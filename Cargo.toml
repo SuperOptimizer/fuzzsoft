@@ -10,6 +10,7 @@ members = [
     "crates/fs-platform",
     "crates/fs-vec",
     "crates/fs-san",
+    "crates/fs-prog",
 ]
 
 [workspace.package]

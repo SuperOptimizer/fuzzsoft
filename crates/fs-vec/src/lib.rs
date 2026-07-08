@@ -19,24 +19,32 @@
 //!   field.
 //!
 //! On top of that scalar core, [`VecCpu::step`] now also carries a **converged-lane SIMD fast
-//! path** (`try_simd_alu_step`): when every active lane shares the same `pc` and independently
-//! fetches the identical instruction word from its own `Mmu`, the ALU-class instructions (OP-IMM
-//! / OP: add/sub/and/or/xor/sll/srl/sra/slt/sltu — the ones with a clean packed form,
-//! architecture.md §2) are decoded once and executed across all `LANES` lanes with a single
-//! `std::simd::Simd<u32, LANES>` operation, instead of `LANES` scalar `step_lane` calls. Anything
-//! that does not fit that shape (divergent pc, divergent instruction words, memory ops, branches/
-//! jumps, DIV/REM/MULH*) falls straight through to the scalar-over-lanes `step_lane` path below —
-//! see `DESIGN.md` for exactly what's vectorized today and what remains scalar on the road to real
+//! path** (`try_simd_fast_step`, in two flavors: `try_simd_alu`/`try_simd_load`/`try_simd_store`):
+//! when every active lane shares the same `pc`, the whole group fetches its instruction **once**
+//! from the shared [`VecMmu`] (`VecMmu::ifetch16_same` — no more per-lane fetch, see `vec_mmu.rs`)
+//! and decodes it once. ALU-class instructions (OP-IMM / OP: add/sub/and/or/xor/sll/srl/sra/slt/
+//! sltu — the ones with a clean packed form, architecture.md §2) execute across all `LANES` lanes
+//! with a single `std::simd::Simd<u32, LANES>` operation; `Load`/`Store` whose effective address
+//! also agrees across every active lane (the common case) go through `VecMmu`'s same-address
+//! fast path in one more shared access. Anything that does not fit that shape (divergent pc,
+//! divergent addresses, branches/jumps, DIV/REM/MULH*) falls straight through to the
+//! scalar-over-lanes `step_lane` path below, now itself rewired onto the same shared `VecMmu`
+//! (`load_lane`/`store_lane`/`ifetch16_lane`) instead of a private per-lane `fs_mmu::Mmu` — see
+//! `DESIGN.md` for exactly what's vectorized today and what remains scalar on the road to real
 //! AVX-512.
 //!
-//! See `DESIGN.md` in this crate for the full AVX-512 target (interleaved MMU, `vmovdqa32`
-//! same-address fast path vs `vpgatherdd`/`vpscatterdd`, masked scalarize-16 fallback for
-//! DIV/REM/MULH, and where `unsafe` will eventually live).
+//! See `DESIGN.md` in this crate for the full AVX-512 target (interleaved MMU — now implemented
+//! in safe Rust in [`vec_mmu`] — `vmovdqa32` same-address fast path vs `vpgatherdd`/`vpscatterdd`,
+//! masked scalarize-16 fallback for DIV/REM/MULH, and where `unsafe` will eventually live).
 
 #![feature(portable_simd)]
 #![forbid(unsafe_code)]
 
-use fs_mmu::{Bus, Fault, Mmu};
+mod vec_mmu;
+
+pub use vec_mmu::VecMmu;
+
+use fs_mmu::Fault;
 use fs_riscv::{decode, decode_compressed, AluOp, AmoOp, BranchOp, Inst, LoadOp, MulOp, StoreOp};
 use std::simd::prelude::*;
 
@@ -51,7 +59,8 @@ pub enum LaneExit {
     Ecall { a0: u32 },
     /// `ebreak`.
     Ebreak,
-    /// A memory fault (unmapped/permission/unaligned) from the lane's own `Mmu`.
+    /// A memory fault (unmapped/permission/unaligned) from the lane's access to the shared
+    /// [`VecMmu`].
     Fault(Fault),
     /// Decoded to `Inst::Illegal`, or to a privileged/CSR form this executor does not implement
     /// (CSR access, MRET/SRET/WFI/SFENCE.VMA). Full-system privilege is `fs-arch`'s job (M2+);
@@ -79,12 +88,16 @@ pub struct VecCpu {
     pub exit: [Option<LaneExit>; LANES],
     /// Per-lane LR/SC reservation (A-extension), independent per hart/lane.
     reservation: [Option<u32>; LANES],
-    /// Number of `step()` calls that took the converged-lane SIMD ALU fast path
-    /// (`try_simd_alu_step`), as opposed to falling through to the scalar-over-lanes loop. One
-    /// `step()` call retiring all `LANES` lanes' ALU instruction counts once here — this is a
-    /// diagnostic/benchmark counter, not part of the executor's correctness contract (see the
+    /// Number of `step()` calls that took the converged-lane SIMD ALU fast path (`try_simd_alu`),
+    /// as opposed to falling through to the scalar-over-lanes loop. One `step()` call retiring
+    /// all `LANES` lanes' ALU instruction counts once here — this is a diagnostic/benchmark
+    /// counter, not part of the executor's correctness contract (see the
     /// `converged_straight_line_alu_program_uses_the_simd_fast_path` test and `examples/bench.rs`).
     pub simd_alu_steps: u64,
+    /// Number of `step()` calls that took the converged-lane, same-address SIMD memory fast path
+    /// (`try_simd_load`/`try_simd_store`) — a diagnostic/benchmark counter alongside
+    /// `simd_alu_steps`, not part of the correctness contract.
+    pub simd_mem_steps: u64,
 }
 
 impl VecCpu {
@@ -100,6 +113,7 @@ impl VecCpu {
             exit: [None; LANES],
             reservation: [None; LANES],
             simd_alu_steps: 0,
+            simd_mem_steps: 0,
         }
     }
 
@@ -144,46 +158,47 @@ impl VecCpu {
         }
     }
 
-    /// Advance every active lane by exactly one instruction, each against its own `Mmu`
-    /// (`buses[lane]` — see DESIGN.md for the future interleaved single-shared layout).
+    /// Advance every active lane by exactly one instruction, all against the ONE shared
+    /// [`VecMmu`] (DESIGN.md §3's interleaved layout — no more per-lane `Mmu`).
     ///
-    /// Tries the converged-lane SIMD ALU fast path first ([`VecCpu::try_simd_alu_step`]); if that
+    /// Tries the converged-lane SIMD fast path first ([`VecCpu::try_simd_fast_step`]); if that
     /// declines (returns `false`, having mutated nothing), falls back to the scalar-over-lanes
     /// loop (decision #45, correctness-first): each lane independently fetches/decodes/executes
     /// via `fs_riscv::decode`/`decode_compressed` and the M-extension semantics copied below, but
     /// the SoA layout + active mask keep a future AVX-512 lockstep step a mechanical drop-in.
-    pub fn step(&mut self, buses: &mut [Mmu]) {
-        assert_eq!(buses.len(), LANES, "fs-vec: exactly one Mmu per lane");
-        if self.try_simd_alu_step(buses) {
+    pub fn step(&mut self, mmu: &mut VecMmu) {
+        if self.try_simd_fast_step(mmu) {
             return;
         }
-        for (lane, bus) in buses.iter_mut().enumerate() {
+        for lane in 0..LANES {
             if self.active[lane] {
-                self.step_lane(lane, bus);
+                self.step_lane(lane, mmu);
             }
         }
     }
 
-    /// Converged-lane SIMD fast path (architecture.md §2, DESIGN.md "Lockstep fetch/decode").
+    /// Converged-lane SIMD fast path dispatcher (architecture.md §2, DESIGN.md "Lockstep
+    /// fetch/decode" + "Memory: same-address fast path").
     ///
     /// Preconditions, all checked before anything is mutated:
     /// - every active lane shares the same `pc` ([`VecCpu::lanes_converged`]);
-    /// - every active lane's *own* `Mmu` fetches the exact same instruction word at that `pc`
-    ///   (true whenever lanes share a byte-identical code page, the common case this executor
-    ///   targets — see DESIGN.md §3 on the eventual shared interleaved memory);
-    /// - that instruction decodes to `Inst::OpImm`/`Inst::Op` with an `AluOp` (add/sub/and/or/xor/
-    ///   sll/srl/sra/slt/sltu) — the subset with a clean packed `Simd<u32, LANES>` form.
+    /// - the whole group fetches its instruction **once** from the shared [`VecMmu`]
+    ///   ([`fetch_converged`]) — one shared read instead of `LANES` per-lane ones, and every
+    ///   active lane's line must agree byte-for-byte (checked, not assumed: lanes whose memory
+    ///   has diverged decline here and fall back to `step_lane`'s per-lane fetch).
     ///
-    /// If any precondition fails (divergent pc, a faulting or disagreeing lane, a non-ALU
-    /// instruction), this returns `false` having mutated no state — `step`'s existing
-    /// scalar-over-lanes loop then handles the instruction exactly as before. Re-fetching in that
-    /// fallback is free of side effects (`ifetch16` is a pure load), so speculatively fetching
-    /// here first is always safe to discard.
+    /// Given a single decode, dispatches to the payload that matches the instruction class:
+    /// - `Inst::OpImm`/`Inst::Op` -> [`VecCpu::try_simd_alu`] (packed ALU, `Simd<u32, LANES>`).
+    /// - `Inst::Load`/`Inst::Store` whose effective address also agrees across every active lane
+    ///   -> [`VecCpu::try_simd_load`]/[`VecCpu::try_simd_store`] (`VecMmu`'s same-address fast
+    ///   path, one shared access instead of `LANES`).
+    /// - anything else (branches/jumps, MUL/DIV/REM, divergent addresses, system) -> `false`,
+    ///   `step`'s scalar-over-lanes loop handles it exactly as before.
     ///
-    /// On success, the single scalar `decode` call replaces `LANES` of them, and the ALU op
-    /// itself runs as one masked `Simd<u32, LANES>` operation ([`simd_alu`]) instead of `LANES`
-    /// scalar ones — this is the throughput win `examples/bench.rs` measures.
-    fn try_simd_alu_step(&mut self, buses: &mut [Mmu]) -> bool {
+    /// Re-fetching in the fallback is free of side effects (fetch/load are pure reads until a
+    /// same-address store commits), so speculatively decoding here first is always safe to
+    /// discard.
+    fn try_simd_fast_step(&mut self, mmu: &mut VecMmu) -> bool {
         let active = self.active;
         if !self.lanes_converged() {
             return false;
@@ -193,43 +208,47 @@ impl VecCpu {
         };
         let pc = self.pc[first];
 
-        // Every active lane fetches from its OWN Mmu (independent per-lane memory, DESIGN.md
-        // §3); the fast path additionally requires all of them to agree on the fetched bytes.
-        let mut iword_ilen: Option<(u32, u32)> = None;
-        for (lane, bus) in buses.iter_mut().enumerate() {
-            if !active[lane] {
-                continue;
-            }
-            let lo = match bus.ifetch16(pc) {
-                Ok(v) => v,
-                Err(_) => return false,
-            };
-            let (word, ilen) = if lo & 0x3 != 0x3 {
-                (lo as u32, 2u32)
-            } else {
-                let hi = match bus.ifetch16(pc.wrapping_add(2)) {
-                    Ok(v) => v,
-                    Err(_) => return false,
-                };
-                ((lo as u32) | ((hi as u32) << 16), 4u32)
-            };
-            match iword_ilen {
-                None => iword_ilen = Some((word, ilen)),
-                Some((w, _)) if w == word => {}
-                _ => return false, // lanes disagree on the encoded instruction bytes
-            }
-        }
-        let Some((iword, ilen)) = iword_ilen else {
+        let Some((iword, ilen)) = fetch_converged(mmu, pc, active) else {
             return false;
         };
-
         let inst = if ilen == 2 { decode_compressed(iword as u16) } else { decode(iword) };
+
+        match inst {
+            Inst::OpImm { .. } | Inst::Op { .. } => self.try_simd_alu(inst, ilen, active),
+            Inst::Load { .. } => self.try_simd_load(inst, ilen, active, mmu),
+            Inst::Store { .. } => self.try_simd_store(inst, ilen, active, mmu),
+            _ => false, // branch / jump / mul-div / system: scalar path handles it
+        }
+    }
+
+    /// Advance every active lane's `pc` by `ilen`, masked so inactive lanes are untouched — the
+    /// pc-update tail shared by every converged fast-path payload below.
+    fn advance_pc_converged(&mut self, active_mask: Mask<i32, LANES>, ilen: u32) {
+        let pc_vec: Simd<u32, LANES> = Simd::from_array(self.pc);
+        self.pc = active_mask.select(pc_vec + Simd::splat(ilen), pc_vec).to_array();
+    }
+
+    /// Bump `insns_retired` for every lane that was active this step — shared by every converged
+    /// fast-path payload below.
+    fn retire_active(&mut self, active: [bool; LANES]) {
+        for (lane, &was_active) in active.iter().enumerate() {
+            if was_active {
+                self.insns_retired[lane] += 1;
+            }
+        }
+    }
+
+    /// Packed ALU payload: `inst` must be `Inst::OpImm`/`Inst::Op` (checked by the caller,
+    /// `try_simd_fast_step`'s match arm). Executes across all `LANES` lanes with one masked
+    /// `Simd<u32, LANES>` operation ([`simd_alu`]) instead of `LANES` scalar `alu` calls — the
+    /// original throughput win `examples/bench.rs` measures.
+    fn try_simd_alu(&mut self, inst: Inst, ilen: u32, active: [bool; LANES]) -> bool {
         let (op, rd, rs1, b): (AluOp, u8, u8, Simd<u32, LANES>) = match inst {
             Inst::OpImm { op, rd, rs1, imm } => (op, rd, rs1, Simd::splat(imm as u32)),
             Inst::Op { op, rd, rs1, rs2 } => {
                 (op, rd, rs1, Simd::from_array(self.regs[rs2 as usize]))
             }
-            _ => return false, // memory / branch / jump / mul-div / system: scalar path handles it
+            _ => return false,
         };
 
         let active_mask: Mask<i32, LANES> = Mask::from_array(active);
@@ -245,16 +264,102 @@ impl VecCpu {
 
         // No branch/jump/load/store in this instruction class, so every active lane's `pc`
         // advances by the same `ilen` — still a masked vector op, not a per-lane scalar add.
-        let pc_vec: Simd<u32, LANES> = Simd::from_array(self.pc);
-        self.pc = active_mask.select(pc_vec + Simd::splat(ilen), pc_vec).to_array();
-
-        for (lane, &was_active) in active.iter().enumerate() {
-            if was_active {
-                self.insns_retired[lane] += 1;
-            }
-        }
+        self.advance_pc_converged(active_mask, ilen);
+        self.retire_active(active);
         self.simd_alu_steps += 1;
 
+        true
+    }
+
+    /// Same-address vectorized load payload (DESIGN.md "Memory: same-address fast path"):
+    /// `inst` must be `Inst::Load` (checked by the caller). Computes every active lane's
+    /// effective address as one `Simd<u32, LANES>` add; if every active lane's address agrees,
+    /// issues one `VecMmu::load_same` for the whole group instead of `LANES` separate loads.
+    /// Declines (returns `false`, mutating nothing) on divergent addresses or if `VecMmu` itself
+    /// declines (misalignment/OOB/permission) — `step`'s scalar-over-lanes loop then services the
+    /// instruction lane-by-lane via `VecMmu::load_lane` (the divergent-address path's scalar
+    /// body).
+    fn try_simd_load(&mut self, inst: Inst, ilen: u32, active: [bool; LANES], mmu: &VecMmu) -> bool {
+        let Inst::Load { op, rd, rs1, imm } = inst else {
+            return false;
+        };
+        let Some(first) = active.iter().position(|&a| a) else {
+            return false;
+        };
+        let rs1v: Simd<u32, LANES> = Simd::from_array(self.regs[rs1 as usize]);
+        let addrs = rs1v + Simd::splat(imm as u32);
+        let addr0 = addrs.to_array()[first];
+        let active_mask: Mask<i32, LANES> = Mask::from_array(active);
+        if (active_mask & !addrs.simd_eq(Simd::splat(addr0))).any() {
+            return false; // divergent effective addresses: scalar-over-lanes handles it lane-by-lane
+        }
+
+        let (size, signed) = match op {
+            LoadOp::Lb => (1u8, true),
+            LoadOp::Lbu => (1u8, false),
+            LoadOp::Lh => (2u8, true),
+            LoadOp::Lhu => (2u8, false),
+            LoadOp::Lw => (4u8, false),
+        };
+        let Some(raw) = mmu.load_same(addr0, size, active) else {
+            return false;
+        };
+        let value = if signed {
+            match size {
+                1 => sign_extend_simd(raw, 8),
+                2 => sign_extend_simd(raw, 16),
+                _ => raw,
+            }
+        } else {
+            raw
+        };
+
+        if rd != 0 {
+            let prev: Simd<u32, LANES> = Simd::from_array(self.regs[rd as usize]);
+            self.regs[rd as usize] = active_mask.select(value, prev).to_array();
+        }
+        self.advance_pc_converged(active_mask, ilen);
+        self.retire_active(active);
+        self.simd_mem_steps += 1;
+        true
+    }
+
+    /// Same-address vectorized store payload, the twin of [`VecCpu::try_simd_load`]: `inst` must
+    /// be `Inst::Store`. Declines under the same conditions (divergent effective address, or
+    /// `VecMmu::store_same` itself declining).
+    fn try_simd_store(
+        &mut self,
+        inst: Inst,
+        ilen: u32,
+        active: [bool; LANES],
+        mmu: &mut VecMmu,
+    ) -> bool {
+        let Inst::Store { op, rs1, rs2, imm } = inst else {
+            return false;
+        };
+        let Some(first) = active.iter().position(|&a| a) else {
+            return false;
+        };
+        let rs1v: Simd<u32, LANES> = Simd::from_array(self.regs[rs1 as usize]);
+        let addrs = rs1v + Simd::splat(imm as u32);
+        let addr0 = addrs.to_array()[first];
+        let active_mask: Mask<i32, LANES> = Mask::from_array(active);
+        if (active_mask & !addrs.simd_eq(Simd::splat(addr0))).any() {
+            return false; // divergent effective addresses: scalar-over-lanes handles it lane-by-lane
+        }
+
+        let size = match op {
+            StoreOp::Sb => 1u8,
+            StoreOp::Sh => 2u8,
+            StoreOp::Sw => 4u8,
+        };
+        let vals: Simd<u32, LANES> = Simd::from_array(self.regs[rs2 as usize]);
+        if !mmu.store_same(addr0, size, active, vals) {
+            return false;
+        }
+        self.advance_pc_converged(active_mask, ilen);
+        self.retire_active(active);
+        self.simd_mem_steps += 1;
         true
     }
 
@@ -263,19 +368,22 @@ impl VecCpu {
         self.exit[lane] = Some(exit);
     }
 
-    fn step_lane(&mut self, lane: usize, bus: &mut Mmu) {
+    fn step_lane(&mut self, lane: usize, mmu: &mut VecMmu) {
         let pc = self.pc[lane];
 
         // Variable-length fetch, identical to the scalar core: a half-word whose low 2 bits
-        // != 0b11 is a 16-bit compressed instruction (IALIGN=16); otherwise it is 32-bit.
-        let lo = match bus.ifetch16(pc) {
+        // != 0b11 is a 16-bit compressed instruction (IALIGN=16); otherwise it is 32-bit. Reads
+        // this lane's own slot of the shared `VecMmu` (`ifetch16_lane` — the divergent-address
+        // path's scalar body, DESIGN.md §3), since a lane running `step_lane` may have diverged
+        // in `pc` from the rest of the group.
+        let lo = match mmu.ifetch16_lane(lane, pc) {
             Ok(v) => v,
             Err(f) => return self.halt(lane, LaneExit::Fault(f)),
         };
         let (inst, ilen, iword) = if lo & 0x3 != 0x3 {
             (decode_compressed(lo), 2u32, lo as u32)
         } else {
-            let hi = match bus.ifetch16(pc.wrapping_add(2)) {
+            let hi = match mmu.ifetch16_lane(lane, pc.wrapping_add(2)) {
                 Ok(v) => v,
                 Err(f) => return self.halt(lane, LaneExit::Fault(f)),
             };
@@ -329,7 +437,7 @@ impl VecCpu {
                     LoadOp::Lhu => (2, false),
                     LoadOp::Lw => (4, false),
                 };
-                let raw = try_mem!(bus.load(addr, size));
+                let raw = try_mem!(mmu.load_lane(lane, addr, size));
                 let v = if signed {
                     match size {
                         1 => raw as u8 as i8 as i32 as u32,
@@ -349,7 +457,7 @@ impl VecCpu {
                     StoreOp::Sh => 2,
                     StoreOp::Sw => 4,
                 };
-                try_mem!(bus.store(addr, size, val));
+                try_mem!(mmu.store_lane(lane, addr, size, val));
             }
             Inst::OpImm { op, rd, rs1, imm } => {
                 let v = alu(op, self.rd_reg(lane, rs1), imm as u32);
@@ -365,7 +473,7 @@ impl VecCpu {
             }
             Inst::LrW { rd, rs1, .. } => {
                 let addr = self.rd_reg(lane, rs1);
-                let v = try_mem!(bus.load(addr, 4));
+                let v = try_mem!(mmu.load_lane(lane, addr, 4));
                 self.reservation[lane] = Some(addr);
                 self.wr_reg(lane, rd, v);
             }
@@ -374,7 +482,7 @@ impl VecCpu {
                 let success = self.reservation[lane] == Some(addr);
                 if success {
                     let v = self.rd_reg(lane, rs2);
-                    try_mem!(bus.store(addr, 4, v));
+                    try_mem!(mmu.store_lane(lane, addr, 4, v));
                 }
                 // A reservation is single-use, and any trap/context-switch would clear it too.
                 self.reservation[lane] = None;
@@ -382,7 +490,7 @@ impl VecCpu {
             }
             Inst::AmoW { op, rd, rs1, rs2, .. } => {
                 let addr = self.rd_reg(lane, rs1);
-                let old = try_mem!(bus.load(addr, 4));
+                let old = try_mem!(mmu.load_lane(lane, addr, 4));
                 let src = self.rd_reg(lane, rs2);
                 let result = match op {
                     AmoOp::Swap => src,
@@ -395,7 +503,7 @@ impl VecCpu {
                     AmoOp::Minu => old.min(src),
                     AmoOp::Maxu => old.max(src),
                 };
-                try_mem!(bus.store(addr, 4, result));
+                try_mem!(mmu.store_lane(lane, addr, 4, result));
                 self.reservation[lane] = None;
                 self.wr_reg(lane, rd, old);
             }
@@ -416,6 +524,52 @@ impl VecCpu {
         self.pc[lane] = next;
         self.insns_retired[lane] += 1;
     }
+}
+
+/// Vectorized instruction fetch for a converged group (DESIGN.md "Lockstep fetch/decode" +
+/// "Vectorized interleaving"): every `active` lane already shares `pc` (checked by the caller,
+/// `VecCpu::lanes_converged`), so this issues ONE [`VecMmu::ifetch16_same`] (or two, for a 32-bit
+/// instruction) against the shared interleaved store instead of `LANES` independent per-lane
+/// fetches — the fetch deduplication that removes the original SIMD fast path's ~2x throughput
+/// ceiling (DESIGN.md).
+///
+/// Returns `None`, having read nothing lanes disagree on, if `VecMmu` declines (misalignment/
+/// out-of-bounds/any active lane missing `PERM_EXEC`) or if the active lanes' fetched halfword(s)
+/// are not byte-identical (checked, not assumed: a lane whose memory has diverged — e.g.
+/// self-modifying code taking different edits per lane — must not be silently treated as
+/// converged). Either way the caller falls back to `step_lane`'s per-lane fetch
+/// (`VecMmu::ifetch16_lane`), which produces the correct per-lane result/fault even when lanes'
+/// own memory has diverged.
+fn fetch_converged(mmu: &VecMmu, pc: u32, active: [bool; LANES]) -> Option<(u32, u32)> {
+    let active_mask: Mask<i32, LANES> = Mask::from_array(active);
+    let first = active.iter().position(|&a| a)?;
+
+    let lo_line = mmu.ifetch16_same(pc, active)?;
+    let lo0 = lo_line.to_array()[first];
+    if (active_mask & !lo_line.simd_eq(Simd::splat(lo0))).any() {
+        return None; // active lanes disagree on the fetched halfword
+    }
+    if lo0 & 0x3 != 0x3 {
+        return Some((lo0, 2));
+    }
+
+    let hi_line = mmu.ifetch16_same(pc.wrapping_add(2), active)?;
+    let hi0 = hi_line.to_array()[first];
+    if (active_mask & !hi_line.simd_eq(Simd::splat(hi0))).any() {
+        return None;
+    }
+    Some((lo0 | (hi0 << 16), 4))
+}
+
+/// Sign-extend the low `bits` bits of every lane of `v` to a full 32-bit signed value packed back
+/// into `Simd<u32, LANES>` — the packed twin of the scalar `as u8 as i8 as i32 as u32` / `as u16
+/// as i16 as i32 as u32` casts `step_lane`'s `Inst::Load` arm uses for `LB`/`LH`, via the
+/// arithmetic-shift-left-then-right idiom (`(v << (32-bits)) >> (32-bits)` in signed lanes).
+#[inline]
+fn sign_extend_simd(v: Simd<u32, LANES>, bits: u32) -> Simd<u32, LANES> {
+    let shift: Simd<i32, LANES> = Simd::splat((32 - bits) as i32);
+    let vi: Simd<i32, LANES> = v.cast();
+    ((vi << shift) >> shift).cast()
 }
 
 /// Copied verbatim from `fs_riscv`'s private `alu` (single source of truth is the scalar core;
@@ -439,8 +593,8 @@ fn alu(op: AluOp, a: u32, b: u32) -> u32 {
 /// The `Simd<u32, LANES>`-packed twin of [`alu`] above: identical op semantics (wrapping
 /// arithmetic, `& 31` shift-amount masking, signed vs. unsigned compares), all `LANES` lanes at
 /// once instead of one lane at a time. This is the SIMD fast path's payload
-/// (`VecCpu::try_simd_alu_step`); the `simd_alu_fast_path_matches_scalar_alu_exhaustively` test
-/// below is what actually enforces that this and `alu` never disagree.
+/// (`VecCpu::try_simd_alu`); the `simd_alu_fast_path_matches_scalar_alu_exhaustively` test below
+/// is what actually enforces that this and `alu` never disagree.
 ///
 /// `std::simd`'s wrapping-integer arithmetic matches the plain scalar `u32` semantics required
 /// here (add/sub wrap silently, no overflow trap), so this needs no `wrapping_*` equivalents of
@@ -509,12 +663,29 @@ fn muldiv(op: MulOp, a: u32, b: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fs_mmu::{PERM_EXEC, PERM_READ, PERM_WRITE};
+    use fs_mmu::{Mmu, PERM_EXEC, PERM_READ, PERM_WRITE};
     use fs_riscv::{asm, A0, A7, T0, T1, X0};
 
     const BASE: u32 = 0x8000_0000;
 
-    fn make_mmu(prog: &[u32]) -> Mmu {
+    /// Lay `prog` out in a fresh shared [`VecMmu`] — `map`/`protect` broadcast identically to
+    /// every lane (DESIGN.md "byte-identical starting snapshot"), which is exactly what these
+    /// tests want: all `LANES` lanes start byte-identical, diverging only via per-lane register
+    /// seeds/execution, never via different underlying memory content.
+    fn make_mmu(prog: &[u32]) -> VecMmu {
+        let mut mmu = VecMmu::new(BASE, 0x1_0000);
+        mmu.protect(BASE, 0x1_0000, PERM_READ | PERM_WRITE).unwrap();
+        let mut bytes = Vec::new();
+        for w in prog {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        mmu.map(BASE, &bytes, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+        mmu
+    }
+
+    /// The scalar golden model's own `fs_mmu::Mmu` — unrelated to `VecMmu`, used only to run
+    /// `fs_riscv::Cpu` (the oracle these tests cross-check `VecCpu` against) independently.
+    fn make_scalar_mmu(prog: &[u32]) -> Mmu {
         let mut mmu = Mmu::new(BASE, 0x1_0000);
         mmu.protect(BASE, 0x1_0000, PERM_READ | PERM_WRITE).unwrap();
         let mut bytes = Vec::new();
@@ -528,7 +699,7 @@ mod tests {
     /// Run the scalar golden model (`fs_riscv::Cpu`) to its `ecall` exit, optionally seeding one
     /// register first, and return the final CPU.
     fn run_scalar(prog: &[u32], seed: Option<(u8, u32)>) -> fs_riscv::Cpu {
-        let mut mmu = make_mmu(prog);
+        let mut mmu = make_scalar_mmu(prog);
         let mut cpu = fs_riscv::Cpu::new(BASE);
         if let Some((reg, val)) = seed {
             cpu.regs[reg as usize] = val;
@@ -566,12 +737,12 @@ mod tests {
     #[test]
     fn identical_lanes_match_each_other_and_the_scalar_golden_model() {
         let prog = sum_1_to_10_program();
-        let mut buses: Vec<Mmu> = (0..LANES).map(|_| make_mmu(&prog)).collect();
+        let mut mmu = make_mmu(&prog);
         let mut vcpu = VecCpu::new(BASE);
 
         let mut guard = 0;
         while vcpu.any_active() {
-            vcpu.step(&mut buses);
+            vcpu.step(&mut mmu);
             guard += 1;
             assert!(guard < 10_000, "vectorized program did not converge");
         }
@@ -618,7 +789,7 @@ mod tests {
             ecall(),          // 8
         ];
 
-        let mut buses: Vec<Mmu> = (0..LANES).map(|_| make_mmu(&prog)).collect();
+        let mut mmu = make_mmu(&prog);
         let mut vcpu = VecCpu::new(BASE);
         let ns: [u32; LANES] = std::array::from_fn(|lane| lane as u32); // N = 0, 1, .., 15
         for (lane, &n) in ns.iter().enumerate() {
@@ -629,7 +800,7 @@ mod tests {
         let mut saw_partial_completion = false;
         let mut guard = 0;
         while vcpu.any_active() {
-            vcpu.step(&mut buses);
+            vcpu.step(&mut mmu);
             if !vcpu.lanes_converged() {
                 saw_pc_divergence = true;
             }
@@ -802,14 +973,14 @@ mod tests {
     }
 
     /// Requirement 3: a converged straight-line ALU program — no branches, so lanes never
-    /// diverge in `pc` — must take `VecCpu::try_simd_alu_step`'s SIMD fast path for every ALU
+    /// diverge in `pc` — must take `VecCpu::try_simd_alu`'s SIMD fast path for every ALU
     /// instruction, and still land on exactly the same per-lane results as an independent scalar
     /// `fs_riscv::Cpu` run seeded with that lane's input.
     #[test]
     fn converged_straight_line_alu_program_uses_the_simd_fast_path() {
         const T2: u8 = 7;
         let prog = straight_line_alu_program();
-        let mut buses: Vec<Mmu> = (0..LANES).map(|_| make_mmu(&prog)).collect();
+        let mut mmu = make_mmu(&prog);
         let mut vcpu = VecCpu::new(BASE);
         let seeds: [u32; LANES] = std::array::from_fn(|lane| (lane as u32) * 7 + 1);
         for (lane, &seed) in seeds.iter().enumerate() {
@@ -820,7 +991,7 @@ mod tests {
 
         let mut guard = 0;
         while vcpu.any_active() {
-            vcpu.step(&mut buses);
+            vcpu.step(&mut mmu);
             guard += 1;
             assert!(guard < 1_000, "straight-line ALU program did not converge");
         }
@@ -854,5 +1025,129 @@ mod tests {
         let distinct: std::collections::HashSet<u32> =
             (0..LANES).map(|lane| vcpu.regs[A0 as usize][lane]).collect();
         assert!(distinct.len() > 1, "lanes should not all compute the same result");
+    }
+
+    /// The new `VecMmu`-backed memory fast path (DESIGN.md "Memory: same-address fast path"):
+    /// every lane shares the same effective address (`t5`) but stores/loads a distinct per-lane
+    /// value (`t2`) — this must take `VecCpu::try_simd_store`/`try_simd_load`'s same-address
+    /// vectorized access exactly twice (once for the `sw`, once for the `lw`), never falling back
+    /// to `step_lane`'s per-lane path, and every lane must read back exactly what it (not some
+    /// other lane) stored — proving the interleaved layout keeps each lane's copy of the shared
+    /// word genuinely independent.
+    #[test]
+    fn converged_same_address_load_store_uses_the_simd_mem_fast_path() {
+        use asm::*;
+        const T2: u8 = 7; // per-lane value to store
+        const T5: u8 = 30; // shared data pointer (same for every lane)
+        let prog = vec![
+            lui(T5, BASE),          // 0: t5 = BASE
+            addi(T5, T5, 0x100),    // 1: t5 += 0x100  (same address for every lane)
+            sw(T5, T2, 0),          // 2: store this lane's seed at [t5]
+            lw(A0, T5, 0),          // 3: a0 = load back from [t5]
+            addi(A7, X0, 93),       // 4: exit
+            ecall(),                // 5
+        ];
+        let mut mmu = make_mmu(&prog);
+        let mut vcpu = VecCpu::new(BASE);
+        let seeds: [u32; LANES] = std::array::from_fn(|lane| (lane as u32) * 37 + 11);
+        for (lane, &seed) in seeds.iter().enumerate() {
+            vcpu.set_reg(lane, T2, seed);
+        }
+
+        let mut guard = 0;
+        while vcpu.any_active() {
+            vcpu.step(&mut mmu);
+            guard += 1;
+            assert!(guard < 1_000, "converged same-address program did not converge");
+        }
+
+        assert_eq!(
+            vcpu.simd_mem_steps, 2,
+            "both the store and the load-back should take the same-address SIMD fast path"
+        );
+        for (lane, &seed) in seeds.iter().enumerate() {
+            assert_eq!(vcpu.regs[A0 as usize][lane], seed, "lane {lane} did not read back its own value");
+            assert_eq!(vcpu.exit[lane], Some(LaneExit::Ecall { a0: seed }), "lane {lane}");
+        }
+    }
+
+    /// The divergent-address path (DESIGN.md "Divergent-address path"): every lane targets a
+    /// *different* guest address (set directly per lane, rather than computed identically), so
+    /// `try_simd_store`/`try_simd_load` must decline every time and `step_lane` services each
+    /// lane through `VecMmu::store_lane`/`load_lane` instead — the scalar body the eventual
+    /// `vpgatherdd`/`vpscatterdd` batching wraps. Each lane must still read back exactly its own
+    /// stored value, with zero cross-lane interference.
+    #[test]
+    fn divergent_addresses_fall_back_to_the_per_lane_path() {
+        use asm::*;
+        const T2: u8 = 7; // per-lane value to store
+        const T5: u8 = 30; // per-lane absolute data address, set directly so it diverges by construction
+        let prog = vec![sw(T5, T2, 0), lw(A0, T5, 0), addi(A7, X0, 93), ecall()];
+        let mut mmu = make_mmu(&prog);
+        let mut vcpu = VecCpu::new(BASE);
+        let seeds: [u32; LANES] = std::array::from_fn(|lane| (lane as u32) * 13 + 3);
+        for (lane, &seed) in seeds.iter().enumerate() {
+            vcpu.set_reg(lane, T2, seed);
+            vcpu.set_reg(lane, T5, BASE + 0x300 + (lane as u32) * 4);
+        }
+
+        let mut guard = 0;
+        while vcpu.any_active() {
+            vcpu.step(&mut mmu);
+            guard += 1;
+            assert!(guard < 1_000, "divergent-address program did not converge");
+        }
+
+        assert_eq!(
+            vcpu.simd_mem_steps, 0,
+            "per-lane-divergent addresses must never take the same-address SIMD fast path"
+        );
+        for (lane, &seed) in seeds.iter().enumerate() {
+            assert_eq!(vcpu.regs[A0 as usize][lane], seed, "lane {lane} did not read back its own value");
+            assert_eq!(vcpu.exit[lane], Some(LaneExit::Ecall { a0: seed }), "lane {lane}");
+        }
+    }
+
+    /// A same-address store the shared `VecMmu` must decline (missing `PERM_WRITE`) has to fall
+    /// back to `step_lane`'s per-lane store — which, since every lane shares the same permission
+    /// state here, means every lane independently faults rather than the fast path silently
+    /// "succeeding" for some lanes and not others.
+    #[test]
+    fn converged_store_permission_fault_falls_back_and_halts_every_lane() {
+        use asm::*;
+        const T5: u8 = 30;
+        let data_addr = BASE + 0x200;
+        let prog = vec![
+            lui(T5, BASE),       // 0: t5 = BASE
+            addi(T5, T5, 0x200), // 1: t5 += 0x200 (same address for every lane)
+            addi(A0, X0, 0x11),  // 2: a0 = dummy value to store
+            sw(T5, A0, 0),       // 3: store (should fault: read-only)
+            addi(A7, X0, 93),    // 4: exit (unreached)
+            ecall(),             // 5
+        ];
+        let mut mmu = make_mmu(&prog);
+        // Downgrade just the target word to read-only: every lane's store must now fault.
+        mmu.protect(data_addr, 4, PERM_READ).unwrap();
+        let mut vcpu = VecCpu::new(BASE);
+
+        let mut guard = 0;
+        while vcpu.any_active() {
+            vcpu.step(&mut mmu);
+            guard += 1;
+            assert!(guard < 1_000, "permission-fault program did not converge");
+        }
+
+        assert_eq!(
+            vcpu.simd_mem_steps, 0,
+            "a same-address store that VecMmu declines must never count as a fast-path success"
+        );
+        for lane in 0..LANES {
+            match vcpu.exit[lane] {
+                Some(LaneExit::Fault(f)) => {
+                    assert_eq!(f.kind, fs_mmu::FaultKind::Permission, "lane {lane}");
+                }
+                other => panic!("lane {lane}: expected a permission fault, got {other:?}"),
+            }
+        }
     }
 }

@@ -4,30 +4,40 @@
 //! interpreter loop and debug builds are dominated by bounds-check/panic-machinery noise, not the
 //! thing being measured). No external crates: timing is plain `std::time::Instant`.
 //!
-//! Both engines run the *exact same* RV32IM program: a fixed-iteration-count counting loop (same
-//! trip count on every lane, so lanes stay `pc`-converged for the whole run — architecture.md
-//! §2's "lockstep" precondition) wrapped around a straight-line ALU body that folds a per-lane
-//! seed (`T4`) into a per-lane accumulator (`T3`), the same instruction mix
-//! `converged_straight_line_alu_program_uses_the_simd_fast_path` in `src/lib.rs` exercises unit
-//! -tested, just looped instead of unrolled once.
+//! Two RV32IM programs are benchmarked, both fixed-iteration-count counting loops (same trip
+//! count on every lane, so lanes stay `pc`-converged for the whole run — architecture.md §2's
+//! "lockstep" precondition), each run on two engines:
 //!
-//! - **SIMD path**: [`fs_vec::VecCpu::step`] — because every lane's `pc` stays converged for the
-//!   loop's entire run, `try_simd_alu_step` decodes each ALU instruction once and executes it as
-//!   one packed `Simd<u32, LANES>` op across all 16 lanes; only the loop's `bge`/`jal` fall back
-//!   to the scalar path (once each per iteration).
-//! - **Scalar-over-lanes path**: `LANES` independent [`fs_riscv::Cpu`]s, each stepped one
-//!   instruction at a time. This is the exact decode/execute logic `VecCpu`'s own scalar fallback
-//!   calls, just run `LANES` times over instead of once as a packed vector op — i.e. what
-//!   `VecCpu::step` did before the SIMD fast path existed (see `DESIGN.md`).
+//! - **SIMD path**: [`fs_vec::VecCpu::step`] against a single shared [`fs_vec::VecMmu`] — because
+//!   every lane's `pc` stays converged for the loop's entire run, the group fetches its
+//!   instruction **once** per step from the shared interleaved store (`VecMmu::ifetch16_same`,
+//!   not `LANES` per-lane fetches as in the original cut of this executor); `try_simd_alu` decodes
+//!   each ALU instruction once and executes it as one packed `Simd<u32, LANES>` op across all 16
+//!   lanes; only the loop's `bge`/`jal` fall back to the scalar path (once each per iteration, now
+//!   against the same shared `VecMmu` via `ifetch16_lane`).
+//! - **Scalar-over-lanes path**: `LANES` independent [`fs_riscv::Cpu`]s, each with its own
+//!   `fs_mmu::Mmu` and each stepped one instruction at a time. This is the exact decode/execute
+//!   logic `VecCpu`'s own scalar fallback calls, just run `LANES` times over instead of once as a
+//!   packed vector op — i.e. what `VecCpu::step` did before the SIMD fast path existed, fetch
+//!   included (see `DESIGN.md`).
+//!
+//! `counting_alu_loop_program` folds a per-lane seed (`T4`) into a per-lane accumulator (`T3`)
+//! kept in a register — the same instruction mix
+//! `converged_straight_line_alu_program_uses_the_simd_fast_path` in `src/lib.rs` exercises
+//! unit-tested, just looped instead of unrolled once; it exercises the fetch + ALU fast paths
+//! only (no memory ops in its loop body). `counting_mem_loop_program` is the same shape but routes
+//! the accumulator through ONE shared guest address every iteration instead, exercising `VecMmu`'s
+//! same-address `load_same`/`store_same` fast path too.
 
 use fs_mmu::{Mmu, PERM_EXEC, PERM_READ, PERM_WRITE};
 use fs_riscv::{asm, Exit, A0, A7, T0, T1, X0};
-use fs_vec::{VecCpu, LANES};
+use fs_vec::{VecCpu, VecMmu, LANES};
 use std::time::Instant;
 
 const BASE: u32 = 0x8000_0000;
 const T3: u8 = 28; // per-lane ALU accumulator
 const T4: u8 = 29; // per-lane seed, folded into the accumulator every iteration
+const T5: u8 = 30; // shared (same-address-across-lanes) data pointer, memory-loop benchmark only
 // `addi`'s I-type immediate is a signed 12-bit field (-2048..=2047, `fs_riscv::asm::addi`), so the
 // loop trip count encoded directly into the guest program is capped there; `OUTER_REPEATS` below
 // re-runs the whole program at the Rust level to reach a stable measurement instead.
@@ -104,8 +114,65 @@ fn counting_alu_loop_program() -> Vec<u32> {
     ]
 }
 
+/// A shared-address memory loop: same trip count and shape as `counting_alu_loop_program`, but
+/// the per-lane accumulator now round-trips through ONE shared guest address (`t5`, identical
+/// across every lane) every iteration instead of staying in a register — exercising `VecCpu`'s
+/// *other* new fast path, `VecMmu`'s same-address `load_same`/`store_same` (DESIGN.md "Memory:
+/// same-address fast path"), which the ALU-only loop above never touches. Each lane still reads
+/// back only its own value (the interleaved layout keeps every lane's copy of that shared address
+/// independent), so this is still a valid throughput comparison, not a data race.
+///
+/// Indices (each instruction is 4 bytes):
+/// ```text
+///  0  addi T0, X0, 0        i = 0
+///  1  addi T1, X0, ITERS    limit
+///  2  lui  T5, BASE         t5 = BASE
+///  3  addi T5, T5, 0x100    t5 += 0x100 (shared data pointer, same for every lane)
+///  4  bge  T0, T1, +24      if i >= limit -> 10 (done)
+///  5  lw   T3, T5, 0        t3 = mem[t5]  (this lane's own copy)
+///  6  add  T3, T3, T4       t3 += seed
+///  7  sw   T5, T3, 0        mem[t5] = t3
+///  8  addi T0, T0, 1        i++
+///  9  jal  X0, -20          -> 4
+/// 10 add  A0, T3, X0        done: a0 = t3
+/// 11 addi A7, X0, 93        a7 = exit
+/// 12 ecall
+/// ```
+fn counting_mem_loop_program() -> Vec<u32> {
+    use asm::*;
+    vec![
+        addi(T0, X0, 0),
+        addi(T1, X0, ITERS),
+        lui(T5, BASE),
+        addi(T5, T5, 0x100),
+        bge(T0, T1, 24),
+        lw(T3, T5, 0),
+        add(T3, T3, T4),
+        sw(T5, T3, 0),
+        addi(T0, T0, 1),
+        jal(X0, -20),
+        add(A0, T3, X0),
+        addi(A7, X0, 93),
+        ecall(),
+    ]
+}
+
 fn make_mmu(prog: &[u32]) -> Mmu {
     let mut mmu = Mmu::new(BASE, 0x1_0000);
+    mmu.protect(BASE, 0x1_0000, PERM_READ | PERM_WRITE).unwrap();
+    let mut bytes = Vec::new();
+    for w in prog {
+        bytes.extend_from_slice(&w.to_le_bytes());
+    }
+    mmu.map(BASE, &bytes, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+    mmu
+}
+
+/// Same program, laid out once in the shared interleaved [`VecMmu`] (`map`/`protect` broadcast
+/// identically to every lane) instead of `LANES` separate `fs_mmu::Mmu`s — this single shared
+/// store is what lets a converged group's fetch happen once instead of `LANES` times.
+fn make_vec_mmu(prog: &[u32]) -> VecMmu {
+    let mut mmu = VecMmu::new(BASE, 0x1_0000);
     mmu.protect(BASE, 0x1_0000, PERM_READ | PERM_WRITE).unwrap();
     let mut bytes = Vec::new();
     for w in prog {
@@ -120,17 +187,18 @@ fn seed(lane: usize) -> u32 {
 }
 
 /// Runs `prog` on `VecCpu`, which takes the SIMD fast path for every converged ALU instruction.
-/// Returns `(total lane-instructions retired, step() calls that used the SIMD fast path)`.
-fn run_simd(prog: &[u32]) -> (u64, u64) {
-    let mut buses: Vec<Mmu> = (0..LANES).map(|_| make_mmu(prog)).collect();
+/// Returns `(total lane-instructions retired, SIMD ALU fast-path step() calls, SIMD same-address
+/// memory fast-path step() calls)`.
+fn run_simd(prog: &[u32]) -> (u64, u64, u64) {
+    let mut mmu = make_vec_mmu(prog);
     let mut vcpu = VecCpu::new(BASE);
     for lane in 0..LANES {
         vcpu.set_reg(lane, T4, seed(lane));
     }
     while vcpu.any_active() {
-        vcpu.step(&mut buses);
+        vcpu.step(&mut mmu);
     }
-    (vcpu.insns_retired.iter().sum(), vcpu.simd_alu_steps)
+    (vcpu.insns_retired.iter().sum(), vcpu.simd_alu_steps, vcpu.simd_mem_steps)
 }
 
 /// Runs `prog` on `LANES` independent scalar `fs_riscv::Cpu`s, one instruction at a time — the
@@ -152,23 +220,24 @@ fn run_scalar_over_lanes(prog: &[u32]) -> u64 {
     total
 }
 
-fn main() {
-    let prog = counting_alu_loop_program();
-
+/// Times both engines on `prog` and prints the comparison, labeled `name`.
+fn bench_one(name: &str, prog: &[u32]) {
     let simd_start = Instant::now();
     let mut simd_total_insns = 0u64;
     let mut simd_alu_steps = 0u64;
+    let mut simd_mem_steps = 0u64;
     for _ in 0..OUTER_REPEATS {
-        let (insns, steps) = run_simd(&prog);
+        let (insns, alu_steps, mem_steps) = run_simd(prog);
         simd_total_insns += insns;
-        simd_alu_steps += steps;
+        simd_alu_steps += alu_steps;
+        simd_mem_steps += mem_steps;
     }
     let simd_elapsed = simd_start.elapsed();
 
     let scalar_start = Instant::now();
     let mut scalar_total_insns = 0u64;
     for _ in 0..OUTER_REPEATS {
-        scalar_total_insns += run_scalar_over_lanes(&prog);
+        scalar_total_insns += run_scalar_over_lanes(prog);
     }
     let scalar_elapsed = scalar_start.elapsed();
 
@@ -181,17 +250,23 @@ fn main() {
     let simd_rate = simd_total_insns as f64 / simd_elapsed.as_secs_f64();
     let scalar_rate = scalar_total_insns as f64 / scalar_elapsed.as_secs_f64();
 
-    println!(
-        "fs-vec throughput micro-benchmark ({LANES} lanes x {ITERS} loop iterations x \
-         {OUTER_REPEATS} repeats)"
-    );
+    println!("{name} ({LANES} lanes x {ITERS} loop iterations x {OUTER_REPEATS} repeats)");
     println!(
         "  SIMD fast path:    {simd_total_insns} lane-instructions in {simd_elapsed:?}  =  \
-         {simd_rate:.0} lane-instr/sec  ({simd_alu_steps} step() calls took the SIMD ALU path)"
+         {simd_rate:.0} lane-instr/sec  ({simd_alu_steps} ALU-path + {simd_mem_steps} \
+         same-address-mem-path step() calls)"
     );
     println!(
         "  scalar-over-lanes: {scalar_total_insns} lane-instructions in {scalar_elapsed:?}  =  \
          {scalar_rate:.0} lane-instr/sec"
     );
-    println!("  speedup:           {:.2}x", simd_rate / scalar_rate);
+    println!("  speedup:           {:.2}x\n", simd_rate / scalar_rate);
+}
+
+fn main() {
+    bench_one("fs-vec throughput micro-benchmark: ALU+fetch-bound loop", &counting_alu_loop_program());
+    bench_one(
+        "fs-vec throughput micro-benchmark: same-address memory loop",
+        &counting_mem_loop_program(),
+    );
 }
