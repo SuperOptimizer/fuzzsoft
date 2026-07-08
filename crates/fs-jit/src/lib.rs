@@ -52,10 +52,25 @@
 //! recheck — *not* dispatch cost, see `docs/jit.md`) is fully realized by a cache hit regardless of
 //! whether the caller's own loop iterates once per instruction or once per block.
 
-#![forbid(unsafe_code)]
+//! # Unsafe isolation (Phase 1, `docs/jit-scalar-design.md`)
+//!
+//! This module (`BlockCache`, Stage 0) stays exactly as it was: zero unsafe, unchanged. Phase 1's
+//! native x86-64 chain compiler (`chain::ChainCache`) is additive — it wraps a `BlockCache`
+//! internally rather than replacing it — and lives in `chain.rs`/`emit.rs`, both of which keep
+//! their own `#![forbid(unsafe_code)]`. The one place `unsafe` is used anywhere in this crate is
+//! `sys.rs` (the W^X executable arena + the raw fn-pointer call into it), mirroring
+//! `fs-hostmem`'s isolated-unsafe-surface convention. There is deliberately no crate-level
+//! `forbid(unsafe_code)` attribute (it cannot be locally re-enabled for `sys.rs` — that's the
+//! difference between `forbid` and `deny`), so this file (like `fs-hostmem`'s `lib.rs`) relies on
+//! `sys.rs` being the only module that ever writes `unsafe`.
 
 use fs_mmu::{Access, Bus};
 use fs_riscv::{Cpu, Inst, SysExit, Trap, decode, decode_compressed};
+
+mod emit;
+mod sys;
+pub mod chain;
+pub use chain::ChainCache;
 
 /// Direct-mapped slot count (must be a power of two). ~1M instructions' worth of decode results
 /// (a few tens of bytes each) comfortably covers a booted kernel's hot working set; collisions just

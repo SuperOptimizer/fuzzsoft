@@ -313,6 +313,45 @@ fn run_case_jit(
     Stop::Budget
 }
 
+/// Run one fuzz case via the Phase 1 native chain-JIT (`fs-jit::chain::ChainCache`,
+/// `docs/jit-scalar-design.md`) — the `--jit-chain` analogue of `run_case`/`run_case_jit`. Same
+/// per-instruction-equivalent loop shape as `run_case_jit` (CLINT sync before each `run_block`
+/// call); the only difference is that one `run_block` call here may natively retire an entire
+/// admission-guarded chain of ALU/branch instructions instead of one instruction, with the
+/// admission-guard/fallback decision made entirely inside `fs-jit` (see `ChainCache::run_block`'s
+/// doc comment) — this loop doesn't need to know or care which happened.
+///
+/// Coverage-edge recording deliberately does NOT reuse `run_case_jit`'s
+/// `cur != prev.wrapping_add(4/2)` heuristic: that's only valid at single-instruction granularity
+/// (true for Stage 0's `BlockCache`, false here — a chain can retire many instructions per call,
+/// so comparing the *call's* entry/exit pc against a fixed 2/4-byte delta would misfire on every
+/// multi-instruction ALU-only chain). `ChainCache::take_last_edge` computes the correct edge (or
+/// `None`) internally instead — see its doc comment.
+fn run_case_jit_chain(
+    cpu: &mut fs_riscv::Cpu,
+    m: &mut fs_platform::Machine,
+    cache: &mut fs_jit::ChainCache,
+    cov: &mut fs_cov::CovBitmap,
+    deadline: u64,
+) -> fs_platform::Stop {
+    use fs_platform::Stop;
+    use fs_riscv::SysExit;
+    while cpu.insns_retired < deadline {
+        m.clint.mtime = cpu.virtual_time();
+        fs_platform::sync_timer(cpu, m);
+        match cache.run_block(cpu, m, &mut |_| true) {
+            SysExit::Continue => {
+                if let Some((from, to)) = cache.take_last_edge() {
+                    cov.record_edge(from, to);
+                }
+            }
+            SysExit::Halt(c) => return Stop::Halt(c),
+            SysExit::Hypercall(c) => return Stop::Hypercall(c),
+        }
+    }
+    Stop::Budget
+}
+
 /// The faulting kernel PC from an oops register dump ("epc : c00185e0"), for crash dedup.
 fn parse_epc(s: &str) -> Option<u32> {
     let i = s.find("epc : ")?;
@@ -933,6 +972,10 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     let mut sanitize = false;
     let mut cmplog = false;
     let mut jit = false;
+    // Phase 1 native chain-JIT (`docs/jit-scalar-design.md`): distinct from `--jit` (Stage 0's
+    // threaded-code cache) so interpreter / Stage 0 / chain-JIT can all be benchmarked against
+    // each other. Mutually exclusive with `--jit` (checked below).
+    let mut jit_chain = false;
     let mut ubsan = false;
     // Fault injection (docs/bug-finding.md): when set, arm a fraction PCT of generated programs
     // with the fail_nth preamble (`fs_prog::prepend_fail_inject`) so kmalloc/alloc_pages
@@ -1016,6 +1059,15 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
             // `--cmplog` — see the `--jobs > 1` incompatibility check below.
             "--jit" => {
                 jit = true;
+                i += 1;
+                continue;
+            }
+            // Phase 1 chain-JIT (`docs/jit-scalar-design.md`): native x86-64 codegen for chained
+            // ALU/branch runs, admission-guarded against the CLINT timer, falling back to the
+            // interpreter for everything else (Load/Store/Mul/Ecall/CSR/...). Opt-in, off by
+            // default, serial-only (same footprint as `--jit`).
+            "--jit-chain" => {
+                jit_chain = true;
                 i += 1;
                 continue;
             }
@@ -1137,6 +1189,10 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
             eprintln!("fuzz: --jobs > 1 is incompatible with --jit in this first cut (serial-only)");
             return ExitCode::FAILURE;
         }
+        if jit_chain {
+            eprintln!("fuzz: --jobs > 1 is incompatible with --jit-chain in this first cut (serial-only)");
+            return ExitCode::FAILURE;
+        }
         if ubsan {
             eprintln!("fuzz: --jobs > 1 is incompatible with --ubsan in this first cut (serial-only)");
             return ExitCode::FAILURE;
@@ -1205,6 +1261,14 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
         eprintln!("fuzz: --jit is incompatible with --sanitize (the PC-hook runner is interpreter-only for now)");
         return ExitCode::FAILURE;
     }
+    if jit_chain && sanitize {
+        eprintln!("fuzz: --jit-chain is incompatible with --sanitize (the PC-hook runner is interpreter-only for now)");
+        return ExitCode::FAILURE;
+    }
+    if jit && jit_chain {
+        eprintln!("fuzz: --jit and --jit-chain are mutually exclusive (pick one JIT path to benchmark)");
+        return ExitCode::FAILURE;
+    }
 
     // UBSAN div-by-zero (docs/emulator-sanitizers.md): arm recording on `cpu` BEFORE
     // `Snapshot::capture` below, so the captured golden `cpu` clone carries `ubsan: Some(empty
@@ -1218,6 +1282,7 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     // the sanitizer's poison/alloc primitives): a single `Machine` + golden `Snapshot`. ---
     let snap = Snapshot::capture(&cpu, &mut m);
     let mut jit_cache = jit.then(fs_jit::BlockCache::new);
+    let mut jit_chain_cache = jit_chain.then(fs_jit::ChainCache::new);
     // Golden (post-boot) permission-plane copy, captured at the identical instant as `snap`'s own
     // internal golden planes — feeds `SanCtx::restore_dirtied_perms`'s workaround for
     // `Mmu::protect`/`poison` not being tracked by `Mmu`'s dirty-block reset (see `SanCtx`'s doc
@@ -1432,9 +1497,12 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
 
         run_map.clear();
         let deadline = cpu.insns_retired + case_insns;
-        let stop = match jit_cache.as_mut() {
-            Some(cache) => run_case_jit(&mut cpu, &mut m, cache, &mut run_map, deadline),
-            None => run_case(&mut cpu, &mut m, &mut run_map, deadline, san_ctx.as_mut()),
+        let stop = if let Some(cache) = jit_chain_cache.as_mut() {
+            run_case_jit_chain(&mut cpu, &mut m, cache, &mut run_map, deadline)
+        } else if let Some(cache) = jit_cache.as_mut() {
+            run_case_jit(&mut cpu, &mut m, cache, &mut run_map, deadline)
+        } else {
+            run_case(&mut cpu, &mut m, &mut run_map, deadline, san_ctx.as_mut())
         };
         match stop {
             Stop::Hypercall(HC_DONE) => done += 1,
@@ -1531,6 +1599,24 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
         let total = hits + misses;
         let hit_pct = if total > 0 { hits as f64 / total as f64 * 100.0 } else { 0.0 };
         println!("  jit cache     : {hits} hits, {misses} compiles ({hit_pct:.1}% hit rate)  [Stage 0, docs/jit.md]");
+    }
+    if let Some(cache) = &jit_chain_cache {
+        let (hits, misses, fallbacks) = (cache.chain_hits(), cache.chain_misses(), cache.fallbacks());
+        println!(
+            "  chain-jit     : {hits} native chains, {misses} compiles, {fallbacks} fallback single-steps  [Phase 1, docs/jit-scalar-design.md]"
+        );
+        println!(
+            "  chain interp  : {} hits, {} misses (shared per-instruction decode cache)",
+            cache.interp_hits(),
+            cache.interp_misses()
+        );
+        print!("  chain lengths :");
+        for (&(lo, hi), &n) in fs_jit::chain::CHAIN_LEN_BUCKETS.iter().zip(cache.len_histogram()) {
+            let label = if hi == u32::MAX { format!("{lo}+") } else if lo == hi { format!("{lo}") } else { format!("{lo}-{hi}") };
+            print!(" [{label}]={n}");
+        }
+        println!();
+        println!("  chain arena   : {} / {} bytes used", cache.arena_bytes_used(), cache.arena_capacity());
     }
     println!(
         "  guest speed   : {mips:.0} MIPS ({} insns/case avg)",
