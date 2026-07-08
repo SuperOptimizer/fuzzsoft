@@ -673,3 +673,84 @@ covered by the existing `s.contains("KASAN:")` check); KFENCE's is `"BUG: KFENCE
 not yet matched** (`kernel_crash_sig` checks `"KASAN:"` but not `"KFENCE"`), so add
 `|| s.contains("KFENCE:")` to the `hard_fault` condition at that point, but not before rv32 KFENCE
 actually exists to test it against.
+
+---
+
+## Emulator-native sanitizer fuzz-loop wiring — shipped 2026-07-08
+
+The slack-only kmalloc OOB/UAF core (`Sanitizer::alloc_with_slack`/`reopen_slack`) and the
+page-granularity core (`PageSanitizer::alloc_pages`/`free_pages`) built in `fs-san` (see
+`docs/emulator-sanitizers.md`) are now wired into `fuzzsoft fuzz`'s actual run loop
+(`crates/fs-cli/src/main.rs`), replacing the old validation-only/`--san-poison` counting stub.
+`--sanitize` now poisons unconditionally (the old separate `--san-poison` gate is a deprecated
+alias — poisoning is zero-FP now, so there's no reason to keep it opt-in twice). `--jobs > 1` stays
+incompatible (PC-hook path is serial-only, unchanged).
+
+**Wiring, per `docs/emulator-sanitizers.md`'s KASAN section item list:** `run_case`'s per-instruction
+dispatch calls, alongside the existing `hooks.on_pc`: `hooks.ksize_hit(pc, &cpu.regs)` ->
+`Sanitizer::reopen_slack` (re-opens rounding slack on `ksize()`/`__ksize()`), and
+`hooks.on_page_pc(pc, &cpu.regs)` -> `PageSanitizer::alloc_pages`/`free_pages` (whole-page
+UAF/OOB). `SanCtx` now holds `page_san: PageSanitizer` alongside `san: Sanitizer`, both re-created
+fresh at the top of every case (mirroring the existing `Sanitizer` reset), and `SanError`s from
+either core are counted in `san_errors` rather than silently dropped.
+
+**Two real false-positive mechanisms were found and fixed during validation — both fixed entirely
+from `fs-cli`, with zero changes to `fs-san`/`fs-mmu` (as scoped):**
+
+1. **`Mmu::protect`/`poison` aren't tracked by `Mmu`'s dirty-block reset.** `Snapshot::reset`'s
+   O(dirty) restore only reverts blocks marked dirty by the *content-writing* path
+   (`write`/`store`); `protect`/`poison` are permission-*only* mutations and never call
+   `mark_dirty`. Every sanitizer-poisoned byte therefore leaked permanently across every
+   subsequent case, until the guest allocator eventually reused that physical address for an
+   unrelated, live object in a later case — a real, delayed false positive with no clean way to
+   attribute it back to the sanitizer at a glance. Fixed by having `SanCtx` record every `(addr,
+   len)` range it touches each case (`SanCtx::mark_dirtied`) and manually restoring it byte-for-
+   byte from a golden permission-plane copy (`SanCtx::restore_dirtied_perms`, using only the
+   already-public `Mmu::protect`/`Mmu::planes`) right after `snap.reset()`, before the next case
+   (and also before crash minimization, which replays candidates via the sanitizer-free
+   `run_case_bus`/`snap.reset` path and would otherwise inherit the same-case leak).
+2. **`Sanitizer::alloc`/`alloc_with_slack` stamp `WRITE|RAW` unconditionally, colliding with
+   `kmalloc(..., __GFP_ZERO)`/`kzalloc()`'s in-call zeroing.** The alloc-shaped PC-hook fires at
+   the callee's *return* (the pointer isn't known until then — see `hooks.rs`), by which point
+   SLUB has already run its own `GFP_ZERO`/`init_on_alloc` zeroing memset *inside* the call
+   (`mm/slub.c`'s `slab_want_init_on_alloc`) — a real, legitimate write that happened before our
+   hook ever ran. Stamping the payload `RAW` (unwritten) at that point hides that write and faults
+   the very next legitimate read. Confirmed on the very first kmalloc the fuzzer's own corpus
+   reached: `sk_prot_alloc()`'s `kmalloc(prot->obj_size, priority | __GFP_ZERO)` fallback (used by
+   `netlink_create` -> `sk_alloc`, since `netlink_proto` has no dedicated `kmem_cache`) — verified
+   deterministically reproducible with sanitizer poisoning on and absent with it off, isolating it
+   to the sanitizer rather than a kernel/emulator bug. Fixed by dropping the `RAW` bit (keeping
+   `WRITE|READ`) on the live payload immediately after `alloc_with_slack` succeeds, and again on
+   the whole bucket after `reopen_slack` succeeds — the alloc-side analogue of `hooks.rs`'s
+   existing free-side "delay to return" fix for SLUB's freelist-pointer write. This keeps the
+   slack/OOB and free/quarantine/UAF protection (the actual ask), and only drops the
+   uninitialized-read oracle for kmalloc payloads specifically — which real KASAN doesn't have
+   either (that's KMSAN's separate, not-yet-built job per `docs/emulator-sanitizers.md`), so this
+   is not a regression against the thing being approximated.
+
+**Result (with both fixes in place):** `fuzz --sanitize --cases 500 --seed 1` and `--cases 2000
+--seed 1` against `firmware/Image` both completed with **0 kernel crashes** — and, notably, with
+coverage-bucket counts, corpus size, and syscalls-done/budget-hit counts **byte-identical** to the
+same seed/case-count run with `--sanitize` entirely absent (2000-case run: 12088 coverage buckets,
+421-program corpus, 1839 done/161 budget-hit in both cases). That exact match is strong evidence
+the sanitizer's poisoning no longer perturbs legitimate guest execution at all on this campaign —
+the 0% this task set out to confirm, replacing the old in-place cross-object redzone's measured
+~40% false-positive rate. Sanitizer activity over the 2000-case run: 73 kmalloc / 6738 kfree
+tracked, 0 page-alloc / 8 page-free (the page-alloc/free asymmetry is the documented
+`alloc_pages`/`struct page*` coverage gap, not a false positive — `PageSanitizer::free_pages` on an
+address it never saw allocated safely reports `SanError::InvalidFree` without touching memory),
+5504 total `SanError`s (overwhelmingly `kfree`/`kmem_cache_free` of objects allocated via the
+documented-unhooked `kmem_cache_alloc` path — a coverage gap, not a spatial false positive, since
+`Sanitizer::free` returns before poisoning anything when the address isn't tracked live).
+Before the RAW-vs-`GFP_ZERO` fix, the identical 500-case run produced 4 crashes (1 unique
+signature) — the false positive this section documents catching and fixing.
+
+Before this task, div-by-zero (RISC-V's other from-`docs/emulator-sanitizers.md` "build now" item)
+had no emulator-side detection at all, since RV32 DIV/0 and REM/0 are defined (saturating result,
+no trap). `fs-riscv`'s `Cpu` now carries an `Option<Vec<u32>>` UBSAN log mirroring the existing
+CMPLOG mechanism exactly (`set_ubsan`/`ubsan_take`, zero cost when disabled); `fuzz --ubsan` arms
+it once (before `Snapshot::capture`, so every case's reset restores a clean armed log for free) and
+reports a deduped-by-pc finding count. A 2000-case run against the same clean kernel found 0
+div-by-zero hits (an honest result — this kernel build's exercised syscall surface didn't reach a
+reachable div/0 in that budget, not a wiring failure) with coverage identical to the non-`--ubsan`
+baseline, confirming it's purely observational when armed and free when not.

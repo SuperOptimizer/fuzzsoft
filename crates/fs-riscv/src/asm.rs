@@ -56,6 +56,9 @@ pub fn sub(rd: u8, rs1: u8, rs2: u8) -> u32 {
 pub fn mul(rd: u8, rs1: u8, rs2: u8) -> u32 {
     r_type(0x33, 0, 0x01, rd, rs1, rs2)
 }
+pub fn divu(rd: u8, rs1: u8, rs2: u8) -> u32 {
+    r_type(0x33, 5, 0x01, rd, rs1, rs2)
+}
 pub fn beq(rs1: u8, rs2: u8, imm: i32) -> u32 {
     b_type(0x63, 0, rs1, rs2, imm)
 }

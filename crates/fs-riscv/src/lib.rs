@@ -658,6 +658,11 @@ impl Tlb {
 /// common case: an argument validated near the top of a syscall handler) is captured either way.
 const CMPLOG_CAP: usize = 8192;
 
+/// UBSAN div-by-zero log capacity — same rationale as [`CMPLOG_CAP`]: bounds recording cost so a
+/// tight div-by-zero loop can't grow the log unboundedly. The fs-cli caller dedups by PC anyway,
+/// so the first `UBSAN_CAP` hits of a case are ample signal.
+const UBSAN_CAP: usize = 8192;
+
 /// The scalar RV32IM core state.
 #[derive(Clone)]
 pub struct Cpu {
@@ -684,6 +689,14 @@ pub struct Cpu {
     /// per instruction and no allocation — the hot fuzzing loop pays nothing extra unless a case
     /// explicitly opts in via `--cmplog`.
     cmplog: Option<Vec<(u32, u32)>>,
+    /// UBSAN div-by-zero log: `Some(log)` while recording is enabled via [`Cpu::set_ubsan`],
+    /// `None` (the default) otherwise. RISC-V *defines* DIV/0 (result all-ones) and REM/0 (result
+    /// the dividend) — no trap — so this is the only way to observe it
+    /// (`docs/emulator-sanitizers.md`'s UBSAN section). Every retired `Mul`-shaped instruction
+    /// whose op is `Div`/`Divu`/`Rem`/`Remu` and whose divisor is `0` appends the faulting `pc`,
+    /// capped at [`UBSAN_CAP`]. `None` costs exactly one discriminant check per such instruction
+    /// and no allocation — zero cost unless a case explicitly opts in via `--ubsan`.
+    ubsan: Option<Vec<u32>>,
 }
 
 impl Cpu {
@@ -699,6 +712,7 @@ impl Cpu {
             hypercall_eid: None,
             tlb: Tlb::new(),
             cmplog: None,
+            ubsan: None,
         }
     }
 
@@ -719,6 +733,27 @@ impl Cpu {
     /// empty vec if recording was never enabled.
     pub fn cmplog_take(&mut self) -> Vec<(u32, u32)> {
         match &mut self.cmplog {
+            Some(log) => std::mem::take(log),
+            None => Vec::new(),
+        }
+    }
+
+    /// Enable or disable UBSAN div-by-zero recording (`docs/emulator-sanitizers.md`'s UBSAN
+    /// section). Enabling (re)starts from an empty log; disabling drops any log content and
+    /// reverts execution to zero extra cost — mirrors [`Cpu::set_cmplog`]'s cost model exactly.
+    pub fn set_ubsan(&mut self, on: bool) {
+        self.ubsan = if on { Some(Vec::new()) } else { None };
+    }
+
+    /// True if UBSAN div-by-zero recording is currently enabled.
+    pub fn ubsan_enabled(&self) -> bool {
+        self.ubsan.is_some()
+    }
+
+    /// Drain the recorded div-by-zero PCs, leaving recording enabled with a freshly emptied log.
+    /// Returns an empty vec if recording was never enabled.
+    pub fn ubsan_take(&mut self) -> Vec<u32> {
+        match &mut self.ubsan {
             Some(log) => std::mem::take(log),
             None => Vec::new(),
         }
@@ -1100,7 +1135,19 @@ impl Cpu {
                 self.wr_reg(rd, v);
             }
             Inst::Mul { op, rd, rs1, rs2 } => {
-                let v = muldiv(op, self.rd_reg(rs1), self.rd_reg(rs2));
+                let a = self.rd_reg(rs1);
+                let b = self.rd_reg(rs2);
+                // UBSAN div-by-zero: RISC-V defines DIV/0 (all-ones) and REM/0 (dividend) rather
+                // than trapping, so this is the only way to catch it — record the faulting `pc`
+                // when recording is enabled (see `Cpu::set_ubsan`'s doc comment).
+                if matches!(op, MulOp::Div | MulOp::Divu | MulOp::Rem | MulOp::Remu)
+                    && b == 0
+                    && let Some(log) = self.ubsan.as_mut()
+                    && log.len() < UBSAN_CAP
+                {
+                    log.push(pc);
+                }
+                let v = muldiv(op, a, b);
                 self.wr_reg(rd, v);
             }
             Inst::LrW { rd, rs1, .. } => {
@@ -1477,6 +1524,61 @@ mod tests {
         assert_eq!(muldiv(MulOp::Div, 0x8000_0000, 0xffff_ffff), 0x8000_0000);
         assert_eq!(muldiv(MulOp::Rem, 0x8000_0000, 0xffff_ffff), 0);
         assert_eq!(muldiv(MulOp::Mul, 6, 7), 42);
+    }
+
+    #[test]
+    fn ubsan_records_div_by_zero_pc_only_when_enabled() {
+        use asm::*;
+        // a0 = 0 (divisor), t0 = 10 (dividend); divu t1, t0, a0 -> b == 0, then ecall exit.
+        let prog = [
+            addi(A0, X0, 0),   // 0: divisor = 0
+            addi(T0, X0, 10),  // 1: t0 = 10 (dividend)
+            divu(T1, T0, A0),  // 2: t1 = t0 / a0 (div-by-zero, saturating result, no trap)
+            addi(A7, X0, 93),  // 3: exit
+            ecall(),           // 4:
+        ];
+        let base = 0x8000_0000u32;
+        let mut mmu = Mmu::new(base, 0x1_0000);
+        mmu.protect(base, 0x1_0000, PERM_READ | PERM_WRITE).unwrap();
+        let mut bytes = Vec::new();
+        for w in prog {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        mmu.map(base, &bytes, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+
+        // Disabled (default): zero cost, nothing recorded, execution unaffected.
+        let mut cpu = Cpu::new(base);
+        assert!(!cpu.ubsan_enabled());
+        loop {
+            match cpu.step(&mut mmu).unwrap() {
+                Exit::Ecall => break,
+                Exit::Continue => {}
+                other => panic!("unexpected exit {other:?}"),
+            }
+        }
+        assert_eq!(cpu.ubsan_take(), Vec::<u32>::new());
+
+        // Enabled: the div-by-zero instruction's pc is recorded exactly once, and the saturating
+        // (non-trapping) RISC-V semantics are unchanged.
+        let mut mmu2 = Mmu::new(base, 0x1_0000);
+        mmu2.protect(base, 0x1_0000, PERM_READ | PERM_WRITE).unwrap();
+        mmu2.map(base, &bytes, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+        let mut cpu2 = Cpu::new(base);
+        cpu2.set_ubsan(true);
+        assert!(cpu2.ubsan_enabled());
+        let div_pc = base + 2 * 4; // the divu instruction's address
+        loop {
+            match cpu2.step(&mut mmu2).unwrap() {
+                Exit::Ecall => break,
+                Exit::Continue => {}
+                other => panic!("unexpected exit {other:?}"),
+            }
+        }
+        assert_eq!(cpu2.regs[T1 as usize], 0xffff_ffff); // Divu/0 -> all-ones, no trap
+        assert_eq!(cpu2.ubsan_take(), vec![div_pc]);
+        // Draining clears the log but leaves recording enabled.
+        assert_eq!(cpu2.ubsan_take(), Vec::<u32>::new());
+        assert!(cpu2.ubsan_enabled());
     }
 
     #[test]

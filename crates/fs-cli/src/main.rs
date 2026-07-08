@@ -37,17 +37,74 @@ const HC_EID: u32 = 0x0A55_0000;
 const HC_SNAPSHOT: u32 = 0;
 const HC_DONE: u32 = 1;
 
-/// Emulator-level sanitizer context: PC-hooks on the kernel allocator + observed-allocation stats.
-/// First step is validation-only (prove the hooks fire on the real kernel); redzone poisoning is
-/// gated behind the SLUB false-positive analysis (docs/kernel-san.md, pending).
+/// Emulator-native kernel-heap sanitizer context: PC-hooks on the kernel allocator driving two
+/// zero-false-positive cores (`docs/emulator-sanitizers.md`) — [`fs_san::Sanitizer`]'s slack-only
+/// kmalloc OOB/UAF (`alloc_with_slack`/`reopen_slack`, never a cross-object guard — the fix for
+/// the ~40% false-positive rate the old in-place cross-object redzone measured on stock SLUB, see
+/// `docs/kernel-san.md`) and [`fs_san::PageSanitizer`]'s whole-page UAF/OOB. A poisoned-byte access
+/// the guest kernel makes is caught by the soft MMU's existing permission-fault mechanism and
+/// delivered to the kernel as a real load/store access-fault trap — so it surfaces as a kernel
+/// oops on the console, already matched by `kernel_crash_sig` (no separate "[SANITIZER]" detection
+/// path is needed for that class). `SanError`s from the bookkeeping layer itself (double-alloc/
+/// double-free/unknown-pointer/bad page order — a wiring bug or a genuinely wild pointer) don't
+/// produce a guest fault, so they're counted separately in `san_errors`.
+///
+/// `golden_perms`/`dirtied`: `fs_mmu::Mmu::protect`/`poison` (the only primitive `Sanitizer`/
+/// `PageSanitizer` use to poison/unpoison bytes) are permission-*only* mutations, and `Mmu`'s
+/// dirty-block reset tracking only marks a block dirty on the content-writing path — so a
+/// sanitizer-poisoned byte is otherwise **never** reverted by `Snapshot::reset`'s dirty-block
+/// restore, and would leak permanently across every subsequent case. Left unaddressed, the guest
+/// allocator legitimately reusing that same physical address in a later, unrelated case would
+/// fault against stale poison from a case whose own `Sanitizer`/`PageSanitizer` bookkeeping has
+/// long since been reset — a real false positive (confirmed empirically: see the validation
+/// notes). Fixed entirely from this side, with no `fs-mmu`/`fs-san` changes, by recording every
+/// `(addr, len)` range the sanitizer touches each case in `dirtied` and manually restoring it
+/// byte-for-byte from a golden permission-plane snapshot (`golden_perms`, captured once
+/// alongside `Snapshot::capture`) right after the next case's `snap.reset()`, before that case
+/// runs — using only the already-public `Mmu::protect`/`Mmu::planes` API.
 struct SanCtx {
     hooks: fs_san::PcHooks,
     san: fs_san::Sanitizer,
+    page_san: fs_san::PageSanitizer,
     lm: fs_san::LinearMap,
-    poison: bool,
+    golden_perms: Vec<u8>,
+    ram_base: u32,
+    dirtied: Vec<(u32, u32)>,
     allocs: u64,
     frees: u64,
     bytes: u64,
+    page_allocs: u64,
+    page_frees: u64,
+    san_errors: u64,
+}
+
+impl SanCtx {
+    /// Record that the sanitizer touched (or was about to touch) `[addr, addr+len)` this case —
+    /// called from every `run_case` dispatch site that goes on to call a `Sanitizer`/
+    /// `PageSanitizer` method, so the exact same range can be restored to its golden permission
+    /// byte before the next case runs (see the struct doc comment for why this is necessary).
+    fn mark_dirtied(&mut self, addr: u32, len: u32) {
+        if len > 0 {
+            self.dirtied.push((addr, len));
+        }
+    }
+
+    /// Restore every range recorded in `dirtied` (from the case that just ended) to its golden
+    /// permission byte, then clear the list — call once per case, right after `snap.reset()` and
+    /// before resetting `san`/`page_san`/`hooks` for the new case.
+    fn restore_dirtied_perms(&mut self, mmu: &mut fs_mmu::Mmu) {
+        for (addr, len) in self.dirtied.drain(..) {
+            for off in 0..len {
+                let a = addr.wrapping_add(off);
+                let Some(idx) = a.checked_sub(self.ram_base).map(|d| d as usize) else {
+                    continue;
+                };
+                if let Some(&p) = self.golden_perms.get(idx) {
+                    let _ = mmu.protect(a, 1, p);
+                }
+            }
+        }
+    }
 }
 
 /// Run one fuzz case, recording non-fall-through control-flow edges into an AFL-style bitmap.
@@ -62,23 +119,111 @@ fn run_case(
     use fs_platform::Stop;
     use fs_riscv::SysExit;
     while cpu.insns_retired < deadline {
-        if let Some(ctx) = san.as_deref_mut()
-            && let Some(ev) = ctx.hooks.on_pc(cpu.pc, &cpu.regs)
-        {
-            match ev {
-                fs_san::HookEvent::Alloc { addr, size } => {
-                    ctx.allocs += 1;
-                    ctx.bytes += size as u64;
-                    if ctx.poison && let Some(pa) = ctx.lm.va_to_pa(addr) {
-                        // Redzone around the SLUB-bucket-rounded allocation (trailing guard at the
-                        // object boundary so legitimate ksize() access doesn't fault).
-                        let _ = ctx.san.alloc(&mut m.ram, pa, fs_san::kmalloc_bucket(size));
+        if let Some(ctx) = san.as_deref_mut() {
+            let pc = cpu.pc;
+            // Byte-granular kmalloc/kfree sanitizer: slack-only (never a cross-object guard — the
+            // zero-false-positive fix for stock SLUB's packed objects, docs/emulator-sanitizers.md).
+            if let Some(ev) = ctx.hooks.on_pc(pc, &cpu.regs) {
+                match ev {
+                    fs_san::HookEvent::Alloc { addr, size } => {
+                        ctx.allocs += 1;
+                        ctx.bytes += size as u64;
+                        if let Some(pa) = ctx.lm.va_to_pa(addr) {
+                            let bucket = fs_san::kmalloc_bucket(size);
+                            ctx.mark_dirtied(pa, bucket);
+                            match ctx.san.alloc_with_slack(&mut m.ram, pa, size, bucket) {
+                                Ok(()) => {
+                                    // Drop the RAW bit on the live payload immediately:
+                                    // `alloc_with_slack` unconditionally stamps `WRITE|RAW`, but
+                                    // the alloc event only fires once the callee has *returned*
+                                    // (`hooks.rs`'s entry-then-return dance) — so a
+                                    // `kmalloc(..., __GFP_ZERO)`/`kzalloc()` allocation's
+                                    // in-call zeroing memset (SLUB zeroes on GFP_ZERO/
+                                    // init_on_alloc *inside* the call, confirmed against
+                                    // `mm/slub.c`'s `slab_want_init_on_alloc`) has already
+                                    // legitimately written every payload byte before this point.
+                                    // Stamping RAW here would hide that legitimate write and
+                                    // spuriously fault the very next read — empirically confirmed
+                                    // (see docs/emulator-sanitizers.md's validation notes: this
+                                    // exact path, `sk_prot_alloc`'s `kmalloc(obj_size,
+                                    // GFP_ZERO)` fallback for a proto with no dedicated slab,
+                                    // produced a real false positive before this fix). This is the
+                                    // alloc-side analogue of the free-side "delay to return" fix
+                                    // `hooks.rs` already applies for SLUB's kfree freelist-pointer
+                                    // write. Keep the slack (OOB) + free (UAF) protection this
+                                    // call actually asks for; drop only the uninitialized-read
+                                    // oracle for kmalloc payloads, which cannot be reliably
+                                    // distinguished from an already-zeroed GFP_ZERO allocation at
+                                    // this hook layer — consistent with real KASAN, which also has
+                                    // no uninitialized-read check (that is KMSAN's separate job,
+                                    // per docs/emulator-sanitizers.md's KMSAN section).
+                                    let _ = m.ram.protect(pa, size, PERM_WRITE | PERM_READ);
+                                }
+                                Err(_) => ctx.san_errors += 1,
+                            }
+                        }
+                    }
+                    fs_san::HookEvent::Free { addr } => {
+                        ctx.frees += 1;
+                        if let Some(pa) = ctx.lm.va_to_pa(addr) {
+                            if let Some(bucket) = ctx.san.live_size(pa) {
+                                ctx.mark_dirtied(pa, bucket);
+                            }
+                            if ctx.san.free(&mut m.ram, pa).is_err() {
+                                ctx.san_errors += 1;
+                            }
+                        }
                     }
                 }
-                fs_san::HookEvent::Free { addr } => {
-                    ctx.frees += 1;
-                    if ctx.poison && let Some(pa) = ctx.lm.va_to_pa(addr) {
-                        let _ = ctx.san.free(&mut m.ram, pa);
+            }
+            // ksize()/krealloc(): re-open rounding slack the kernel legitimately grows into. An
+            // independent query, run alongside (not instead of) on_pc — see
+            // fs_san::hooks::HookEvent's doc comment for why it's kept out of that match.
+            if let Some(va) = ctx.hooks.ksize_hit(pc, &cpu.regs)
+                && let Some(pa) = ctx.lm.va_to_pa(va)
+            {
+                if let Some(bucket) = ctx.san.live_size(pa) {
+                    ctx.mark_dirtied(pa, bucket);
+                }
+                match ctx.san.reopen_slack(&mut m.ram, pa) {
+                    Ok(()) => {
+                        // Same RAW-vs-GFP_ZERO reasoning as the alloc site above: once ksize()
+                        // legitimately re-opens the slack, the whole bucket is fair game per
+                        // fs-san's own model (`reopen_slack`'s doc comment), so drop RAW across it
+                        // too rather than risk faulting a read of memory the original allocation's
+                        // in-call zeroing (or the kernel's own subsequent write) already covered.
+                        if let Some(bucket) = ctx.san.live_size(pa) {
+                            let _ = m.ram.protect(pa, bucket, PERM_WRITE | PERM_READ);
+                        }
+                    }
+                    Err(_) => ctx.san_errors += 1,
+                }
+            }
+            // Page-granularity UAF/OOB: a separate, independent query and a separate sanitizer
+            // core (`PageSanitizer`), complementary to the byte-granular kmalloc case above.
+            if let Some(ev) = ctx.hooks.on_page_pc(pc, &cpu.regs) {
+                match ev {
+                    fs_san::PageHookEvent::Alloc { addr, order } => {
+                        ctx.page_allocs += 1;
+                        if let Some(pa) = ctx.lm.va_to_pa(addr) {
+                            if let Some(len) = fs_san::PageSanitizer::page_range_len(order) {
+                                ctx.mark_dirtied(pa, len);
+                            }
+                            if ctx.page_san.alloc_pages(&mut m.ram, pa, order).is_err() {
+                                ctx.san_errors += 1;
+                            }
+                        }
+                    }
+                    fs_san::PageHookEvent::Free { addr, order } => {
+                        ctx.page_frees += 1;
+                        if let Some(pa) = ctx.lm.va_to_pa(addr) {
+                            if let Some(len) = fs_san::PageSanitizer::page_range_len(order) {
+                                ctx.mark_dirtied(pa, len);
+                            }
+                            if ctx.page_san.free_pages(&mut m.ram, pa, order).is_err() {
+                                ctx.san_errors += 1;
+                            }
+                        }
                     }
                 }
             }
@@ -755,9 +900,9 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     let mut jobs = 1u32;
     let mut corpus_dir: Option<String> = None;
     let mut sanitize = false;
-    let mut san_poison = false;
     let mut cmplog = false;
     let mut jit = false;
+    let mut ubsan = false;
     let ram_base = 0x8000_0000u32;
     let kernel_addr = 0x8040_0000u32;
 
@@ -766,17 +911,29 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
         let key = args[i].as_str();
         let val = |i: usize| args.get(i + 1).cloned().unwrap_or_default();
         match key {
+            // Emulator-native kernel-heap sanitizer (docs/emulator-sanitizers.md): slack-only
+            // kmalloc OOB/UAF + page-granularity UAF/OOB, both zero-false-positive by
+            // construction. Poisoning is on unconditionally once this is set — there is no
+            // separate opt-in any more (see `--san-poison` below).
             "--sanitize" => {
                 sanitize = true;
                 i += 1;
                 continue;
             }
-            // Experimental: actually poison redzones. Known to false-positive on stock SLUB
-            // (packed objects) — see docs/kernel-san.md. Needs slub_debug or a KFENCE-style
-            // relocation to be usable; off by default.
+            // Deprecated alias for --sanitize, kept for existing scripts/docs. The old
+            // `--san-poison` gate existed because in-place cross-object redzone poisoning
+            // false-positived ~40% on stock SLUB (docs/kernel-san.md) — the slack-only + page
+            // cores that replaced it are zero-false-positive, so `--sanitize` itself now poisons.
             "--san-poison" => {
                 sanitize = true;
-                san_poison = true;
+                i += 1;
+                continue;
+            }
+            // UBSAN div-by-zero (docs/emulator-sanitizers.md): RISC-V DIV/0 and REM/0 are defined
+            // (saturating result, no trap), so this is the only way to catch it. Off by default —
+            // zero cost unless requested (see `Cpu::set_ubsan`).
+            "--ubsan" => {
+                ubsan = true;
                 i += 1;
                 continue;
             }
@@ -919,6 +1076,10 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
             eprintln!("fuzz: --jobs > 1 is incompatible with --jit in this first cut (serial-only)");
             return ExitCode::FAILURE;
         }
+        if ubsan {
+            eprintln!("fuzz: --jobs > 1 is incompatible with --ubsan in this first cut (serial-only)");
+            return ExitCode::FAILURE;
+        }
         // Captured right here — after boot AND after the prog/scratch address translation above
         // (which can set PTE A/D bits) — the exact instant `Snapshot::capture` would otherwise
         // capture for the serial path below. `m` is dropped immediately after: `Golden` holds its
@@ -980,12 +1141,28 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // UBSAN div-by-zero (docs/emulator-sanitizers.md): arm recording on `cpu` BEFORE
+    // `Snapshot::capture` below, so the captured golden `cpu` clone carries `ubsan: Some(empty
+    // vec)` — every `snap.reset()` then restores a clean, armed, empty log for free, with no
+    // separate per-case toggle needed (and no risk of the reset undoing a toggle set afterward).
+    if ubsan {
+        cpu.set_ubsan(true);
+    }
+
     // --- serial path (also `--sanitize`'s only path — it needs `Machine.ram: Mmu` directly for
     // the sanitizer's poison/alloc primitives): a single `Machine` + golden `Snapshot`. ---
     let snap = Snapshot::capture(&cpu, &mut m);
     let mut jit_cache = jit.then(fs_jit::BlockCache::new);
+    // Golden (post-boot) permission-plane copy, captured at the identical instant as `snap`'s own
+    // internal golden planes — feeds `SanCtx::restore_dirtied_perms`'s workaround for
+    // `Mmu::protect`/`poison` not being tracked by `Mmu`'s dirty-block reset (see `SanCtx`'s doc
+    // comment). Only allocated under --sanitize (an extra `ram_size`-byte copy otherwise unused).
+    let golden_perms: Vec<u8> = if sanitize { m.ram.planes().1.to_vec() } else { Vec::new() };
 
-    // Optional emulator-level kernel-allocator sanitizer hooks (validation-only for now).
+    // Optional emulator-native kernel-heap sanitizer (docs/emulator-sanitizers.md): slack-only
+    // kmalloc OOB/UAF + page-granularity UAF/OOB, both zero-false-positive by construction, so
+    // `--sanitize` poisons unconditionally (no separate `--san-poison` gate any more — see that
+    // flag's doc comment for why the old gate existed and no longer needs to).
     let mut san_ctx = if sanitize {
         match std::fs::read_to_string("build/linux-src/System.map") {
             Ok(text) => {
@@ -994,25 +1171,38 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
                 fs_san::register_kernel_allocator_hooks(&mut hooks, &syms);
                 let lm = fs_san::LinearMap::new(kernel_addr, ram_base, ram_size);
                 // Self-check the linear-map offset against _start: it must map to kernel_addr,
-                // else a mistranslation would poison unrelated physical memory.
+                // else a mistranslation would poison unrelated physical memory — a mistranslated
+                // sanitizer is worse than none at all, so refuse to run it rather than guess.
                 let self_check = syms
                     .get("_start")
                     .map(|&va| lm.va_to_pa(va) == Some(kernel_addr))
                     .unwrap_or(false);
-                let poison = san_poison && self_check;
-                if san_poison && !self_check {
-                    eprintln!("fuzz: sanitizer VA->PA self-check FAILED — poisoning disabled");
+                if !self_check {
+                    eprintln!(
+                        "fuzz: sanitizer VA->PA self-check FAILED — --sanitize disabled (would risk poisoning unrelated memory)"
+                    );
+                    None
+                } else {
+                    eprintln!(
+                        "fuzz: sanitizer ON — slack-only kmalloc OOB/UAF + page-granularity OOB/UAF (zero false-positive design, docs/emulator-sanitizers.md) — {} allocator symbols hooked",
+                        syms.len()
+                    );
+                    Some(SanCtx {
+                        hooks,
+                        san: fs_san::Sanitizer::new(fs_san::DEFAULT_REDZONE),
+                        page_san: fs_san::PageSanitizer::new(),
+                        lm,
+                        golden_perms,
+                        ram_base,
+                        dirtied: Vec::new(),
+                        allocs: 0,
+                        frees: 0,
+                        bytes: 0,
+                        page_allocs: 0,
+                        page_frees: 0,
+                        san_errors: 0,
+                    })
                 }
-                eprintln!("fuzz: sanitizer ON (poison={poison}) — allocator hooks registered ({} symbols)", syms.len());
-                Some(SanCtx {
-                    hooks,
-                    san: fs_san::Sanitizer::new(fs_san::DEFAULT_REDZONE),
-                    lm,
-                    poison,
-                    allocs: 0,
-                    frees: 0,
-                    bytes: 0,
-                })
             }
             Err(e) => {
                 eprintln!("fuzz: --sanitize requested but build/linux-src/System.map unreadable: {e}");
@@ -1046,6 +1236,12 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     } else {
         (VirginMap::new(), Vec::new())
     };
+    // Seed replay runs cases via `run_case_bus` (not the sanitizer-aware `run_case`), but ubsan
+    // recording lives in `Cpu::step`/`exec_one` regardless of which wrapper drives it, so any
+    // div-by-zero hit during replay would otherwise be misattributed to case 0 below. Flush it.
+    if ubsan {
+        let _ = cpu.ubsan_take();
+    }
 
     // --- coverage-guided fuzz loop over syscall *programs* ---
     let mut virgin = seed_virgin; // accumulated coverage (feedback), warm-started from the corpus
@@ -1066,6 +1262,10 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     // back to the ordinary mutator).
     let mut cmplog_traces = 0u32;
     let mut cmplog_hits = 0u32;
+    // UBSAN bookkeeping (decision: --ubsan, serial path only — see the `--jobs > 1` guard above):
+    // total div-by-zero hits observed, deduped by faulting pc (mirrors `crash_sigs`).
+    let mut ubsan_hits = 0u32;
+    let mut ubsan_pcs = std::collections::HashSet::new();
     let t0 = std::time::Instant::now();
 
     for case in 0..cases {
@@ -1108,9 +1308,16 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
         let lowered = fs_prog::lower(&prog, scratch);
 
         snap.reset(&mut cpu, &mut m);
-        // Reset per-case sanitizer state (perms are restored by snap.reset; clear the tracking).
+        // Reset per-case sanitizer state. `snap.reset` restores memory content + perms for
+        // write-touched blocks, but NOT the permission-only mutations `Sanitizer`/`PageSanitizer`
+        // make via `Mmu::protect`/`poison` — restore exactly those byte ranges back to golden
+        // first (see `SanCtx`'s doc comment), THEN reset the bookkeeping. `ubsan`'s log is
+        // restored automatically by `snap.reset` itself (see the comment where `cpu.set_ubsan` is
+        // called, above `Snapshot::capture`) — no explicit reset needed here.
         if let Some(ctx) = san_ctx.as_mut() {
+            ctx.restore_dirtied_perms(&mut m.ram);
             ctx.san = fs_san::Sanitizer::new(fs_san::DEFAULT_REDZONE);
+            ctx.page_san = fs_san::PageSanitizer::new();
             ctx.hooks.clear_pending();
         }
         let case_start = cpu.insns_retired;
@@ -1145,11 +1352,32 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
                 let nrs: Vec<u32> = prog.calls.iter().map(|c| c.desc.nr).collect();
                 eprintln!("fuzz: [KERNEL CRASH] epc={sig:#010x} case {case} calls={names:?} nrs={nrs:?}");
                 eprintln!("{}", String::from_utf8_lossy(out));
+                // Minimization replays candidates via `run_case_bus` (no sanitizer hooks), so any
+                // permission-only poisoning THIS case's sanitizer applied (not yet restored — that
+                // normally happens at the top of the next loop iteration) must be cleaned up now,
+                // or it would leak into every minimization re-run below (each of which does its
+                // own `snap.reset`, which — per `SanCtx`'s doc comment — does not revert it either).
+                if let Some(ctx) = san_ctx.as_mut() {
+                    ctx.restore_dirtied_perms(&mut m.ram);
+                }
                 // Minimize + emit a C reproducer (resets the snapshot internally; safe mid-loop).
                 handle_new_crash(
                     &mut cpu, &mut m, |cpu, m| snap.reset(cpu, m), &prog, sig, scratch, &prog_pas,
                     &scratch_pas, case_insns, base_uart,
                 );
+            }
+        }
+
+        // UBSAN oracle (decision: --ubsan): RISC-V DIV/0 and REM/0 don't trap, so `Cpu` records
+        // the faulting pc itself (see `Cpu::set_ubsan`) — drain and dedupe it here, mirroring the
+        // kernel-crash oracle above but keyed on the div instruction's pc rather than a trap epc.
+        if ubsan {
+            for pc in cpu.ubsan_take() {
+                ubsan_hits += 1;
+                if ubsan_pcs.insert(pc) {
+                    let names: Vec<&str> = prog.calls.iter().map(|c| c.desc.name).collect();
+                    eprintln!("fuzz: [UBSAN] div-by-zero at pc={pc:#010x} case {case} calls={names:?}");
+                }
             }
         }
 
@@ -1177,13 +1405,19 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     println!("  kernel crashes: {crashes}  ({} unique kernel PCs)", crash_sigs.len());
     if let Some(ctx) = &san_ctx {
         println!(
-            "  kernel allocs : {} kmalloc ({} bytes), {} kfree  [hooks fired — sanitizer path validated]",
-            ctx.allocs, ctx.bytes, ctx.frees
+            "  sanitizer     : {} kmalloc ({} bytes) / {} kfree  |  {} page-alloc / {} page-free  |  {} SanError(s)  [zero-FP slack-only + page-granularity, docs/emulator-sanitizers.md]",
+            ctx.allocs, ctx.bytes, ctx.frees, ctx.page_allocs, ctx.page_frees, ctx.san_errors
         );
     }
     if cmplog {
         println!(
             "  cmplog        : {cmplog_traces} traces, {cmplog_hits} produced a value-substitution mutation"
+        );
+    }
+    if ubsan {
+        println!(
+            "  ubsan         : {ubsan_hits} div-by-zero hit(s) ({} unique pc)",
+            ubsan_pcs.len()
         );
     }
     if let Some(cache) = &jit_cache {
