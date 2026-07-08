@@ -6,8 +6,9 @@
 
 #![forbid(unsafe_code)]
 
-use fs_mmu::{Access, Bus, Fault, FaultKind, Mmu};
+use fs_mmu::{Access, Bus, CowRam, Fault, FaultKind, Golden, Mmu};
 use fs_riscv::{Cpu, SysExit};
+use std::sync::Arc;
 
 /// Core-Local Interruptor: software interrupt (msip), timer compare (mtimecmp), and the
 /// monotonic timer (mtime). Base and register offsets match the SiFive/ACLINT CLINT.
@@ -77,6 +78,27 @@ impl Uart {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Shared physical-address routing (PR2 of the software COW design, `docs/cow-shared-ram.md`):
+// both `Machine` (owned `Mmu`) and `CowMachine` (shared-golden `CowRam`) dispatch a physical
+// address to RAM / CLINT / UART identically. Factored here once so the two `Bus` impls cannot
+// silently drift apart.
+// ---------------------------------------------------------------------------------------------
+
+pub(crate) fn in_ram(addr: u32, ram_base: u32, ram_end: u32) -> bool {
+    (ram_base..ram_end).contains(&addr)
+}
+pub(crate) fn in_clint(addr: u32) -> bool {
+    (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&addr)
+}
+pub(crate) fn in_uart(addr: u32) -> bool {
+    (UART_BASE..UART_BASE + UART_SIZE).contains(&addr)
+}
+
+pub(crate) fn mmio_fault(addr: u32, size: u8, access: Access) -> Fault {
+    Fault { addr, len: size as u32, access, kind: FaultKind::Unmapped }
+}
+
 /// The physical machine: RAM (soft-MMU) + MMIO devices.
 #[derive(Clone)]
 pub struct Machine {
@@ -99,17 +121,17 @@ impl Machine {
     }
 
     fn in_ram(&self, addr: u32) -> bool {
-        (self.ram_base..self.ram_end).contains(&addr)
+        in_ram(addr, self.ram_base, self.ram_end)
     }
     fn in_clint(&self, addr: u32) -> bool {
-        (CLINT_BASE..CLINT_BASE + CLINT_SIZE).contains(&addr)
+        in_clint(addr)
     }
     fn in_uart(&self, addr: u32) -> bool {
-        (UART_BASE..UART_BASE + UART_SIZE).contains(&addr)
+        in_uart(addr)
     }
 
     fn fault(addr: u32, size: u8, access: Access) -> Fault {
-        Fault { addr, len: size as u32, access, kind: FaultKind::Unmapped }
+        mmio_fault(addr, size, access)
     }
 }
 
@@ -143,6 +165,87 @@ impl Bus for Machine {
             self.ram.ifetch16(addr)
         } else {
             Err(Self::fault(addr, 2, Access::Exec))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// `CowMachine`: the same physical machine, but RAM is a per-lane `CowRam` copy-on-write view over
+// a shared, immutable `Arc<Golden>` image instead of an owned `Mmu`. CLINT/UART stay per-lane
+// (small, not shared/COW'd). Routing/dispatch is byte-identical to `Machine` (both call the
+// shared `in_ram`/`in_clint`/`in_uart`/`mmio_fault` free functions above), so the audited scalar
+// full-system core (`fs_riscv::Cpu::step_system(&mut dyn Bus)`) drives a `CowMachine` with zero
+// `fs-riscv` changes. See `docs/cow-shared-ram.md` (PR2) and `cow_machine.rs`'s differential test.
+pub struct CowMachine {
+    pub ram: CowRam,
+    ram_base: u32,
+    ram_end: u32,
+    pub clint: Clint,
+    pub uart: Uart,
+}
+
+impl CowMachine {
+    /// A fresh per-lane view over `golden`: RAM starts entirely golden (no overlay pages
+    /// allocated yet); CLINT/UART start at their defaults, same as `Machine::new`.
+    pub fn from_golden(golden: Arc<Golden>, ram_base: u32, ram_size: u32) -> Self {
+        debug_assert_eq!(golden.base(), ram_base, "golden base must match ram_base");
+        debug_assert_eq!(golden.size(), ram_size as usize, "golden size must match ram_size");
+        Self {
+            ram: CowRam::new(golden),
+            ram_base,
+            ram_end: ram_base.wrapping_add(ram_size),
+            clint: Clint::default(),
+            uart: Uart::default(),
+        }
+    }
+
+    /// Convenience for callers that don't already have a `Golden`: snapshot `m.ram` as the golden
+    /// image and build a `CowMachine` over it. PR3 (VecSystem) will instead capture one `Golden`
+    /// and call `from_golden` up to 16×32 times over the *same* `Arc`, so it does not use this.
+    pub fn from_machine(m: &Machine) -> Self {
+        let golden = Arc::new(Golden::from_mmu(&m.ram));
+        let ram_size = golden.size() as u32;
+        Self::from_golden(golden, m.ram_base, ram_size)
+    }
+
+    /// Revert this lane's RAM to golden (O(dirty), zero byte copy-back). CLINT/UART reset
+    /// orchestration (mirroring `Snapshot::reset`) is left to PR3, which owns the per-lane
+    /// case-reset loop.
+    pub fn reset_case(&mut self) {
+        self.ram.reset();
+    }
+}
+
+impl Bus for CowMachine {
+    fn load(&mut self, addr: u32, size: u8) -> Result<u32, Fault> {
+        if in_clint(addr) {
+            Ok(self.clint.load(addr - CLINT_BASE, size))
+        } else if in_uart(addr) {
+            Ok(self.uart.load(addr - UART_BASE))
+        } else if in_ram(addr, self.ram_base, self.ram_end) {
+            self.ram.load(addr, size)
+        } else {
+            Err(mmio_fault(addr, size, Access::Read))
+        }
+    }
+    fn store(&mut self, addr: u32, size: u8, val: u32) -> Result<(), Fault> {
+        if in_clint(addr) {
+            self.clint.store(addr - CLINT_BASE, val);
+            Ok(())
+        } else if in_uart(addr) {
+            self.uart.store(addr - UART_BASE, val);
+            Ok(())
+        } else if in_ram(addr, self.ram_base, self.ram_end) {
+            self.ram.store(addr, size, val)
+        } else {
+            Err(mmio_fault(addr, size, Access::Write))
+        }
+    }
+    fn ifetch16(&mut self, addr: u32) -> Result<u16, Fault> {
+        if in_ram(addr, self.ram_base, self.ram_end) {
+            self.ram.ifetch16(addr)
+        } else {
+            Err(mmio_fault(addr, 2, Access::Exec))
         }
     }
 }
@@ -193,15 +296,30 @@ pub enum Stop {
     Budget,
 }
 
-/// Sync the CLINT timer/IPI state into the hart for one step.
+/// Shared body of `sync_timer`/`sync_timer_cow`: push a `Clint`'s compare/pending-IPI state into
+/// the hart. Factored so `Machine` and `CowMachine` can't drift on timer semantics either.
 #[inline]
-pub fn sync_timer(cpu: &mut Cpu, machine: &Machine) {
-    cpu.csr.mtimecmp = machine.clint.mtimecmp;
-    if machine.clint.msip & 1 != 0 {
+fn apply_clint(cpu: &mut Cpu, clint: &Clint) {
+    cpu.csr.mtimecmp = clint.mtimecmp;
+    if clint.msip & 1 != 0 {
         cpu.csr.mip |= MIP_MSIP;
     } else {
         cpu.csr.mip &= !MIP_MSIP;
     }
+}
+
+/// Sync the CLINT timer/IPI state into the hart for one step.
+#[inline]
+pub fn sync_timer(cpu: &mut Cpu, machine: &Machine) {
+    apply_clint(cpu, &machine.clint);
+}
+
+/// Same as `sync_timer`, for a `CowMachine` (PR3's VecSystem per-lane fallback driver needs
+/// this — the CLINT/timer logic is identical to the scalar `Machine` path, only the RAM backing
+/// differs).
+#[inline]
+pub fn sync_timer_cow(cpu: &mut Cpu, machine: &CowMachine) {
+    apply_clint(cpu, &machine.clint);
 }
 
 /// Run until an HTIF halt, a fuzzing hypercall, or `cpu.insns_retired >= deadline`.
@@ -224,12 +342,7 @@ pub fn run_until(cpu: &mut Cpu, machine: &mut Machine, deadline: u64) -> Stop {
 pub fn run(cpu: &mut Cpu, machine: &mut Machine, max_insns: u64) -> Option<u32> {
     while cpu.insns_retired < max_insns {
         machine.clint.mtime = cpu.virtual_time();
-        cpu.csr.mtimecmp = machine.clint.mtimecmp;
-        if machine.clint.msip & 1 != 0 {
-            cpu.csr.mip |= MIP_MSIP;
-        } else {
-            cpu.csr.mip &= !MIP_MSIP;
-        }
+        apply_clint(cpu, &machine.clint);
         if let SysExit::Halt(code) = cpu.step_system(machine) {
             return Some(code);
         }
