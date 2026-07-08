@@ -1,0 +1,11 @@
+# Build for the host CPU. fuzzsoft is a single-host project pinned to an AMD Ryzen 9 7945HX
+# (Zen 4, AVX-512: avx512f/bw/dq/vl/cd/vnni) — the whole premise is a *vectorized* emulator that
+# packs 16 u32 guest lanes into one 512-bit ZMM. Without this, rustc's default x86-64 target only
+# enables sse/sse2, so `std::simd::Simd<u32,16>` silently compiles to 4× 128-bit SSE2 ops instead
+# of one AVX-512 op — verified by disassembly (default build: 0 zmm; with this: real zmm + k-mask
+# predication, and the fs-vec bench jumps from ~3-4× to ~9-11× over the scalar-per-lane baseline).
+# See crates/fs-vec/DESIGN.md. Integer emulation results are identical regardless of SIMD width, so
+# this changes only performance, not determinism. Tradeoff: binaries are host-specific (require a
+# CPU with at least these features) — acceptable and intended for this pinned research host.
+[build]
+rustflags = ["-C", "target-cpu=native"]

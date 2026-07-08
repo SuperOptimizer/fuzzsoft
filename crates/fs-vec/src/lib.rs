@@ -455,15 +455,15 @@ impl VecCpu {
 
     /// Divergent-address (or same-address-declined) load payload: `addrs` is one effective
     /// address per lane (meaningless for inactive lanes), already computed once by the caller.
-    /// Issues a single [`VecMmu::load_gather`] batch call — `LANES` independent per-lane checked
-    /// loads underneath (decision #45; the real AVX-512 executor replaces just this loop with
-    /// `vpgatherdd`), but sharing the fetch/decode/address-computation this function's caller
-    /// already did across the whole group. A lane whose load faults is halted individually
-    /// ([`VecCpu::halt`]) without disturbing any other lane's `pc`/registers/mask — only lanes
-    /// that actually succeeded advance their `pc` and (if `rd != 0`) their destination register.
-    /// Always returns `true`: unlike the same-address fast path, a gather cannot itself "decline"
-    /// as a whole — per-lane faults are the expected, fully-handled outcome, not a reason to fall
-    /// back further.
+    ///
+    /// Tries [`VecMmu::load_gather_fast`] first — the vectorized common case (every active lane
+    /// in-bounds/aligned/permitted) resolves in one gather, no per-lane Rust loop at all. Only a
+    /// lane that fast path couldn't resolve (the rare case) is re-serviced individually via
+    /// [`VecMmu::load_lane`], which halts it ([`VecCpu::halt`]) on a real fault without disturbing
+    /// any other lane's `pc`/registers/mask — only lanes that actually succeeded (by either path)
+    /// advance their `pc` and (if `rd != 0`) their destination register. Always returns `true`:
+    /// unlike the same-address fast path, a gather cannot itself "decline" as a whole — per-lane
+    /// faults are the expected, fully-handled outcome, not a reason to fall back further.
     #[allow(clippy::too_many_arguments)]
     fn try_simd_gather_load(
         &mut self,
@@ -475,30 +475,42 @@ impl VecCpu {
         signed: bool,
         mmu: &VecMmu,
     ) -> bool {
-        let results = mmu.load_gather(addrs, size, active);
+        let active_mask: Mask<i32, LANES> = Mask::from_array(active);
+        let addrs_v: Simd<u32, LANES> = Simd::from_array(addrs);
+        let (raw_v, ok) = mmu.load_gather_fast(addrs_v, size, active_mask);
+        let raw_arr = raw_v.to_array();
+        let ok_arr = ok.to_array();
+
         let mut values = [0u32; LANES];
         let mut succeeded = active;
         for lane in 0..LANES {
             if !active[lane] {
                 continue;
             }
-            match results[lane] {
-                Ok(raw) => {
-                    values[lane] = if signed {
-                        match size {
-                            1 => raw as u8 as i8 as i32 as u32,
-                            2 => raw as u16 as i16 as i32 as u32,
-                            _ => raw,
-                        }
-                    } else {
-                        raw
-                    };
+            let raw = if ok_arr[lane] {
+                raw_arr[lane]
+            } else {
+                // Rare: this one lane's address is out-of-bounds/misaligned/unpermitted. Re-check
+                // individually to get its precise Fault, exactly as the pre-fast-path code did for
+                // every lane.
+                match mmu.load_lane(lane, addrs[lane], size) {
+                    Ok(raw) => raw,
+                    Err(f) => {
+                        succeeded[lane] = false;
+                        self.halt(lane, LaneExit::Fault(f));
+                        continue;
+                    }
                 }
-                Err(f) => {
-                    succeeded[lane] = false;
-                    self.halt(lane, LaneExit::Fault(f));
+            };
+            values[lane] = if signed {
+                match size {
+                    1 => raw as u8 as i8 as i32 as u32,
+                    2 => raw as u16 as i16 as i32 as u32,
+                    _ => raw,
                 }
-            }
+            } else {
+                raw
+            };
         }
 
         let succeeded_mask: Mask<i32, LANES> = Mask::from_array(succeeded);
@@ -559,13 +571,14 @@ impl VecCpu {
     }
 
     /// Divergent-address (or same-address-declined) store payload: `addrs`/`vals` are one
-    /// effective address/value per lane, already computed once by the caller. Issues a single
-    /// [`VecMmu::store_scatter`] batch call — `LANES` independent per-lane checked stores
-    /// underneath (the real AVX-512 executor replaces just this loop with `vpscatterdd`), sharing
-    /// the fetch/decode/address/value computation the caller already did. A lane whose store
-    /// faults is halted individually without disturbing any other lane. Always returns `true` for
-    /// the same reason as [`VecCpu::try_simd_gather_load`]: per-lane faults are a fully-handled
-    /// outcome here, not a further decline.
+    /// effective address/value per lane, already computed once by the caller.
+    ///
+    /// Tries [`VecMmu::store_scatter_fast`] first — the vectorized common case (every active lane
+    /// in-bounds/aligned/permitted) commits in one gather + two scatters, no per-lane Rust loop at
+    /// all. Only a lane that fast path couldn't resolve (the rare case) is re-serviced
+    /// individually via [`VecMmu::store_lane`], which halts it without disturbing any other lane.
+    /// Always returns `true` for the same reason as [`VecCpu::try_simd_gather_load`]: per-lane
+    /// faults are a fully-handled outcome here, not a further decline.
     fn try_simd_gather_store(
         &mut self,
         ilen: u32,
@@ -575,13 +588,21 @@ impl VecCpu {
         vals: [u32; LANES],
         mmu: &mut VecMmu,
     ) -> bool {
-        let results = mmu.store_scatter(addrs, size, vals, active);
+        let active_mask: Mask<i32, LANES> = Mask::from_array(active);
+        let addrs_v: Simd<u32, LANES> = Simd::from_array(addrs);
+        let vals_v: Simd<u32, LANES> = Simd::from_array(vals);
+        let ok = mmu.store_scatter_fast(addrs_v, size, vals_v, active_mask);
+        let ok_arr = ok.to_array();
+
         let mut succeeded = active;
         for lane in 0..LANES {
-            if !active[lane] {
+            if !active[lane] || ok_arr[lane] {
                 continue;
             }
-            if let Err(f) = results[lane] {
+            // Rare: this one lane's address is out-of-bounds/misaligned/unpermitted (already left
+            // completely untouched by the fast path above) — re-check individually to get its
+            // precise Fault and commit it, exactly as the pre-fast-path code did for every lane.
+            if let Err(f) = mmu.store_lane(lane, addrs[lane], size, vals[lane]) {
                 succeeded[lane] = false;
                 self.halt(lane, LaneExit::Fault(f));
             }

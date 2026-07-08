@@ -160,6 +160,52 @@ fn counting_mem_loop_program() -> Vec<u32> {
     ]
 }
 
+/// A divergent-address ("gather/scatter") memory loop: same trip count and shape as
+/// `counting_mem_loop_program`, but `t5` is seeded to a DISTINCT address per lane (`gather_addr`,
+/// set once before the run, never recomputed by the program itself) instead of one shared address
+/// — exercising `VecCpu`'s gather/scatter SIMD fast path (`VecMmu::load_gather_fast`/
+/// `store_scatter_fast`, Goal 2) instead of the same-address path `counting_mem_loop_program`
+/// isolates. Every lane's `t5` stays within the mapped window and never overlaps another lane's,
+/// so this is still race-free, just genuinely per-lane-scattered.
+///
+/// Indices (each instruction is 4 bytes):
+/// ```text
+///  0  addi T0, X0, 0        i = 0
+///  1  addi T1, X0, ITERS    limit
+///  2  bge  T0, T1, +24      if i >= limit -> 8 (done)
+///  3  lw   T3, T5, 0        t3 = mem[t5]  (t5 preset per-lane, distinct across lanes)
+///  4  add  T3, T3, T4       t3 += seed
+///  5  sw   T5, T3, 0        mem[t5] = t3
+///  6  addi T0, T0, 1        i++
+///  7  jal  X0, -20          -> 2
+///  8  add  A0, T3, X0       done: a0 = t3
+///  9  addi A7, X0, 93       a7 = exit
+/// 10 ecall
+/// ```
+fn counting_gather_loop_program() -> Vec<u32> {
+    use asm::*;
+    vec![
+        addi(T0, X0, 0),
+        addi(T1, X0, ITERS),
+        bge(T0, T1, 24),
+        lw(T3, T5, 0),
+        add(T3, T3, T4),
+        sw(T5, T3, 0),
+        addi(T0, T0, 1),
+        jal(X0, -20),
+        add(A0, T3, X0),
+        addi(A7, X0, 93),
+        ecall(),
+    ]
+}
+
+/// Per-lane gather/scatter data address for `counting_gather_loop_program`: spread `LANES` words
+/// apart so no two lanes ever touch the same guest word, well within the mapped `0x1_0000`-byte
+/// window.
+fn gather_addr(lane: usize) -> u32 {
+    BASE + 0x400 + (lane as u32) * 4
+}
+
 fn make_mmu(prog: &[u32]) -> Mmu {
     let mut mmu = Mmu::new(BASE, 0x1_0000);
     mmu.protect(BASE, 0x1_0000, PERM_READ | PERM_WRITE).unwrap();
@@ -190,14 +236,19 @@ fn seed(lane: usize) -> u32 {
 }
 
 /// Runs `prog` on `VecCpu`, which takes the SIMD fast path for every converged ALU/branch/jump/
-/// memory instruction. Returns `(total lane-instructions retired, SIMD ALU fast-path step() calls,
-/// SIMD branch/jump fast-path step() calls, SIMD same-address memory fast-path step() calls, SIMD
-/// gather/scatter memory fast-path step() calls)`.
-fn run_simd(prog: &[u32]) -> (u64, u64, u64, u64, u64) {
+/// memory instruction. `t5_seed(lane)`, if given, presets each lane's `T5` before the run (used
+/// only by `counting_gather_loop_program`, which relies on a preset per-lane address rather than
+/// computing one in-program). Returns `(total lane-instructions retired, SIMD ALU fast-path
+/// step() calls, SIMD branch/jump fast-path step() calls, SIMD same-address memory fast-path
+/// step() calls, SIMD gather/scatter memory fast-path step() calls)`.
+fn run_simd(prog: &[u32], t5_seed: Option<fn(usize) -> u32>) -> (u64, u64, u64, u64, u64) {
     let mut mmu = make_vec_mmu(prog);
     let mut vcpu = VecCpu::new(BASE);
     for lane in 0..LANES {
         vcpu.set_reg(lane, T4, seed(lane));
+        if let Some(f) = t5_seed {
+            vcpu.set_reg(lane, T5, f(lane));
+        }
     }
     while vcpu.any_active() {
         vcpu.step(&mut mmu);
@@ -213,12 +264,15 @@ fn run_simd(prog: &[u32]) -> (u64, u64, u64, u64, u64) {
 
 /// Runs `prog` on `LANES` independent scalar `fs_riscv::Cpu`s, one instruction at a time — the
 /// scalar-over-lanes baseline `VecCpu::step` itself falls back to, run without any packing.
-fn run_scalar_over_lanes(prog: &[u32]) -> u64 {
+fn run_scalar_over_lanes(prog: &[u32], t5_seed: Option<fn(usize) -> u32>) -> u64 {
     let mut total = 0u64;
     for lane in 0..LANES {
         let mut mmu = make_mmu(prog);
         let mut cpu = fs_riscv::Cpu::new(BASE);
         cpu.regs[T4 as usize] = seed(lane);
+        if let Some(f) = t5_seed {
+            cpu.regs[T5 as usize] = f(lane);
+        }
         loop {
             match cpu.step(&mut mmu).unwrap() {
                 Exit::Continue => total += 1,
@@ -231,7 +285,7 @@ fn run_scalar_over_lanes(prog: &[u32]) -> u64 {
 }
 
 /// Times both engines on `prog` and prints the comparison, labeled `name`.
-fn bench_one(name: &str, prog: &[u32]) {
+fn bench_one(name: &str, prog: &[u32], t5_seed: Option<fn(usize) -> u32>) {
     let simd_start = Instant::now();
     let mut simd_total_insns = 0u64;
     let mut simd_alu_steps = 0u64;
@@ -239,7 +293,7 @@ fn bench_one(name: &str, prog: &[u32]) {
     let mut simd_mem_steps = 0u64;
     let mut simd_gather_steps = 0u64;
     for _ in 0..OUTER_REPEATS {
-        let (insns, alu_steps, branch_steps, mem_steps, gather_steps) = run_simd(prog);
+        let (insns, alu_steps, branch_steps, mem_steps, gather_steps) = run_simd(prog, t5_seed);
         simd_total_insns += insns;
         simd_alu_steps += alu_steps;
         simd_branch_steps += branch_steps;
@@ -251,7 +305,7 @@ fn bench_one(name: &str, prog: &[u32]) {
     let scalar_start = Instant::now();
     let mut scalar_total_insns = 0u64;
     for _ in 0..OUTER_REPEATS {
-        scalar_total_insns += run_scalar_over_lanes(prog);
+        scalar_total_insns += run_scalar_over_lanes(prog, t5_seed);
     }
     let scalar_elapsed = scalar_start.elapsed();
 
@@ -279,9 +333,19 @@ fn bench_one(name: &str, prog: &[u32]) {
 }
 
 fn main() {
-    bench_one("fs-vec throughput micro-benchmark: ALU+fetch-bound loop", &counting_alu_loop_program());
+    bench_one(
+        "fs-vec throughput micro-benchmark: ALU+fetch-bound loop",
+        &counting_alu_loop_program(),
+        None,
+    );
     bench_one(
         "fs-vec throughput micro-benchmark: same-address memory loop",
         &counting_mem_loop_program(),
+        None,
+    );
+    bench_one(
+        "fs-vec throughput micro-benchmark: divergent-address (gather/scatter) memory loop",
+        &counting_gather_loop_program(),
+        Some(gather_addr),
     );
 }
