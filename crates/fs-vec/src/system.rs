@@ -19,11 +19,12 @@
 //! per-lane scalar path. See `DESIGN.md`'s "Full-system (VecSystem)" section for the honest
 //! accounting of how often that fast path actually fires on real kernel code.
 
-use fs_mmu::{Access, Bus};
-use fs_platform::Machine;
+use fs_mmu::{Access, Bus, Golden};
+use fs_platform::{CowMachine, Machine};
 use fs_riscv::sys::{self, Priv};
 use fs_riscv::{decode, decode_compressed, AluOp, Cpu, Inst, SysExit};
 use std::simd::prelude::*;
+use std::sync::Arc;
 
 use crate::{simd_alu, LANES};
 
@@ -39,13 +40,18 @@ pub enum LaneExit {
     Hypercall(u32),
 }
 
-/// `LANES` full-system lanes: each a real `fs_riscv::Cpu` + `fs_platform::Machine` pair, stepped
-/// together. Per-lane memory is a full independent `Machine` clone (correctness-first; a
-/// COW-shared-RAM optimization, so `LANES` lanes don't each pay for `LANES` full RAM copies, is a
-/// later round — see `DESIGN.md`).
+/// `LANES` full-system lanes: each a real `fs_riscv::Cpu` + `fs_platform::CowMachine` pair,
+/// stepped together. Per-lane RAM is a page-copy-on-write view (`fs_platform::CowMachine`'s
+/// `CowRam`) over one shared, immutable `Arc<Golden>` image (`docs/cow-shared-ram.md`'s PR3): all
+/// `LANES` lanes share a single golden RAM copy process-wide, only diverging pages (stack/heap/
+/// per-lane-dirtied kernel state) pay for a private 4 KiB overlay.
 pub struct VecSystem {
     pub lanes: Box<[Cpu; LANES]>,
-    pub bus: Box<[Machine; LANES]>,
+    pub bus: Box<[CowMachine; LANES]>,
+    /// The shared immutable golden RAM image every lane's `CowMachine` COWs pages out of. Kept
+    /// alive here (not just inside each lane's `Arc` clone) so `VecSystem` can report its size /
+    /// rebuild lanes later without threading it through separately.
+    golden: Arc<Golden>,
     /// Per-lane active mask; a lane is masked off once it halts or hypercalls.
     pub active: [bool; LANES],
     /// Set exactly when a lane transitions from active to inactive.
@@ -62,17 +68,42 @@ impl VecSystem {
     /// into all `LANES` lanes — byte-identical starting state, mirroring `VecCpu::new`'s
     /// "identical lanes" contract. Seed per-lane divergent inputs afterwards with
     /// [`VecSystem::set_reg`].
+    ///
+    /// Captures `machine.ram` as ONE shared, immutable `Golden` image and builds all `LANES`
+    /// lanes as `CowMachine::from_golden` over the same `Arc` — a single golden RAM copy shared
+    /// process-wide instead of `LANES` independent full RAM clones (`docs/cow-shared-ram.md`'s
+    /// PR3). CLINT/UART start at their defaults per lane, exactly as `Machine::new` does (the
+    /// template's `machine.clint`/`machine.uart` are not carried over, matching today's
+    /// pre-swap behavior since a freshly loaded template is always CLINT/UART-default at this
+    /// point).
     pub fn from_template(cpu: &Cpu, machine: &Machine) -> Self {
         let lanes: Box<[Cpu; LANES]> = Box::new(std::array::from_fn(|_| cpu.clone()));
-        let bus: Box<[Machine; LANES]> = Box::new(std::array::from_fn(|_| machine.clone()));
+        let ram_base = machine.ram.base();
+        let ram_size = machine.ram.size() as u32;
+        let golden = Arc::new(Golden::from_mmu(&machine.ram));
+        let bus: Box<[CowMachine; LANES]> =
+            Box::new(std::array::from_fn(|_| CowMachine::from_golden(Arc::clone(&golden), ram_base, ram_size)));
         Self {
             lanes,
             bus,
+            golden,
             active: [true; LANES],
             exit: [None; LANES],
             simd_steps: 0,
             scalar_steps: 0,
         }
+    }
+
+    /// Total number of per-lane overlay pages currently allocated across all `LANES` lanes (each
+    /// 4 KiB) — the memory-drop measurement: shared golden (once) + this many private overlays vs.
+    /// `LANES` independent full RAM copies.
+    pub fn total_overlay_pages(&self) -> usize {
+        self.bus.iter().map(|b| b.ram.dirty_pages().len()).sum()
+    }
+
+    /// The shared golden RAM image's size in bytes (allocated exactly once, regardless of `LANES`).
+    pub fn golden_pages(&self) -> usize {
+        self.golden.num_pages()
     }
 
     /// Seed one lane's register (writes to x0 are dropped, matching hardware).
@@ -121,7 +152,7 @@ impl VecSystem {
                 continue;
             }
             self.bus[lane].clint.mtime = self.lanes[lane].virtual_time();
-            fs_platform::sync_timer(&mut self.lanes[lane], &self.bus[lane]);
+            fs_platform::sync_timer_cow(&mut self.lanes[lane], &self.bus[lane]);
         }
 
         if self.try_simd_alu_step() {

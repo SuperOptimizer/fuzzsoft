@@ -102,6 +102,32 @@ fn main() {
         scalar_ips / 1e6,
     );
 
+    // --- COW memory accounting (PR3, `docs/cow-shared-ram.md`): one shared golden RAM image plus
+    // however many private 4 KiB overlay pages each lane dirtied, vs. `LANES` fully independent RAM
+    // copies pre-swap. Booting a real kernel dirties a lot of RAM (this is *not* the win case —
+    // the win is short post-snapshot fuzz cases with a handful of overlay pages each), so report
+    // the honest post-boot number rather than a cherry-picked one.
+    const PAGE_SIZE_BYTES: usize = 4096;
+    let golden_bytes = vs.golden_pages() * PAGE_SIZE_BYTES;
+    let overlay_pages = vs.total_overlay_pages();
+    let overlay_bytes = overlay_pages * PAGE_SIZE_BYTES;
+    let cow_total_bytes = golden_bytes + overlay_bytes;
+    let old_total_bytes = (LANES as u64) * (RAM_MB as u64) * 0x0010_0000;
+    eprintln!(
+        "boot_vec: COW memory — golden {:.1} MB (shared once, {} pages) + {overlay_pages} overlay \
+         pages across {LANES} lanes ({:.1} MB) = {:.1} MB total",
+        golden_bytes as f64 / (1024.0 * 1024.0),
+        vs.golden_pages(),
+        overlay_bytes as f64 / (1024.0 * 1024.0),
+        cow_total_bytes as f64 / (1024.0 * 1024.0),
+    );
+    eprintln!(
+        "boot_vec: vs. {LANES} independent {RAM_MB} MB Machines = {:.1} MB ({:.1}x reduction after a \
+         full boot; short post-snapshot fuzz cases with few dirtied pages see a far bigger win)",
+        old_total_bytes as f64 / (1024.0 * 1024.0),
+        old_total_bytes as f64 / cow_total_bytes as f64,
+    );
+
     // --- The acid test itself: lane 0's console must match the scalar oracle's byte-for-byte, and
     // every lane's console must match every other lane's. ---
     let lane0_uart = vs.uart(0).to_vec();
