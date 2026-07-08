@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 fs-mmu = { path = "../fs-mmu" }
 fs-riscv = { path = "../fs-riscv" }
+fs-platform = { path = "../fs-platform" }
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -45,12 +45,22 @@
 //! See `DESIGN.md` in this crate for the full AVX-512 target (interleaved MMU — now implemented
 //! in safe Rust in [`vec_mmu`] — `vmovdqa32` same-address fast path vs `vpgatherdd`/`vpscatterdd`,
 //! masked scalarize-16 fallback for DIV/REM/MULH, and where `unsafe` will eventually live).
+//!
+//! [`system::VecSystem`] (module `system`, re-exported as [`VecSystem`]) is the separate M4
+//! **full-system** step built on top of this foundation: `LANES` independent `fs_riscv::Cpu` +
+//! `fs_platform::Machine` pairs (array-of-structures, not this module's SoA `VecCpu`), each
+//! stepped via the exact scalar `Cpu::step_system` privileged/trap/sv32 core, with a narrow
+//! convergence-gated SIMD ALU fast path layered on top. See `DESIGN.md`'s "Full-system
+//! (VecSystem)" section for the architecture, the boot-acid-test result, and the honest
+//! performance accounting.
 
 #![feature(portable_simd)]
 #![forbid(unsafe_code)]
 
+mod system;
 mod vec_mmu;
 
+pub use system::VecSystem;
 pub use vec_mmu::VecMmu;
 
 use fs_mmu::Fault;
@@ -885,7 +895,7 @@ fn alu(op: AluOp, a: u32, b: u32) -> u32 {
 /// here (add/sub wrap silently, no overflow trap), so this needs no `wrapping_*` equivalents of
 /// its own — only the shift amount needs the explicit `& 31` mask that hardware shifts impose.
 #[inline]
-fn simd_alu(op: AluOp, a: Simd<u32, LANES>, b: Simd<u32, LANES>) -> Simd<u32, LANES> {
+pub(crate) fn simd_alu(op: AluOp, a: Simd<u32, LANES>, b: Simd<u32, LANES>) -> Simd<u32, LANES> {
     let shamt = b & Simd::splat(31u32);
     match op {
         AluOp::Add => a + b,

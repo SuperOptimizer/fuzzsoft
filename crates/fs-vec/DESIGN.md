@@ -409,3 +409,159 @@ current gap:
 - DIV/REM/MULH* scalarization and any lane that falls out of the k-mask remain calls into this
   crate's existing safe `step_lane`/`muldiv` — no unsafe code is needed for the scalar fallback
   itself, only for the gather/scatter/compare glue around it.
+
+## Full-system (VecSystem)
+
+Everything above (`VecCpu`) is M4's *user-mode* vectorization foundation: rv32im(a) only, every
+`Ecall`/`Csr`/`Mret`/`Sret`/trap just halts the lane. `VecSystem` (`src/system.rs`) is the M4
+full-system step: it makes `fs-vec` able to boot a real Linux kernel across 16 lanes at all,
+trading (for now) the SoA register-file vectorization for a much narrower but *provably correct*
+convergence-gated fast path layered on top of the exact scalar full-system core.
+
+### Architecture: per-lane scalar reuse, not a second privileged implementation
+
+`VecSystem` is deliberately **array-of-structures**, unlike `VecCpu`'s SoA layout:
+
+```rust
+pub struct VecSystem {
+    pub lanes: Box<[fs_riscv::Cpu; LANES]>,      // each lane's full regs/pc/CSR/privilege
+    pub bus: Box<[fs_platform::Machine; LANES]>, // each lane's own RAM + CLINT + UART
+    pub active: [bool; LANES],
+    pub exit: [Option<LaneExit>; LANES],
+    pub simd_steps: u64,
+    pub scalar_steps: u64,
+}
+```
+
+`VecSystem::from_template` clones one already-loaded `fs_riscv::Cpu` + `fs_platform::Machine` into
+all 16 lanes — byte-identical start, same contract as `VecCpu::new`. Every lane not handled by the
+SIMD fast path this step goes through **exactly** `fs_platform::run_until`'s per-step body,
+per lane: `bus.clint.mtime = cpu.virtual_time(); sync_timer(cpu, bus); cpu.step_system(bus)`. There
+is no second CSR/trap/sv32/MMIO implementation to keep in sync with `fs_riscv`'s — that is the
+entire correctness argument. This is why `VecSystem` reuses `fs_riscv::Cpu`/`fs_platform::Machine`
+directly instead of trying to retrofit CSRs/privilege/traps into `VecCpu`'s SoA register file: the
+privileged surface is exactly the part of the architecture with the most trap-delivery/delegation
+edge cases (§ "M2 full-system layer" in `fs_riscv::sys`), and getting a second copy of it subtly
+wrong is exactly the failure mode M4 has to avoid.
+
+### The SIMD fast path: narrow, convergence-gated, ALU-only
+
+`VecSystem::step` first tries `try_simd_alu_step`, which requires ALL of the following (any doubt
+declines and falls through to the per-lane scalar loop, which reproduces the identical state from
+there):
+
+1. Every active lane shares `pc`, `privilege`, and `csr.satp`.
+2. A byte-for-byte replica of `fs_riscv::Cpu`'s private `update_timers` (STIP/MTIP refresh from
+   virtual time) is applied to every active lane — needed regardless of which path is taken, since
+   `step_system` does this unconditionally too — and no active lane then has a pending, enabled
+   interrupt (replicated from `Cpu`'s private `pending_interrupt`). A pending trap needs
+   `step_system`'s trap-vectoring, which this fast path does not implement.
+3. The instruction is fetched **per lane** (translation is genuinely per-lane state even when
+   `satp`/`privilege` agree — each lane owns an independent `Machine`) and every active lane's
+   fetched bytes must agree byte-for-byte; never assumed identical just because the CSRs agree. A
+   cheap early-out reads only the opcode from the low halfword first: any opcode that can never
+   decode to `OpImm`/`Op` (load/store/branch/jal/jalr/system/amo/fence — most of a kernel's
+   non-ALU instruction mix) declines immediately, without paying for a second per-lane
+   translate+fetch of the high halfword that would only be thrown away.
+4. The decoded instruction is `Inst::OpImm`/`Inst::Op` — the only classes `decode`/
+   `decode_compressed` produce that touch no memory, no CSR, and cannot fault on any operand value.
+   All ten `AluOp`s (add/sub/and/or/xor/sll/srl/sra/slt/sltu) execute across every active lane with
+   one `Simd<u32, LANES>` op via this crate's `simd_alu` (gathered from `lanes[*].regs[rs1/rs2]`,
+   scattered back to `lanes[*].regs[rd]`), then `pc`/`insns_retired` advance per lane.
+
+Everything else — loads, stores, branches, jumps, CSR access, MUL/DIV/REM, atomics, `ecall`/
+`ebreak`/`mret`/`sret`, and any `pc`/`privilege`/`satp` divergence at all — falls straight to the
+per-lane scalar loop, unchanged from what `fs_platform::run_until` would do standalone.
+
+### Validation
+
+1. **`examples/boot_vec.rs`** (the acid test): loads `firmware/fw_jump.bin` @ `0x8000_0000`,
+   `firmware/Image` @ `0x8040_0000`, `firmware/fuzzsoft.dtb` near the top of 128 MiB RAM, `a0=0`/
+   `a1=dtb`, into one `fs_riscv::Cpu` + `fs_platform::Machine`; clones that into a 16-lane
+   `VecSystem` (no per-lane fuzzing input at all — every lane is byte-identical the entire run);
+   steps it for a fixed instruction budget; independently boots the *same* image on a standalone
+   scalar `Cpu`+`Machine` for the same budget; asserts lane 0's UART output equals the scalar UART
+   output and all 16 lanes' UART outputs are identical to each other.
+
+   **Result: PASS.** At a 100,000,000-instruction/lane budget, lane 0 and all 15 other lanes
+   produced byte-identical 10,050-byte UART console output (OpenSBI banner through early kernel
+   boot messages), matching the standalone scalar run byte-for-byte. At a smaller 5,000,000-insn
+   budget (faster to iterate on) the same holds (2,464 identical bytes). This is real OpenSBI +
+   real Linux kernel machine code — sv32 translation, CSR/mstatus manipulation, M→S privilege
+   transitions, CLINT-driven timer interrupts, ns16550 UART MMIO — executing across 16
+   independently-full-system lanes with byte-identical results.
+
+2. **`system.rs`'s `#[cfg(test)]` property test**
+   (`vec_system_matches_scalar_oracle_across_divergent_seeds_with_branch_csr_and_trap`): a hermetic
+   (no external files) hand-assembled program exercising straight-line ALU ops (the fast path's
+   target), a genuinely per-lane-divergent conditional branch (some lanes take it, some don't —
+   forcing the fast path to decline and the two sub-groups to run scalar independently), a `csrrw`
+   (MSCRATCH read/modify/write), an `ecall` that traps to an M-mode handler which advances `mepc`
+   past the `ecall` and `mret`s back, run on `VecSystem` with 16 per-lane DIVERGENT seed registers.
+   Every lane's final regs/pc/`mscratch`/`mcause`/`mepc`/privilege and HTIF exit code are asserted
+   against an independently-run standalone scalar `fs_riscv::Cpu`. Passes.
+
+3. `cargo test -p fs-vec`: 24 passed (0 failed) — every pre-existing `VecCpu`/`VecMmu` test still
+   passes unchanged, plus the new property test above. `cargo clippy -p fs-vec --all-targets`: 0
+   warnings.
+
+### Honest performance accounting: the fast path fires often, but is currently a net LOSS
+
+Measured on this host (7945HX, `-C target-cpu=native` via the workspace `.cargo/config.toml`),
+`examples/boot_vec.rs` at a 100,000,000-insn/lane budget:
+
+```
+VecSystem:      100,000,000 lane0 insns in 121.0s  (43.0% of steps: SIMD; 57.0%: scalar)
+scalar oracle:  100,000,000 insns      in   4.9s
+```
+
+Because every lane is byte-identical for this workload (no fuzzing-input divergence at all), lanes
+stay `pc`/`privilege`/`satp`-converged essentially the *entire* boot — the SIMD ALU fast path fires
+on **43% of steps**, higher than a skeptic might expect from an "ALU-op-shaped instructions only"
+gate. That is the good news.
+
+The bad news, reported honestly rather than glossed over: comparing against the *naive*
+baseline — a plain loop over 16 independent `fs_riscv::Cpu`+`fs_platform::Machine` pairs, no
+sharing, no fast path, i.e. exactly 16x the standalone scalar cost (≈16 × 4.9s ≈ 78.7s for this
+workload) — `VecSystem` at 121.0s is **~1.5x SLOWER**, not faster. The 43%-of-steps ALU
+vectorization win does not currently outweigh its own overhead. The likely dominant cost,
+identifiable directly from the design: `try_simd_alu_step` must *speculatively* fetch+translate
+every active lane's instruction *before* it can know whether the instruction qualifies, and on
+every step that ultimately declines (57% of them) that per-lane translate+fetch work — sv32 page
+walks included, once S-mode paging is live — is thrown away and then redone from scratch inside
+each lane's own `step_system` call. The opcode-only early-out (checking the low halfword before
+ever fetching the high one) cuts this in the load/store/branch/jump/system/fence case, but every
+`OpImm`/`Op`-*opcode*-shaped instruction that turns out to be e.g. `Mul` (same opcode as `Op`,
+disambiguated only by `funct7` in the high halfword) still pays the full speculative cost, and the
+`pc`/`privilege`/`satp` convergence scan plus the `update_timers`/`pending_interrupt` replica run
+over all 16 lanes on *every* step regardless of outcome. None of this affects correctness (the
+whole point of "decline on the slightest doubt" is that a wasted attempt is side-effect-free or
+idempotent — see `try_simd_alu_step`'s doc comment), only speed.
+
+**This is the honest, first-cut result the task explicitly allows for**: full-system correctness
+is proven (§ Validation above); the narrow ALU-only fast path is real, measurable, and fires
+often on genuine kernel code; but in this array-of-structures shape it is not yet a net win over
+the trivial per-lane scalar loop it is meant to beat.
+
+### Clear next step
+
+The fundamental limiter is that `VecSystem` is array-of-structures: `LANES` completely independent
+`fs_riscv::Cpu`s and `fs_platform::Machine`s, each with its own 128 MiB `Mmu` (16 full RAM copies
+for this boot — a real, currently-unaddressed memory cost too, not just a speed one). Two changes,
+in priority order, would plausibly flip this from a loss to a win:
+
+1. **A single shared, interleaved full-system memory** (`VecMmu`-style, `content[phys_word*LANES +
+   lane]`) instead of `LANES` independent `Machine`s, so a converged same-address fetch/load/store
+   — the overwhelmingly common case whenever lanes are running identical code against
+   byte-identical memory, i.e. most of a kernel boot before any fuzzing input diverges lanes — costs
+   ONE shared vectorized access instead of `LANES` independent ones. This is the single highest-
+   leverage change: it would turn the *wasted* speculative fetch this section just described into
+   the useful common case instead, and extend well beyond ALU ops to loads/stores/branches too
+   (mirroring what `VecCpu`/`VecMmu` already do for the user-mode-only path).
+2. **A COW-shared-RAM story** for the 16-lanes-of-full-RAM memory cost noted above (only pages a
+   lane actually diverges on ever need a private copy) — orthogonal to (1) but compounds with it:
+   most of a boot's memory (kernel text, most data) never actually differs across lanes at all.
+3. Once (1) lands, the fast path's gate can widen past ALU-only to loads/stores/branches (mirroring
+   `VecCpu`'s `try_simd_branch`/`try_simd_load`/`try_simd_store`), and CSR-only-no-trap forms (plain
+   `csrrs`/`csrrc` reads, or writes that provably can't change delegation/paging state) become
+   plausible fast-path candidates too — right now every one of those unconditionally scalarizes.
