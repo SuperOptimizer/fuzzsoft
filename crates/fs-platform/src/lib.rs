@@ -167,6 +167,9 @@ impl Bus for Machine {
             Err(Self::fault(addr, 2, Access::Exec))
         }
     }
+    fn store_may_assert_interrupt(&self, addr: u32, _size: u8) -> bool {
+        self.in_clint(addr)
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -247,6 +250,9 @@ impl Bus for CowMachine {
         } else {
             Err(mmio_fault(addr, 2, Access::Exec))
         }
+    }
+    fn store_may_assert_interrupt(&self, addr: u32, _size: u8) -> bool {
+        in_clint(addr)
     }
 }
 

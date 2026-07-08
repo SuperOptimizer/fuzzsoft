@@ -46,6 +46,7 @@ name = "fs-jit"
 version = "0.0.0"
 dependencies = [
  "fs-mmu",
+ "fs-platform",
  "fs-riscv",
  "libc",
 ]

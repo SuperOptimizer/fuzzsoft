@@ -660,17 +660,22 @@ fn admission_guard_admits_when_budget_is_generous() {
     assert_eq!(cache.fallbacks(), 0);
 }
 
-fn fs_riscv_store_sw(rs1: u8, rs2: u8, imm: i32) -> u32 {
-    // S-type SW encoding (opcode 0x23, funct3=2) — only the handler code needs a real store
-    // (Store isn't Phase 1 chain scope, but the handler itself runs through the ordinary
-    // interpreter fallback after the trap redirects pc there, same as any uncompiled instruction).
+/// General S-type encoder (opcode 0x23's family — `Store`).
+fn s_type(op: u32, funct3: u32, rs1: u8, rs2: u8, imm: i32) -> u32 {
     let s_imm = imm as u32;
     ((s_imm & 0xfe0) << 20)
         | ((rs2 as u32) << 20)
         | ((rs1 as u32) << 15)
-        | (2 << 12)
+        | (funct3 << 12)
         | ((s_imm & 0x1f) << 7)
-        | 0x23
+        | op
+}
+
+fn fs_riscv_store_sw(rs1: u8, rs2: u8, imm: i32) -> u32 {
+    // SW encoding — only the admission-guard test's handler code needs a real store (Store wasn't
+    // Phase 1 chain scope when this helper was written; the handler runs through the ordinary
+    // interpreter fallback after the trap redirects pc there either way).
+    s_type(0x23, 2, rs1, rs2, imm)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -735,4 +740,521 @@ fn chain_stops_at_page_boundary_but_stays_correct() {
     assert_eq!(cpu_i.regs, cpu_j.regs);
     assert_eq!(cpu_i.pc, cpu_j.pc);
     assert_eq!(cpu_i.insns_retired, cpu_j.insns_retired);
+}
+
+// =================================================================================================
+// Phase 2 (`docs/jit-scalar-design.md`): Load/Store differential tests. `Load`/`Store` join the
+// continuable chain set, so a chain may now fault (a real translation/permission fault) or halt
+// (an HTIF `tohost` store) mid-run — neither of which Phase 1's ALU/branch-only chains could ever
+// do. This module's reference oracle (`run_reference_once`) is an INDEPENDENT (not code-shared)
+// reimplementation of what a compiled chain is supposed to do, built only from
+// `Cpu::exec_one`/`finish_exit` plus the same `Bus::store_may_assert_interrupt` hook the real
+// call-out uses — so a bug in `chain.rs`'s codegen (wrong tag bit, wrong pc commit order, wrong
+// register aliasing) has to independently reproduce itself in BOTH this oracle's logic and the
+// native codegen to slip through, rather than the test merely re-deriving the same code path.
+// =================================================================================================
+mod load_store {
+    use super::*;
+    use fs_riscv::{LoadOp, StoreOp};
+    use fs_mmu::Bus;
+
+    fn load_funct3(op: LoadOp) -> u32 {
+        match op {
+            LoadOp::Lb => 0,
+            LoadOp::Lh => 1,
+            LoadOp::Lw => 2,
+            LoadOp::Lbu => 4,
+            LoadOp::Lhu => 5,
+        }
+    }
+    fn store_funct3(op: StoreOp) -> u32 {
+        match op {
+            StoreOp::Sb => 0,
+            StoreOp::Sh => 1,
+            StoreOp::Sw => 2,
+        }
+    }
+    fn load_insn(op: LoadOp, rd: u8, rs1: u8, imm: i32) -> u32 {
+        i_type(0x03, load_funct3(op), rd, rs1, imm)
+    }
+    fn store_insn(op: StoreOp, rs1: u8, rs2: u8, imm: i32) -> u32 {
+        s_type(0x23, store_funct3(op), rs1, rs2, imm)
+    }
+
+    const ALL_LOAD_OPS: [LoadOp; 5] = [LoadOp::Lb, LoadOp::Lh, LoadOp::Lw, LoadOp::Lbu, LoadOp::Lhu];
+    const ALL_STORE_OPS: [StoreOp; 3] = [StoreOp::Sb, StoreOp::Sh, StoreOp::Sw];
+
+    // Memory layout (all within one `fs_platform::Machine`'s RAM window, distinct from its CLINT
+    // window at `fs_platform::CLINT_BASE`): a code page, a two-page READ|WRITE "good" data region
+    // (two pages so an unaligned access straddling their shared boundary is still entirely inside
+    // permitted memory — a real page-crossing exercise, not an accidental fault), and an
+    // unprotected ("no permission bits at all") data region that reliably faults any access.
+    const RAM_BASE: u32 = 0x8000_0000;
+    const RAM_SIZE: u32 = 0x10_0000;
+    const CODE_LEN: u32 = 0x1000;
+    const GOOD_DATA: u32 = RAM_BASE + 0x2000;
+    const GOOD_DATA_LEN: u32 = 0x2000;
+    const GOOD_MID: u32 = GOOD_DATA + GOOD_DATA_LEN / 2; // the shared page boundary
+    const BAD_DATA: u32 = RAM_BASE + 0x6000;
+    // Page-aligned so a bare `lui` can encode it exactly (low 12 bits must be 0 — `lui` masks
+    // them off, so a non-page-aligned target silently truncates to the wrong address, which is
+    // exactly the bug this constant's introduction fixed: an earlier version of these tests used
+    // `BAD_DATA + 0x800`/`handler + 0x100` — neither page-aligned — as an HTIF `tohost` target
+    // reached via `lui` alone, so the emitted `lui` silently truncated to a DIFFERENT address than
+    // `cpu.htif_tohost`, and the store's actual target was never recognized as the HTIF sentinel.
+    const HTIF_TOHOST: u32 = RAM_BASE + 0x7000;
+
+    fn fresh_machine(bytes: &[u8]) -> fs_platform::Machine {
+        let mut m = fs_platform::Machine::new(RAM_BASE, RAM_SIZE);
+        m.ram.protect(RAM_BASE, CODE_LEN, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+        m.ram.protect(GOOD_DATA, GOOD_DATA_LEN, PERM_READ | PERM_WRITE).unwrap();
+        // BAD_DATA is deliberately left with perms=0 (unprotected): any access there faults.
+        m.ram.map(RAM_BASE, bytes, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+        m
+    }
+
+    /// Independent reference oracle for ONE `ChainCache::run_block` dispatch, built only from
+    /// `Cpu::exec_one`/`finish_exit`/`Bus::store_may_assert_interrupt` — see the module doc.
+    /// Mirrors `decode_chain`'s classification (ALU/Load/Store are continuable; exactly one
+    /// trailing `Branch`/`Jal`/`Jalr` is terminal; anything else stops the chain before itself)
+    /// and `emit_step`'s Load/Store semantics (pc commits, trap-stops-without-retiring,
+    /// CLINT-repoll-stops-after-retiring).
+    fn run_reference_once(cpu: &mut Cpu, bus: &mut dyn Bus, program: &[u32], base_pc: u32) -> fs_riscv::SysExit {
+        let mut pc = base_pc;
+        let mut executed_any = false;
+        loop {
+            let idx = ((pc.wrapping_sub(base_pc)) / 4) as usize;
+            if idx >= program.len() {
+                cpu.pc = pc;
+                return fs_riscv::SysExit::Continue;
+            }
+            let raw = program[idx];
+            let inst = fs_riscv::decode(raw);
+            let is_continuable = matches!(
+                inst,
+                fs_riscv::Inst::Lui { .. }
+                    | fs_riscv::Inst::Auipc { .. }
+                    | fs_riscv::Inst::OpImm { .. }
+                    | fs_riscv::Inst::Op { .. }
+                    | fs_riscv::Inst::Fence
+                    | fs_riscv::Inst::Load { .. }
+                    | fs_riscv::Inst::Store { .. }
+            );
+            let is_terminal =
+                matches!(inst, fs_riscv::Inst::Branch { .. } | fs_riscv::Inst::Jal { .. } | fs_riscv::Inst::Jalr { .. });
+            if !is_continuable && !is_terminal {
+                if !executed_any {
+                    // Empty would-be chain: `ChainCache::run_block`'s own contract (mirroring
+                    // `BlockCache::run_block`'s Stage 0 fallback) is to fall back and single-step
+                    // exactly this one instruction FOR REAL (fetch+exec_one+finish_exit), not
+                    // merely leave `pc` unchanged in front of it — see `check_program`'s identical
+                    // handling above for the ALU/branch-only Phase 1 suite.
+                    let r = cpu.exec_one(bus, inst, pc, 4, raw);
+                    return cpu.finish_exit(r);
+                }
+                cpu.pc = pc; // chain ends BEFORE this instruction (not executed) — same as decode_chain
+                return fs_riscv::SysExit::Continue;
+            }
+            executed_any = true;
+
+            // Store's target address/size, computed BEFORE `exec_one` (needed for the
+            // post-success CLINT-repoll check; `exec_one` doesn't hand the address back). `x0`
+            // reads as 0 regardless of what the underlying array slot holds (mirrors `rd_reg`).
+            let store_addr_size = if let fs_riscv::Inst::Store { op, rs1, imm, .. } = inst {
+                let rs1v = if rs1 == 0 { 0 } else { cpu.regs[rs1 as usize] };
+                let size = match op {
+                    fs_riscv::StoreOp::Sb => 1,
+                    fs_riscv::StoreOp::Sh => 2,
+                    fs_riscv::StoreOp::Sw => 4,
+                };
+                Some((rs1v.wrapping_add(imm as u32), size))
+            } else {
+                None
+            };
+
+            match cpu.exec_one(bus, inst, pc, 4, raw) {
+                Err(trap) => return cpu.finish_exit(Err(trap)),
+                Ok(fs_riscv::Exit::Continue) => {
+                    if let Some((addr, size)) = store_addr_size
+                        && bus.store_may_assert_interrupt(addr, size)
+                    {
+                        // `exec_one` already committed pc/insns_retired for this store; stop here,
+                        // exactly like the compiled chain's `TAG_REPOLL` early exit.
+                        return fs_riscv::SysExit::Continue;
+                    }
+                    if is_terminal {
+                        return fs_riscv::SysExit::Continue;
+                    }
+                }
+                Ok(exit) => return cpu.finish_exit(Ok(exit)), // HTIF halt (the only other possibility here)
+            }
+            pc = cpu.pc;
+        }
+    }
+
+    /// Compare ONE `ChainCache::run_block` dispatch against [`run_reference_once`] from an
+    /// identical randomized initial state, over an identically-constructed fresh `Machine`.
+    /// Asserts bit-identical `SysExit`, all 32 regs, `pc`, `insns_retired`, and every
+    /// trap-relevant CSR field `take_trap` can touch.
+    fn check_ls_program(words: &[u32], initial_regs: [u32; 32], regs0_garbage: u32) {
+        let bytes = assemble(words);
+
+        let mut m_i = fresh_machine(&bytes);
+        let mut cpu_i = Cpu::new(RAM_BASE);
+        cpu_i.regs = initial_regs;
+        cpu_i.regs[0] = regs0_garbage;
+        cpu_i.htif_tohost = Some(BAD_DATA + 0x800); // an address neither GOOD_DATA nor a real fault would hit incidentally
+        let exit_i = run_reference_once(&mut cpu_i, &mut m_i, words, RAM_BASE);
+
+        let mut m_j = fresh_machine(&bytes);
+        let mut cpu_j = Cpu::new(RAM_BASE);
+        cpu_j.regs = initial_regs;
+        cpu_j.regs[0] = regs0_garbage;
+        cpu_j.htif_tohost = Some(BAD_DATA + 0x800);
+        let mut cache = ChainCache::with_capacity(256, 256);
+        let exit_j = cache.run_block(&mut cpu_j, &mut m_j, &mut |_| true);
+
+        assert_eq!(exit_i, exit_j, "SysExit mismatch\nprogram={words:02x?}");
+        assert_eq!(cpu_i.regs, cpu_j.regs, "register mismatch\nprogram={words:02x?}");
+        assert_eq!(cpu_i.pc, cpu_j.pc, "pc mismatch\nprogram={words:02x?}");
+        assert_eq!(cpu_i.insns_retired, cpu_j.insns_retired, "insns_retired mismatch\nprogram={words:02x?}");
+        assert_eq!(cpu_i.csr.mcause, cpu_j.csr.mcause, "mcause mismatch\nprogram={words:02x?}");
+        assert_eq!(cpu_i.csr.mepc, cpu_j.csr.mepc, "mepc mismatch\nprogram={words:02x?}");
+        assert_eq!(cpu_i.csr.mtval, cpu_j.csr.mtval, "mtval mismatch\nprogram={words:02x?}");
+        assert_eq!(cpu_i.csr.scause, cpu_j.csr.scause, "scause mismatch\nprogram={words:02x?}");
+        assert_eq!(cpu_i.csr.sepc, cpu_j.csr.sepc, "sepc mismatch\nprogram={words:02x?}");
+        assert_eq!(cpu_i.csr.stval, cpu_j.csr.stval, "stval mismatch\nprogram={words:02x?}");
+        assert_eq!(cpu_i.csr.mstatus, cpu_j.csr.mstatus, "mstatus mismatch\nprogram={words:02x?}");
+        assert_eq!(cpu_i.privilege, cpu_j.privilege, "privilege mismatch\nprogram={words:02x?}");
+        assert!(cpu_j.jit_pending_trap.is_none(), "jit_pending_trap must be drained after run_block");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Random fuzz: thousands of programs mixing ALU + Load + Store (+ optional terminal),
+    // targeting a mix of valid (aligned/misaligned/page-crossing) and faulting addresses.
+    // ---------------------------------------------------------------------------------------
+
+    const A_GOOD: u8 = 5; // t0: seeded to a safe mid-point of the two-page GOOD_DATA region
+    const A_BAD: u8 = 6; // t1: seeded to BAD_DATA (always faults)
+
+    fn random_ls_insn(rng: &mut Rng) -> u32 {
+        // rs1 drawn from: the two dedicated address registers, x0 (near-address-0, faults), or a
+        // fully random register (whatever an earlier ALU step left there — broad fuzzing entropy).
+        let rs1 = match rng.range(4) {
+            0 => A_GOOD,
+            1 => A_BAD,
+            2 => 0,
+            _ => rng.reg(),
+        };
+        // Small immediates around 0 (aligned + misaligned). `-2` relative to `A_GOOD` (seeded to
+        // `GOOD_MID`, exactly the shared page boundary of the two-page GOOD_DATA region) exercises
+        // page-crossing without deliberately faulting; RISC-V I/S-type immediates are 12-bit
+        // signed, so this can't be a large offset like `GOOD_DATA_LEN/2`.
+        let imm = rng.choice(&[-8, -3, -2, -1, 0, 1, 2, 3, 4, 8]);
+        let rd_or_rs2 = if rng.range(4) == 0 { rs1 } else { rng.reg() }; // sometimes alias rd/rs2 with rs1
+        if rng.bool() {
+            let op = rng.choice(&ALL_LOAD_OPS);
+            load_insn(op, rd_or_rs2, rs1, imm)
+        } else {
+            let op = rng.choice(&ALL_STORE_OPS);
+            store_insn(op, rs1, rd_or_rs2, imm)
+        }
+    }
+
+    fn seeded_regs(rng: &mut Rng) -> [u32; 32] {
+        let mut regs = random_regs(rng);
+        regs[A_GOOD as usize] = GOOD_MID;
+        regs[A_BAD as usize] = BAD_DATA;
+        regs
+    }
+
+    #[test]
+    fn random_alu_load_store_chains_match_interpreter() {
+        let mut rng = Rng::new(0xFEED_FACE_C0DE_1234);
+        const ITERATIONS: usize = 6_000;
+        for _ in 0..ITERATIONS {
+            let n = rng.range(10); // 0..=9 mixed ALU/Load/Store instructions
+            let mut words = Vec::new();
+            for _ in 0..n {
+                if rng.bool() {
+                    words.push(random_alu_insn(&mut rng));
+                } else {
+                    words.push(random_ls_insn(&mut rng));
+                }
+            }
+            if rng.bool() {
+                words.push(random_terminal_insn(&mut rng, words.len() as i32 * 4));
+            } else {
+                words.push(ecall());
+            }
+            let regs = seeded_regs(&mut rng);
+            let regs0_garbage = if rng.bool() { rng.next_u32() } else { 0 };
+            check_ls_program(&words, regs, regs0_garbage);
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Structured edge cases: every LoadOp/StoreOp x {valid aligned, valid misaligned, valid
+    // page-crossing, faulting} x {rd==0, rs1==0, rd==rs1 aliasing}.
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn every_load_op_x_every_address_shape() {
+        let shapes: [(u8, i32); 5] =
+            [(A_GOOD, 0), (A_GOOD, 1), (A_GOOD, -2), (A_BAD, 0), (0, 0)];
+        for &op in &ALL_LOAD_OPS {
+            for &(rs1, imm) in &shapes {
+                for rd in [0u8, 1, rs1] {
+                    let words = vec![load_insn(op, rd, rs1, imm), ecall()];
+                    let regs = seeded_regs(&mut Rng::new(0x1111));
+                    check_ls_program(&words, regs, 0xDEAD_BEEF);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_store_op_x_every_address_shape() {
+        let shapes: [(u8, i32); 5] =
+            [(A_GOOD, 0), (A_GOOD, 1), (A_GOOD, -2), (A_BAD, 0), (0, 0)];
+        for &op in &ALL_STORE_OPS {
+            for &(rs1, imm) in &shapes {
+                for rs2 in [0u8, 2, rs1] {
+                    let words = vec![store_insn(op, rs1, rs2, imm), ecall()];
+                    let mut regs = seeded_regs(&mut Rng::new(0x2222));
+                    regs[2] = 0x1234_5678;
+                    check_ls_program(&words, regs, 0xCAFE_F00D);
+                }
+            }
+        }
+    }
+
+    /// A store that faults must NOT retire (`insns_retired` unchanged from before it) and must
+    /// vector a trap exactly where the interpreter would — explicit, dedicated (not just
+    /// incidental in the random sweep) since it is the one Store-specific correctness property
+    /// most likely to regress silently (e.g. if `emit_step` bumped `insns_retired` before
+    /// checking the tag instead of after).
+    #[test]
+    fn faulting_store_does_not_retire() {
+        let words = vec![store_insn(StoreOp::Sw, A_BAD, 2, 0), ecall()];
+        let mut regs = seeded_regs(&mut Rng::new(7));
+        regs[2] = 0x42;
+        check_ls_program(&words, regs, 0);
+    }
+
+    /// A faulting Load/Store in the MIDDLE of a longer chain: everything before it must have
+    /// fully retired (regs/insns_retired reflecting exactly those instructions), and the trap
+    /// must be attributed to the faulting instruction's own pc — the scenario that most directly
+    /// exercises `emit_step`'s "write cpu.pc = this instruction's own address before the call".
+    #[test]
+    fn faulting_load_mid_chain_attributes_correct_pc() {
+        use fs_riscv::asm::*;
+        let words = vec![
+            addi(3, 0, 1),
+            addi(3, 3, 1),
+            load_insn(LoadOp::Lw, 4, A_BAD, 0), // faults here — pc must be exactly this instruction's
+            addi(3, 3, 100),                    // never reached
+            ecall(),
+        ];
+        let regs = seeded_regs(&mut Rng::new(9));
+        check_ls_program(&words, regs, 0);
+    }
+
+    /// HTIF `tohost` halt via a `Store` mid-chain: the chain must retire the halting store
+    /// (`insns_retired`/`pc` committed) and report `Halt` with the decoded exit code, exactly
+    /// like `exec_one`'s `Store` arm.
+    #[test]
+    fn htif_halt_store_mid_chain() {
+        use fs_riscv::asm::*;
+        let tohost = HTIF_TOHOST;
+        let words = vec![
+            addi(3, 0, 41),
+            lui(10, tohost),
+            addi(11, 0, 1), // exit code 0, halt-request bit set
+            fs_riscv_store_sw(10, 11, 0),
+            addi(3, 3, 100), // never reached
+            ecall(),
+        ];
+        let bytes = assemble(&words);
+        let mut m = fresh_machine(&bytes);
+        m.ram.protect(tohost & !0xfff, 0x1000, PERM_READ | PERM_WRITE).unwrap();
+        let mut cpu = Cpu::new(RAM_BASE);
+        cpu.htif_tohost = Some(tohost);
+        let mut cache = ChainCache::with_capacity(256, 256);
+        let exit = cache.run_block(&mut cpu, &mut m, &mut |_| true);
+        assert_eq!(exit, fs_riscv::SysExit::Halt(0));
+        assert_eq!(cpu.regs[3], 41);
+        assert_eq!(cpu.insns_retired, 4, "the halting store itself must have retired");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // CLINT store early-exit (task requirement (b)): a chain containing a store to the CLINT
+    // range must stop immediately after it, reproducing the interpreter's exact
+    // timer-interrupt-observability — proven here by a REAL msip-driven software interrupt that
+    // is only deliverable because the chain stopped (rather than running the rest of the chain
+    // with a stale interrupt-pending view).
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn clint_msip_store_forces_early_chain_exit_and_matches_interpreter() {
+        use fs_riscv::asm::*;
+        let handler = RAM_BASE + 0x800;
+        let clint_msip = fs_platform::CLINT_BASE; // offset 0 = msip
+
+        // A single chain: write 1 to CLINT's msip register, then (if the chain wrongly kept
+        // going instead of early-exiting) two more ALU ops that would retire BEFORE the driver
+        // ever gets a chance to resync/poll the newly-asserted software interrupt.
+        let mut prog = vec![
+            lui(20, clint_msip),
+            addi(21, 0, 1),
+            sw(20, 21, 0), // msip = 1 -- must force the chain to stop HERE
+            addi(3, 3, 1), // must NOT retire this call if the early-exit works
+            addi(3, 3, 1),
+        ];
+        prog.push(ecall());
+
+        let mut handler_code = Vec::new();
+        for w in [addi(10, 0, 77), lui(22, HTIF_TOHOST), addi(23, 0, 1), fs_riscv_store_sw(22, 23, 0)] {
+            handler_code.extend_from_slice(&w.to_le_bytes());
+        }
+        let tohost = HTIF_TOHOST;
+
+        let make = || {
+            let bytes = assemble(&prog);
+            let mut m = fresh_machine(&bytes);
+            m.ram.map(handler, &handler_code, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+            m.ram.protect(tohost & !0xfff, 0x1000, PERM_READ | PERM_WRITE).unwrap();
+            let mut cpu = Cpu::new(RAM_BASE);
+            cpu.privilege = fs_riscv::sys::Priv::M;
+            cpu.htif_tohost = Some(tohost);
+            cpu.csr.mtvec = handler;
+            cpu.csr.mie |= 1 << 3; // MSIE
+            cpu.csr.mstatus |= fs_riscv::sys::MSTATUS_MIE;
+            (cpu, m)
+        };
+
+        // Reference: the real per-instruction driver shape (CLINT resync before every single
+        // `step_system` call) — exactly `fs-cli`'s `run_case` loop.
+        let (mut cpu_i, mut m_i) = make();
+        let mut halted_i = false;
+        for _ in 0..1000 {
+            m_i.clint.mtime = cpu_i.virtual_time();
+            fs_platform::sync_timer(&mut cpu_i, &m_i);
+            if let fs_riscv::SysExit::Halt(_) = cpu_i.step_system(&mut m_i) {
+                halted_i = true;
+                break;
+            }
+        }
+        assert!(halted_i, "reference interpreter never observed the msip-driven interrupt");
+
+        // Under test: the real per-`run_block`-call driver shape — `fs-cli`'s `run_case_jit_chain`.
+        let (mut cpu_j, mut m_j) = make();
+        let mut cache = ChainCache::with_capacity(256, 256);
+        let mut halted_j = false;
+        for _ in 0..1000 {
+            m_j.clint.mtime = cpu_j.virtual_time();
+            fs_platform::sync_timer(&mut cpu_j, &m_j);
+            if let fs_riscv::SysExit::Halt(_) = cache.run_block(&mut cpu_j, &mut m_j, &mut |_| true) {
+                halted_j = true;
+                break;
+            }
+        }
+        assert!(halted_j, "ChainCache never observed the msip-driven interrupt");
+
+        assert_eq!(cpu_i.regs, cpu_j.regs, "post-interrupt register state diverged");
+        assert_eq!(cpu_i.pc, cpu_j.pc);
+        assert_eq!(cpu_i.insns_retired, cpu_j.insns_retired, "interrupt fired at a different instruction boundary");
+        assert_eq!(cpu_i.csr.mcause, cpu_j.csr.mcause);
+        assert_eq!(cpu_i.csr.mepc, cpu_j.csr.mepc);
+        assert_eq!(cpu_i.regs[10], 77, "handler must have run (a0==77)");
+        // Prove the early-exit actually mattered: had the chain kept running past the msip store,
+        // x3 would have been incremented twice (to 2) before the interrupt could ever be taken.
+        // The interrupt firing immediately after the store (before either `addi x3,x3,1`) means
+        // x3 must still be 0 when the handler (which doesn't touch x3) takes over.
+        assert_eq!(cpu_j.regs[3], 0, "chain must have stopped immediately after the CLINT store");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Coverage-edge parity (task requirement, design doc's Phase 2 section): an interleaved
+    // ALU+Load+Store+Branch program's compiled-chain run must report the identical coverage edge
+    // as the interpreter, INCLUDING the "no edge at all" case for a CLINT-repoll early exit
+    // (which must not spuriously report the chain's statically-known terminal branch as taken).
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn coverage_edge_parity_interleaved_alu_load_store_branch() {
+        use fs_riscv::asm::*;
+        let words = vec![
+            addi(3, 0, 5),
+            store_insn(StoreOp::Sw, A_GOOD, 3, 0),
+            load_insn(LoadOp::Lw, 4, A_GOOD, 0),
+            addi(4, 4, 1),
+            beq(4, 4, 8), // always taken, forward
+            addi(3, 3, 999),
+            addi(3, 3, 1),
+        ];
+        let regs = seeded_regs(&mut Rng::new(123));
+        let bytes = assemble(&words);
+
+        let mut m = fresh_machine(&bytes);
+        let mut cpu = Cpu::new(RAM_BASE);
+        cpu.regs = regs;
+        let mut cache = ChainCache::with_capacity(256, 256);
+        let entry_pc = cpu.pc;
+        let branch_pc = entry_pc + 4 * 4; // addi,store,load,addi precede the branch
+        let exit = cache.run_block(&mut cpu, &mut m, &mut |_| true);
+        assert_eq!(exit, fs_riscv::SysExit::Continue);
+        let edge = cache.take_last_edge();
+        // The branch is taken (beq x4,x4 is always true) and skips the `addi x3,x3,999` — a real,
+        // non-fallthrough transfer, so an edge (the branch's OWN pc, not the chain's entry pc,
+        // taken target) must be reported — mirrors the interpreter's own address-based heuristic.
+        assert_eq!(edge, Some((branch_pc, cpu.pc)), "expected the taken branch's edge, got {edge:?}");
+
+        // Now the CLINT-repoll variant: the same program but with the store retargeted at the
+        // CLINT window — the chain must stop right after it (never reaching the branch this
+        // call), so NO edge may be reported (the branch's statically-known offset must not leak
+        // through as a phantom edge).
+        let words2 = vec![
+            lui(7, fs_platform::CLINT_BASE),
+            addi(8, 0, 1),
+            sw(7, 8, 0), // msip = 1 -- CLINT repoll
+            beq(4, 4, 8),
+            addi(3, 3, 999),
+            addi(3, 3, 1),
+        ];
+        let bytes2 = assemble(&words2);
+        let mut m2 = fresh_machine(&bytes2);
+        let mut cpu2 = Cpu::new(RAM_BASE);
+        cpu2.regs = regs;
+        let mut cache2 = ChainCache::with_capacity(256, 256);
+        let exit2 = cache2.run_block(&mut cpu2, &mut m2, &mut |_| true);
+        assert_eq!(exit2, fs_riscv::SysExit::Continue);
+        assert_eq!(
+            cache2.take_last_edge(),
+            None,
+            "a CLINT-repoll early exit must not report the chain's unreached terminal as an edge"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // fs-diff/full-system-shaped sanity: an interleaved chain with a genuine page-crossing
+    // Load/Store right at the two GOOD_DATA pages' shared boundary.
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn page_crossing_load_and_store_match_interpreter() {
+        // `A_GOOD` is seeded to `GOOD_MID`, exactly the shared page boundary; `-2` makes a 4-byte
+        // access straddle the two GOOD_DATA pages, both permitted.
+        let mid_off = -2i32;
+        for &op in &ALL_LOAD_OPS {
+            let words = vec![load_insn(op, 4, A_GOOD, mid_off), ecall()];
+            check_ls_program(&words, seeded_regs(&mut Rng::new(55)), 0);
+        }
+        for &op in &ALL_STORE_OPS {
+            let mut regs = seeded_regs(&mut Rng::new(66));
+            regs[2] = 0xABCD_1234;
+            let words = vec![store_insn(op, A_GOOD, 2, mid_off), ecall()];
+            check_ls_program(&words, regs, 0);
+        }
+    }
 }

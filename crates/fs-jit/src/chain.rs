@@ -1,26 +1,25 @@
-//! Phase 1 of `docs/jit-scalar-design.md`: a chained ALU/branch native compiler, memory-resident
-//! regs, admission-guarded. See the design doc in full for the rationale; this module implements
-//! exactly its "Phase 1" section.
+//! Phase 1+2 of `docs/jit-scalar-design.md`: a chained ALU/branch/Load/Store native compiler,
+//! memory-resident regs, admission-guarded. See the design doc in full for the rationale.
 //!
-//! **Scope.** A compiled chain is a straight-line run of `Lui`/`Auipc`/`OpImm`/`Op`/`Fence`,
-//! optionally terminated by exactly one `Branch`/`Jal`/`Jalr` resolved with a branchless `cmov` (no
-//! emitted conditional jumps — no label table, no backpatching, no relocation). Every other `Inst`
-//! kind (`Load`, `Store`, `Mul`, `LrW`, `ScW`, `AmoW`, `Ecall`, `Ebreak`, `Csr`, `Mret`, `Sret`,
-//! `Wfi`, `SfenceVma`, `Illegal`) simply ends the chain *before* itself — that instruction is never
-//! compiled, and the native code, having retired everything before it, returns with `cpu.pc`
-//! already pointing at it so the ordinary interpreter (`Cpu::exec_one`, via the embedded Stage 0
-//! [`crate::BlockCache`]) handles it exactly as today.
+//! **Scope.** A compiled chain is a straight-line run of `Lui`/`Auipc`/`OpImm`/`Op`/`Fence`/`Load`/
+//! `Store`, optionally terminated by exactly one `Branch`/`Jal`/`Jalr` resolved with a branchless
+//! `cmov` (no *ahead-of-time-target* jump — see the Phase 2 note below on the one kind of jump
+//! this module *does* emit). Every other `Inst` kind (`Mul`, `LrW`, `ScW`, `AmoW`, `Ecall`,
+//! `Ebreak`, `Csr`, `Mret`, `Sret`, `Wfi`, `SfenceVma`, `Illegal`) simply ends the chain *before*
+//! itself — that instruction is never compiled, and the native code, having retired everything
+//! before it, returns with `cpu.pc` already pointing at it so the ordinary interpreter
+//! (`Cpu::exec_one`, via the embedded Stage 0 [`crate::BlockCache`]) handles it exactly as today.
 //!
-//! **Why a compiled Phase 1 chain can never trap or halt.** None of `Lui`/`Auipc`/`OpImm`/`Op`/
-//! `Fence`/`Branch`/`Jal`/`Jalr` can return `Err` from [`fs_riscv::Cpu::exec_one`], raise
-//! `Exit::Halt`, or need `Cpu::finish_exit`'s trap-vectoring (that all only happens via `Load`/
-//! `Store`/`Mul`/CSR/`Ecall`/`Ebreak`/`Mret`/`Sret`/`Illegal`, none of which are ever compiled into
-//! a chain). So a Phase 1 `JitFn` call always completes normally and its packed `u64` result is
-//! always the `Continue` tag (`0`) — there is no `TrapPending`/`Halt` tag to interpret yet (those
-//! arrive with Phase 2's `Load`/`Store`, per the design doc's ABI note). This is *why* Phase 1
-//! needs no `Cpu::jit_pending_trap` field and no `fs-riscv` changes at all: every field this
-//! module reads (`regs`, `pc`, `insns_retired`, `csr.mtimecmp`/`csr.stimecmp`,
-//! `kmsan_enabled`/`cmplog_enabled`/`ubsan_enabled`, `virtual_time`) was already `pub`.
+//! **Phase 1 (ALU/branch) vs Phase 2 (Load/Store): why a chain isn't uniformly "can't fail".**
+//! None of `Lui`/`Auipc`/`OpImm`/`Op`/`Fence`/`Branch`/`Jal`/`Jalr` can return `Err` from
+//! [`fs_riscv::Cpu::exec_one`], raise `Exit::Halt`, or need `Cpu::finish_exit`'s trap-vectoring —
+//! so a chain built from *only* those never needs to report anything but the plain `Continue` tag.
+//! `Load`/`Store` break that: a translation/permission fault is a real, data-dependent possibility
+//! on every access, and a `Store` to HTIF `tohost` can halt the case. Each Load/Store call-out
+//! (`sys.rs`'s `jit_load_*`/`jit_store_*` shims, wrapping the byte-for-byte-shared
+//! `fs_riscv::load_impl`/`store_impl`) returns a packed `u64` — see `sys.rs`'s `TAG_TRAP`/
+//! `TAG_HALT`/`TAG_REPOLL` doc for the exact bit layout — and `emit_step`'s Load/Store arms contain
+//! the only conditional control flow this module ever emits (see "The one kind of jump" below).
 //!
 //! **Why the chain's entry pc must be read at runtime, not baked in as a compile-time constant.**
 //! `ChainCache` is PA-keyed (mirroring [`crate::BlockCache`]'s Stage 0 rationale): the same
@@ -32,18 +31,45 @@
 //! is read fresh into a register (`R8`) at the top of every call, so the very same compiled bytes
 //! are correct no matter which VA this physical page happens to be mapped at this time.
 //!
+//! **The one kind of jump this module emits (Phase 2's `emit_skip`).** A Load/Store call-out's
+//! outcome is checked with a single `test rax,rax` (after the call), and the RARE (trap/halt/
+//! repoll) path is placed *inline*, guarded by a forward `Jcc` that skips over it in the common
+//! (successful, non-CLINT) case. Crucially this needs **no label table or backpatching**: the rare
+//! block is built into its own temporary [`Asm`] buffer first, so its exact length is known before
+//! the `Jcc`'s `rel32` is emitted — see [`emit_skip`]. This is a narrower, purpose-built mechanism
+//! than a general jump-target/relocation system, deliberately: every jump this module ever emits
+//! has exactly one, immediately-following, statically-known-length target.
+//!
 //! **Register convention** (see `emit.rs`'s doc comment for why no SIB byte is ever needed):
-//! `RDI` = cpu pointer (base for every `[rdi+disp32]` memory operand, never overwritten); `R8` =
-//! this call's entry pc (loaded once, read-only for the rest of the chain); `RAX`/`RCX` = the
-//! two-operand scratch pair for every ALU op (`RAX`=lhs, `RCX`=rhs — this is also why `RCX` is a
-//! natural choice for `Op`'s register-count shifts, which x86 hardwires to `CL`); `R9`/`R10` =
-//! branch-resolution scratch (`setcc`/`cmovcc` targets). `RSI`/`RDX` are never touched, even though
-//! Phase 1 doesn't need them, to stay Phase-2-ABI-compatible (see `sys.rs`'s `JitFn` doc).
+//! `RDI` = cpu pointer (base for every `[rdi+disp32]` memory operand); `RSI`/`RDX` = the
+//! decomposed `&mut dyn Bus` fat pointer (Phase 2: forwarded into every Load/Store call-out, per
+//! `sys.rs`'s `JitFn` doc); `R8` = this call's entry pc, loaded once. **All four** of
+//! `RDI`/`RSI`/`RDX`/`R8` are caller-saved per the SysV ABI — a real `call` is free to clobber any
+//! of them (Phase 1 had no `call` at all, so this wasn't yet a concern; an early Phase 2 bug
+//! protected only `R8` and segfaulted the moment a chain's `RDI` got clobbered mid-chain by a
+//! Load/Store call-out, since every subsequent memory operand dereferences whatever garbage `RDI`
+//! is left holding) — so [`emit_call_preserving_regs`] `push`es all four (plus one alignment-
+//! padding register, `R9`) immediately before every Load/Store `call` and `pop`s them back
+//! immediately after, restoring exactly the values every later chain instruction (and any
+//! subsequent Load/Store call-out) needs. `RAX`/`RCX` = the two-operand scratch pair for every ALU
+//! op (`RAX`=lhs, `RCX`=rhs — also why `RCX` is a natural choice for `Op`'s register-count shifts,
+//! which x86 hardwires to `CL`) and, for Load/Store, `RCX` doubles as the call-out's `va` argument
+//! (4th SysV integer arg, set up BEFORE the protecting pushes since it's freshly computed each
+//! time, not carried across the call) and `RAX` receives its packed `u64` return (deliberately
+//! left unprotected by `emit_call_preserving_regs` — it's the one register the caller WANTS
+//! clobbered, with the call's result); `R9`/`R10` = branch-resolution scratch (`setcc`/`cmovcc`
+//! targets), used only within a chain's single terminal step so a preceding Load/Store `call` can
+//! never observe them live (this is also why `R9` is a safe, meaningless-to-preserve choice for
+//! `emit_call_preserving_regs`'s alignment-padding push); `R11` = scratch for the call-out's
+//! absolute address (`movabs`+`call`, never a `rel32` direct call — the shim's fixed address can be
+//! arbitrarily far from the mmap'd arena). A `Store`'s `val` argument (5th SysV integer arg) is
+//! loaded directly into `R8` *after* `emit_call_preserving_regs` has already pushed the real `R8` —
+//! safe precisely because it's restored by the matching pop right after the call returns.
 
 #![forbid(unsafe_code)]
 
 use crate::emit::{Alu2, Asm, Cc, Reg};
-use crate::sys::Arena;
+use crate::sys::{self, Arena, TAG_HALT, TAG_REPOLL, TAG_TRAP};
 use crate::BlockCache;
 use fs_mmu::{Access, Bus};
 use fs_riscv::{AluOp, BranchOp, Cpu, Inst, SysExit, decode, decode_compressed};
@@ -232,9 +258,13 @@ impl ChainCache {
 
     /// Look up-or-compile-and-cache the chain starting at (physical) `pa`/(virtual) `va`, or
     /// single-step one instruction and return `None` if nothing was (or could be) compiled there.
-    /// See the module doc for why a chain never traps: this never needs to surface a `Trap` of its
-    /// own — any real fault at `va` is re-derived for real by the fallback path's own
-    /// `fetch`+`exec_one` call, exactly as it would be without this cache at all.
+    /// This is a purely speculative *decode* pass ([`decode_chain`] never executes anything, so it
+    /// never itself needs to surface a `Trap`) — it never needs a `Result` return of its own: any
+    /// real fault at `va`, whether at COMPILE time (this function just stops the speculative
+    /// decode early) or at RUNTIME inside a Load/Store call-out (Phase 2's `TAG_TRAP`, handled by
+    /// `run_block` after the compiled chain returns), is re-derived/reported for real by the
+    /// fallback path's own `fetch`+`exec_one` call or by `run_block`'s trap-vectoring, exactly as
+    /// it would be without this cache at all.
     fn lookup_or_compile(
         &mut self,
         cpu: &mut Cpu,
@@ -353,10 +383,40 @@ impl ChainCache {
         let slot = chain.expect("admitted implies a compiled chain");
         self.chain_hits += 1;
         self.record_len(slot.static_len);
-        let tag = self.arena.call(slot.code_off, cpu as *mut Cpu);
-        debug_assert_eq!(tag, 0, "Phase 1 chains only ever produce the Continue tag");
-        // Coverage edge, computed the SAME (address-based, not runtime-taken-based) way the
-        // interpreter's own heuristic would — see `ChainSlot::terminal`'s doc comment.
+        let (bus_data, bus_vtable) = sys::decompose_bus(bus);
+        let ret = self.arena.call(slot.code_off, cpu as *mut Cpu, bus_data, bus_vtable);
+
+        if ret & TAG_TRAP != 0 {
+            // A Load/Store call-out stashed the real `Trap` in `cpu.jit_pending_trap` just before
+            // returning this sentinel (`sys.rs`'s tag doc) — vector it exactly as the interpreter
+            // would have propagated the same `Err(trap)` from `exec_one`.
+            let trap = cpu.jit_pending_trap.take().expect("TAG_TRAP implies jit_pending_trap is set");
+            let exit = cpu.finish_exit(Err(trap));
+            if exit == SysExit::Continue {
+                self.last_edge = Some((entry_pc, cpu.pc)); // a fault always vectors a trap
+            }
+            return exit;
+        }
+        if ret & TAG_HALT != 0 {
+            // HTIF `tohost` halt, forwarded through the Store call-out exactly as `exec_one`'s
+            // `Store` arm does today — `insns_retired`/`pc` were already committed by the chain
+            // before it returned this tag (see `emit_step`'s `Store` arm).
+            return SysExit::Halt((ret & 0xffff_ffff) as u32);
+        }
+        if ret & TAG_REPOLL != 0 {
+            // A CLINT-range store retired but the chain stopped itself immediately (before
+            // reaching any statically-known terminal `Branch`/`Jal`/`Jalr` this compiled chain may
+            // have had) so the driver's per-instruction CLINT resync runs before anything else
+            // executes. This early exit's own pc transition is always a plain fallthrough (a
+            // `Store` never redirects control) — `slot.terminal` must NOT be consulted here, or a
+            // branch/jal/jalr that was never actually reached this call would be misreported as a
+            // coverage edge (`last_edge` is already `None` from the top of this function).
+            return SysExit::Continue;
+        }
+
+        // Normal completion: the compiled chain ran to its full static length. Coverage edge,
+        // computed the SAME (address-based, not runtime-taken-based) way the interpreter's own
+        // heuristic would — see `ChainSlot::terminal`'s doc comment.
         if let Some((terminal_offset, terminal_ilen)) = slot.terminal {
             let terminal_pc = pc.wrapping_add(terminal_offset);
             self.last_edge = edge_if_not_fallthrough_by(terminal_pc, cpu.pc, terminal_ilen);
@@ -384,9 +444,22 @@ impl Default for ChainCache {
     }
 }
 
-/// Is this `Inst` compileable as a non-terminal chain link (falls straight through)?
+/// Is this `Inst` compileable as a non-terminal chain link (falls straight through)? Phase 2 adds
+/// `Load`/`Store` to Phase 1's ALU/branch set (`docs/jit-scalar-design.md`'s Phase 2 scope) — both
+/// fall straight through by `ilen` just like an ALU op in the no-trap, no-CLINT-repoll case; their
+/// call-out's rare paths (trap/halt/repoll) are handled by an early `ret` from within `emit_step`
+/// itself, not by ending the chain's static shape here.
 fn is_alu_link(inst: &Inst) -> bool {
-    matches!(inst, Inst::Lui { .. } | Inst::Auipc { .. } | Inst::OpImm { .. } | Inst::Op { .. } | Inst::Fence)
+    matches!(
+        inst,
+        Inst::Lui { .. }
+            | Inst::Auipc { .. }
+            | Inst::OpImm { .. }
+            | Inst::Op { .. }
+            | Inst::Fence
+            | Inst::Load { .. }
+            | Inst::Store { .. }
+    )
 }
 
 /// Is this `Inst` a valid chain *terminator* (at most one, always last)?
@@ -467,7 +540,13 @@ fn codegen(steps: &[Step]) -> Vec<u8> {
     let last = steps.len() - 1;
     for (i, step) in steps.iter().enumerate() {
         emit_step(&mut a, step, i == last);
-        a.add_qword_mem_imm8(Reg::RDI, INSNS_RETIRED_OFF, 1);
+        // Load/Store bump `insns_retired` THEMSELVES, conditionally (only on the paths where the
+        // instruction actually retired — never on a trap) — see their `emit_step` arms. Every
+        // other instruction kind can never fail, so the blanket bump here is exactly right for
+        // them, unconditionally, matching Phase 1.
+        if !matches!(step.inst, Inst::Load { .. } | Inst::Store { .. }) {
+            a.add_qword_mem_imm8(Reg::RDI, INSNS_RETIRED_OFF, 1);
+        }
     }
 
     let last_step = &steps[last];
@@ -629,6 +708,109 @@ fn emit_step(a: &mut Asm, step: &Step, is_last: bool) {
             a.cmovcc(cc, Reg::R9, Reg::R10);
             a.mov_mem_r32(Reg::RDI, PC_OFF, Reg::R9);
         }
+        Inst::Load { op, rd, rs1, imm } => {
+            // cpu.pc = this instruction's OWN address, BEFORE the call: `fs_riscv::take_trap`
+            // reads `self.pc` as the faulting epc, and (mirroring `exec_one`'s structure, where
+            // `self.pc` is never advanced until an instruction fully commits) that must be exactly
+            // this instruction's address if the call-out reports a trap. Cheap and paid only on
+            // Load/Store, exactly like `docs/jit-scalar-design.md` specifies.
+            a.lea_r32_mem(Reg::RAX, Reg::R8, step.static_offset as i32);
+            a.mov_mem_r32(Reg::RDI, PC_OFF, Reg::RAX);
+            // va = rs1 + imm, into RCX (the shim's 4th SysV arg; RDI/RSI/RDX already hold
+            // cpu/bus_data/bus_vtable, the shim's first three args, untouched).
+            load_reg(a, Reg::RCX, rs1);
+            a.alu_r32_imm32(Alu2::Add, Reg::RCX, imm as u32);
+            emit_call_preserving_regs(a, |a| {
+                a.mov_r64_imm64(Reg::R11, sys::load_shim_addr(op));
+                a.call_r64(Reg::R11);
+            });
+            a.test_r64_r64(Reg::RAX, Reg::RAX);
+            // Bit 63 (sign) set => TAG_TRAP: stop the chain now, passing the shim's packed value
+            // straight through as this whole compiled chain's own return value (same bit layout —
+            // see `sys.rs`'s tag doc). `pc` is already correct (just set above); `insns_retired`
+            // must NOT be bumped (a faulting instruction never retires, matching `exec_one`).
+            emit_skip(a, Cc::Ns, |rare| rare.ret());
+            // No trap: this instruction retired. Bump `insns_retired` and store the loaded value
+            // (RAX's low 32 bits — always a clean `u32` in this path, see `sys.rs`'s tag doc) into
+            // `rd` (elided for `x0`).
+            a.add_qword_mem_imm8(Reg::RDI, INSNS_RETIRED_OFF, 1);
+            store_reg(a, rd, Reg::RAX);
+        }
+        Inst::Store { op, rs1, rs2, imm } => {
+            a.lea_r32_mem(Reg::RAX, Reg::R8, step.static_offset as i32);
+            a.mov_mem_r32(Reg::RDI, PC_OFF, Reg::RAX);
+            load_reg(a, Reg::RCX, rs1);
+            a.alu_r32_imm32(Alu2::Add, Reg::RCX, imm as u32);
+            emit_call_preserving_regs(a, |a| {
+                // val (the shim's 5th SysV arg, R8) — safe: the real R8 is already saved by
+                // `emit_call_preserving_regs`, restored by its matching pop right after the call.
+                load_reg(a, Reg::R8, rs2);
+                a.mov_r64_imm64(Reg::R11, sys::store_shim_addr(op));
+                a.call_r64(Reg::R11);
+            });
+            a.test_r64_r64(Reg::RAX, Reg::RAX);
+            // Bit 63 set => trap: identical early-`ret` to the Load case above.
+            emit_skip(a, Cc::Ns, |rare| rare.ret());
+            // Not a trap. `rax==0` => plain continue (fast path, falls through below); `rax!=0`
+            // (bit 62 halt | bit 61 repoll — the only two other TAG_* values a Store can produce)
+            // => this store STILL retired, so bump `insns_retired` and advance `pc` to this
+            // instruction's fallthrough (mirroring the interpreter's normal per-instruction commit)
+            // before returning the shim's tag unchanged — the SAME "retire, stop the chain" shape
+            // for both halt and repoll, since only the already-embedded tag value distinguishes
+            // them one level up (`ChainCache::run_block`), not anything computed here.
+            let next_off = (step.static_offset + step.ilen) as i32;
+            emit_skip(a, Cc::E, |rare| {
+                rare.add_qword_mem_imm8(Reg::RDI, INSNS_RETIRED_OFF, 1);
+                rare.lea_r32_mem(Reg::RCX, Reg::R8, next_off);
+                rare.mov_mem_r32(Reg::RDI, PC_OFF, Reg::RCX);
+                rare.ret();
+            });
+            // Plain continue: retired normally, nothing else to do (no `rd` for `Store`).
+            a.add_qword_mem_imm8(Reg::RDI, INSNS_RETIRED_OFF, 1);
+        }
         _ => unreachable!("decode_chain never includes a non-ALU, non-terminal instruction"),
     }
 }
+
+/// Emit `a.jcc_rel32(skip_if, len(inner))` followed by `inner`'s bytes, where `inner` is built by
+/// `build` into its own temporary buffer first (so its exact length is known up front — see the
+/// module doc's "one kind of jump" note). When `skip_if` holds at runtime, execution jumps past
+/// `inner` entirely to whatever `a` emits next; otherwise it falls straight into `inner` (which,
+/// in every call site in this module, ends in its own `ret` — `inner` is always a "handle the rare
+/// case and return" block, never a block meant to fall through to `a`'s continuation).
+fn emit_skip(a: &mut Asm, skip_if: Cc, build: impl FnOnce(&mut Asm)) {
+    let mut inner = Asm::new();
+    build(&mut inner);
+    a.jcc_rel32(skip_if, inner.buf.len() as i32);
+    a.buf.extend_from_slice(&inner.buf);
+}
+
+/// Protect every register a Load/Store call-out's `call` is free to clobber (RDI/RSI/RDX/R8 are
+/// ALL caller-saved per the SysV ABI — not just R8; RDI is the cpu pointer and RSI/RDX are the
+/// `&mut dyn Bus` fat pointer, both needed by every instruction/call-out for the rest of the
+/// chain, not merely R8's entry pc) around `emit_call` (which sets up any call-specific argument —
+/// e.g. Store's `val` into R8 — and emits the `movabs`+`call` itself), then restores them in
+/// reverse order. `R9` is pushed first purely as **16-byte-alignment padding**: the SysV ABI
+/// requires `RSP % 16 == 0` immediately before a `call` (so the callee sees `RSP % 16 == 8` at its
+/// own entry, matching how *this* chain itself was called); a chain's `RSP` is `entry_rsp` (≡ 8
+/// mod 16) at the top of every Load/Store step, and exactly **5** pushes (an odd count) restores
+/// 16-byte alignment before the `call` (4 pushes — one per real register — would leave it
+/// misaligned). `R9`'s own value doesn't need preserving (it's only ever live within a chain's
+/// single terminal step, never across a Load/Store `call`), but pushing-then-popping it is both
+/// the simplest way to get the required odd push count AND, incidentally, still round-trips
+/// whatever was in it for free. RAX (the call's return value) is deliberately left untouched by
+/// any of this.
+fn emit_call_preserving_regs(a: &mut Asm, emit_call: impl FnOnce(&mut Asm)) {
+    a.push_r64(Reg::R9);
+    a.push_r64(Reg::RDI);
+    a.push_r64(Reg::RSI);
+    a.push_r64(Reg::RDX);
+    a.push_r64(Reg::R8);
+    emit_call(a);
+    a.pop_r64(Reg::R8);
+    a.pop_r64(Reg::RDX);
+    a.pop_r64(Reg::RSI);
+    a.pop_r64(Reg::RDI);
+    a.pop_r64(Reg::R9);
+}
+

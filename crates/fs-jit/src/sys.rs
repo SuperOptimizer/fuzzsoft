@@ -26,6 +26,8 @@
 //! supposed to save. `mprotect`ing only the newly-written page(s) bounds each call's cost to a
 //! small, constant number of pages regardless of how full the arena already is.
 
+use fs_mmu::Bus;
+use fs_riscv::{Cpu, LoadOp, StoreOp};
 use std::io;
 
 /// Standard x86-64 Linux page size. Hardcoded rather than queried via `sysconf` (this crate is
@@ -39,6 +41,176 @@ const PAGE_SIZE: usize = 4096;
 /// needs no ABI break). Every `JitFn` value in this crate points into `Arena`'s R-X mapping and was
 /// produced by exactly [`crate::chain`]'s emitter — never interpreted as anything else.
 pub type JitFn = unsafe extern "C" fn(cpu: *mut fs_riscv::Cpu, bus_data: *mut (), bus_vtable: *const ()) -> u64;
+
+// -------------------------------------------------------------------------------------------
+// Phase 2 (`docs/jit-scalar-design.md`): the packed `u64` tag scheme shared by (a) a chain's own
+// `JitFn`-level return value and (b) every Load/Store call-out's return value — deliberately the
+// SAME bit layout for both, so a Load/Store's rare (trap/halt/repoll) path can simply `ret` with
+// the call-out's return value untouched and have it mean the right thing one level up, with zero
+// repacking (see `chain.rs`'s `emit_step` Load/Store arms). Bits are checked in this priority
+// order (a value only ever has at most one of these three high bits set):
+//   - bit 63 (`TAG_TRAP`): a `Trap` is pending in `Cpu::jit_pending_trap`; every other bit ignored.
+//   - bit 62 (`TAG_HALT`): HTIF `tohost` halt; bits 0..32 carry the halt code.
+//   - bit 61 (`TAG_REPOLL`): a CLINT-range store retired but the chain must stop immediately so
+//     the driver's per-instruction CLINT resync runs before anything else executes; no payload.
+//   - none of the above: plain continue; bits 0..32 carry a Load's result value (0 for Store,
+//     which has nothing to return).
+// A `u32` payload (a loaded value or a halt code) can never collide with these bits.
+// -------------------------------------------------------------------------------------------
+pub(crate) const TAG_TRAP: u64 = 1 << 63;
+pub(crate) const TAG_HALT: u64 = 1 << 62;
+pub(crate) const TAG_REPOLL: u64 = 1 << 61;
+
+/// Decompose `bus` into its two raw words (data pointer, vtable pointer) for passing across the
+/// `JitFn`/shim ABI boundary (`rsi`/`rdx` — see `JitFn`'s doc above). [`recompose_bus`] is the
+/// exact inverse; every call site in this crate uses this pair, never hand-rolling the fat-pointer
+/// layout itself.
+pub(crate) fn decompose_bus(bus: &mut dyn Bus) -> (*mut (), *const ()) {
+    // SAFETY: on this (x86-64) target, `*mut dyn Bus` and `(*mut (), *const ())` are both exactly
+    // two machine words wide with no niche/metadata beyond those two words (a trait object raw
+    // pointer is a plain (data, vtable) pair) — `transmute` between them only ever produces the
+    // two raw words here; they are never dereferenced directly, only fed back through
+    // `recompose_bus`'s exact inverse. See `bus_fat_pointer_roundtrip` below for a real call
+    // through the reconstructed reference.
+    unsafe { std::mem::transmute::<*mut dyn Bus, (*mut (), *const ())>(bus as *mut dyn Bus) }
+}
+
+/// Reconstitute the `&mut dyn Bus` that [`decompose_bus`] produced `(data, vtable)` from.
+///
+/// SAFETY: caller must pass back exactly a `(data, vtable)` pair `decompose_bus` produced from a
+/// `&mut dyn Bus` that is still live (not moved, not dropped, not aliased elsewhere) for the
+/// duration of the returned reference's use. Every call site in this crate satisfies this: the
+/// JIT shims (below) run synchronously inside one [`Arena::call`], itself inside one
+/// `ChainCache::run_block` call, which holds the real `&mut dyn Bus` on its own stack frame for
+/// the whole call and never touches it itself while a chain is running.
+unsafe fn recompose_bus<'a>(data: *mut (), vtable: *const ()) -> &'a mut dyn Bus {
+    // SAFETY: see this function's doc comment; `transmute`'s size/alignment precondition is the
+    // same one `decompose_bus` relies on, in reverse.
+    unsafe { std::mem::transmute::<(*mut (), *const ()), &mut dyn Bus>((data, vtable)) }
+}
+
+// -------------------------------------------------------------------------------------------
+// Load/Store call-out shims. Each is a fixed, process-lifetime-stable `extern "C" fn` address
+// `chain.rs`'s codegen `movabs`+`call`s. Monomorphized per `LoadOp`/`StoreOp` variant (rather than
+// taking `size`/`signed`/`op` as runtime arguments) so the call site never needs a register beyond
+// `va` (Load) / `va`+`val` (Store) on top of the already-live `cpu`/`bus_data`/`bus_vtable` — see
+// `chain.rs`'s module doc for the full SysV-argument-register accounting (this is also why there
+// is no 5th-arg register-pressure conflict with `R8`, the chain's pinned entry-pc register: it is
+// saved via `push`/`pop` around every call, which conveniently also doubles as the argument
+// register `val` needs when present — see `chain.rs`'s Store codegen).
+// -------------------------------------------------------------------------------------------
+
+/// Common Load body: call the byte-for-byte-shared [`fs_riscv::load_impl`], stash any `Trap` and
+/// return `TAG_TRAP`, else return the loaded value directly (never collides with the tag bits —
+/// see the tag doc above).
+///
+/// SAFETY: `cpu`/`bus_data`/`bus_vtable` are exactly what `ChainCache::run_block` passed into
+/// [`Arena::call`], which forwards them unchanged as this function's own `rdi`/`rsi`/`rdx` — all
+/// three are guaranteed valid, non-null, and not aliased elsewhere for the duration of this call
+/// (the call is synchronous; `run_block` holds the real `&mut Cpu`/`&mut dyn Bus` on its own stack
+/// frame and does not touch them again until the compiled chain returns).
+unsafe fn load_common(cpu: *mut Cpu, bus_data: *mut (), bus_vtable: *const (), va: u32, size: u8, signed: bool) -> u64 {
+    // SAFETY: see this function's doc comment.
+    let cpu = unsafe { &mut *cpu };
+    // SAFETY: see this function's doc comment / `recompose_bus`'s.
+    let bus = unsafe { recompose_bus(bus_data, bus_vtable) };
+    match fs_riscv::load_impl(cpu, bus, va, size, signed) {
+        Ok(v) => v as u64,
+        Err(trap) => {
+            cpu.jit_pending_trap = Some(trap);
+            TAG_TRAP
+        }
+    }
+}
+
+/// Common Store body: mirrors `fs_riscv::Cpu::exec_one`'s `Store` arm exactly (byte-for-byte
+/// reused soft-MMU write via [`fs_riscv::store_impl`], plus the identical HTIF-`tohost`-intercept
+/// check for `Sw` — `is_sw` selects it at compile time, matching which shim function called this),
+/// then additionally (Phase 2's new behavior, absent from the interpreter because the interpreter
+/// re-syncs the CLINT before every single instruction anyway) tags a CLINT-range store so the
+/// compiled chain stops immediately instead of continuing to run with a stale interrupt-pending
+/// view. SAFETY: see [`load_common`]'s doc comment (identical argument).
+unsafe fn store_common(
+    cpu: *mut Cpu,
+    bus_data: *mut (),
+    bus_vtable: *const (),
+    va: u32,
+    val: u32,
+    size: u8,
+    is_sw: bool,
+) -> u64 {
+    // SAFETY: see `load_common`'s doc comment.
+    let cpu = unsafe { &mut *cpu };
+    // SAFETY: see `load_common`'s doc comment / `recompose_bus`'s.
+    let bus = unsafe { recompose_bus(bus_data, bus_vtable) };
+    if is_sw && cpu.htif_tohost == Some(va) {
+        match fs_riscv::store_impl(cpu, bus, va, size, val) {
+            Ok(()) => {
+                if val & 1 != 0 {
+                    return TAG_HALT | ((val >> 1) as u64);
+                }
+            }
+            Err(trap) => {
+                cpu.jit_pending_trap = Some(trap);
+                return TAG_TRAP;
+            }
+        }
+    } else if let Err(trap) = fs_riscv::store_impl(cpu, bus, va, size, val) {
+        cpu.jit_pending_trap = Some(trap);
+        return TAG_TRAP;
+    }
+    if bus.store_may_assert_interrupt(va, size) { TAG_REPOLL } else { 0 }
+}
+
+unsafe extern "C" fn jit_load_lb(cpu: *mut Cpu, bus_data: *mut (), bus_vtable: *const (), va: u32) -> u64 {
+    unsafe { load_common(cpu, bus_data, bus_vtable, va, 1, true) }
+}
+unsafe extern "C" fn jit_load_lbu(cpu: *mut Cpu, bus_data: *mut (), bus_vtable: *const (), va: u32) -> u64 {
+    unsafe { load_common(cpu, bus_data, bus_vtable, va, 1, false) }
+}
+unsafe extern "C" fn jit_load_lh(cpu: *mut Cpu, bus_data: *mut (), bus_vtable: *const (), va: u32) -> u64 {
+    unsafe { load_common(cpu, bus_data, bus_vtable, va, 2, true) }
+}
+unsafe extern "C" fn jit_load_lhu(cpu: *mut Cpu, bus_data: *mut (), bus_vtable: *const (), va: u32) -> u64 {
+    unsafe { load_common(cpu, bus_data, bus_vtable, va, 2, false) }
+}
+unsafe extern "C" fn jit_load_lw(cpu: *mut Cpu, bus_data: *mut (), bus_vtable: *const (), va: u32) -> u64 {
+    unsafe { load_common(cpu, bus_data, bus_vtable, va, 4, false) }
+}
+
+unsafe extern "C" fn jit_store_sb(cpu: *mut Cpu, bus_data: *mut (), bus_vtable: *const (), va: u32, val: u32) -> u64 {
+    unsafe { store_common(cpu, bus_data, bus_vtable, va, val, 1, false) }
+}
+unsafe extern "C" fn jit_store_sh(cpu: *mut Cpu, bus_data: *mut (), bus_vtable: *const (), va: u32, val: u32) -> u64 {
+    unsafe { store_common(cpu, bus_data, bus_vtable, va, val, 2, false) }
+}
+unsafe extern "C" fn jit_store_sw(cpu: *mut Cpu, bus_data: *mut (), bus_vtable: *const (), va: u32, val: u32) -> u64 {
+    unsafe { store_common(cpu, bus_data, bus_vtable, va, val, 4, true) }
+}
+
+/// The fixed process-lifetime address `chain.rs`'s codegen `movabs`+`call`s for a given `LoadOp`
+/// (Rust function addresses don't move — see `JitFn`'s doc — so this is safe to bake into
+/// compiled-once native code and reuse across every dispatch of that chain).
+pub(crate) fn load_shim_addr(op: LoadOp) -> u64 {
+    let f: unsafe extern "C" fn(*mut Cpu, *mut (), *const (), u32) -> u64 = match op {
+        LoadOp::Lb => jit_load_lb,
+        LoadOp::Lbu => jit_load_lbu,
+        LoadOp::Lh => jit_load_lh,
+        LoadOp::Lhu => jit_load_lhu,
+        LoadOp::Lw => jit_load_lw,
+    };
+    f as usize as u64
+}
+
+/// Same as [`load_shim_addr`], for `StoreOp`.
+pub(crate) fn store_shim_addr(op: StoreOp) -> u64 {
+    let f: unsafe extern "C" fn(*mut Cpu, *mut (), *const (), u32, u32) -> u64 = match op {
+        StoreOp::Sb => jit_store_sb,
+        StoreOp::Sh => jit_store_sh,
+        StoreOp::Sw => jit_store_sw,
+    };
+    f as usize as u64
+}
 
 /// Total arena size: generously large for a fuzz campaign's ALU/branch working set while staying a
 /// small, fixed, single `mmap` (no growth/relocation machinery in Phase 1 — see [`Arena::write`]).
@@ -141,23 +313,25 @@ impl Arena {
 
     /// Call the chain compiled at byte offset `off` (must be a value previously returned by
     /// [`Arena::write`] on `self` — never one from a different `Arena`, and never after the arena
-    /// has been dropped). `cpu` is forwarded unchanged as `rdi`; `rsi`/`rdx` are passed as null —
-    /// sound only because every Phase 1-emitted chain provably never reads or writes them (see the
-    /// `JitFn` doc comment). Safe to call at any time (the arena is always `R-X` whenever this
-    /// runs, by construction — see the module doc) but relies on `off` addressing bytes this
-    /// `Arena` itself emitted via [`crate::chain`]'s emitter, which is the actual unsafety this
-    /// function packages up: a caller could in principle pass a bogus offset. `ChainCache` (the
-    /// only caller) always passes back exactly what `write` returned, immediately followed here.
-    pub fn call(&self, off: u32, cpu: *mut fs_riscv::Cpu) -> u64 {
+    /// has been dropped). `cpu` is forwarded unchanged as `rdi`; `bus_data`/`bus_vtable` (Phase 2:
+    /// [`decompose_bus`]'s output) are forwarded unchanged as `rsi`/`rdx`, kept live across the
+    /// whole chain and forwarded again into every Load/Store call-out — see the `JitFn` doc
+    /// comment. Safe to call at any time (the arena is always `R-X` whenever this runs, by
+    /// construction — see the module doc) but relies on `off` addressing bytes this `Arena` itself
+    /// emitted via [`crate::chain`]'s emitter, which is the actual unsafety this function packages
+    /// up: a caller could in principle pass a bogus offset. `ChainCache` (the only caller) always
+    /// passes back exactly what `write` returned, immediately followed here.
+    pub fn call(&self, off: u32, cpu: *mut fs_riscv::Cpu, bus_data: *mut (), bus_vtable: *const ()) -> u64 {
         // SAFETY: `self.ptr + off` lies within a range `write` already `mprotect`'d to `R-X` (and
         // never touches again — see the module doc), so it is currently executable; the bytes
         // there were emitted by `chain`'s codegen to exactly
-        // match `JitFn`'s calling convention (rdi=cpu, ret=u64, no other register/stack
-        // preconditions — see `chain.rs`'s codegen doc). Transmuting a data pointer to a function
-        // pointer and calling it is exactly what an executable-arena JIT is for.
+        // match `JitFn`'s calling convention (rdi=cpu, rsi/rdx=bus fat pointer, ret=u64, no other
+        // register/stack preconditions on entry — see `chain.rs`'s codegen doc). Transmuting a
+        // data pointer to a function pointer and calling it is exactly what an executable-arena
+        // JIT is for.
         unsafe {
             let f: JitFn = std::mem::transmute(self.ptr.add(off as usize));
-            f(cpu, std::ptr::null_mut(), std::ptr::null())
+            f(cpu, bus_data, bus_vtable)
         }
     }
 }
@@ -210,7 +384,7 @@ mod tests {
 
         // Calling it must be sound and leaves it R-X afterward.
         let mut cpu = fs_riscv::Cpu::new(0);
-        let tag = arena.call(off, &mut cpu as *mut _);
+        let tag = arena.call(off, &mut cpu as *mut _, std::ptr::null_mut(), std::ptr::null());
         assert_eq!(tag, 0, "xor eax,eax; ret deterministically returns 0");
         let perms = perms_of_mapping_containing(arena.ptr as usize);
         assert!(!perms.contains('w'), "arena must still not be writable after a call: {perms}");
@@ -222,7 +396,7 @@ mod tests {
         let mut arena = Arena::new().unwrap();
         let off = arena.write(&[0x31, 0xC0, 0xC3]).unwrap().unwrap();
         let mut cpu = fs_riscv::Cpu::new(0);
-        let tag = arena.call(off, &mut cpu as *mut _);
+        let tag = arena.call(off, &mut cpu as *mut _, std::ptr::null_mut(), std::ptr::null());
         assert_eq!(tag, 0);
     }
 
@@ -231,5 +405,23 @@ mod tests {
         let mut arena = Arena::new().unwrap();
         let big = vec![0xC3u8; ARENA_CAPACITY + 1];
         assert!(arena.write(&big).unwrap().is_none());
+    }
+
+    /// `decompose_bus`/`recompose_bus` round-trip: reconstitute a real `&mut dyn Bus` from the two
+    /// raw words and call a genuine method through it, proving the fat-pointer layout assumption
+    /// (`JitFn`'s doc comment) actually holds on this target rather than merely "looking right".
+    #[test]
+    fn bus_fat_pointer_roundtrip() {
+        use fs_mmu::{Mmu, PERM_READ, PERM_WRITE};
+        let mut mmu = Mmu::new(0x1000, 0x1000);
+        mmu.protect(0x1000, 0x1000, PERM_READ | PERM_WRITE).unwrap();
+        let bus: &mut dyn Bus = &mut mmu;
+        let (data, vtable) = decompose_bus(bus);
+        // SAFETY: `mmu` (the `&mut dyn Bus` `decompose_bus` was just called on) is still alive and
+        // untouched for the whole of this reconstructed reference's use, matching
+        // `recompose_bus`'s documented precondition.
+        let recomposed = unsafe { recompose_bus(data, vtable) };
+        recomposed.store(0x1000, 4, 0xdead_beef).unwrap();
+        assert_eq!(mmu.load(0x1000, 4).unwrap(), 0xdead_beef);
     }
 }

@@ -22,10 +22,13 @@ pub struct Reg(pub u8);
 impl Reg {
     pub const RAX: Reg = Reg(0);
     pub const RCX: Reg = Reg(1);
+    pub const RDX: Reg = Reg(2);
+    pub const RSI: Reg = Reg(6);
     pub const RDI: Reg = Reg(7);
     pub const R8: Reg = Reg(8);
     pub const R9: Reg = Reg(9);
     pub const R10: Reg = Reg(10);
+    pub const R11: Reg = Reg(11);
 
     #[inline]
     fn low3(self) -> u8 {
@@ -69,8 +72,13 @@ impl Alu2 {
     }
 }
 
-/// A branch/set condition, shared by `Jcc` (not emitted in Phase 1 — no internal jumps),
-/// `SETcc`, and `CMOVcc`. `code()` is the low nibble of the `0F 8x`/`0F 9x`/`0F 4x` opcode.
+/// A branch/set condition, shared by `Jcc` (Phase 2: the one-target forward "skip a rare block"
+/// pattern — see `chain.rs`'s `emit_skip`; Phase 1 emitted none), `SETcc`, and `CMOVcc`. `code()`
+/// is the low nibble of the `0F 8x`/`0F 9x`/`0F 4x` opcode. `Ns` (sign flag clear) is a Phase 2
+/// addition: after `test rax,rax` on a JIT call-out's packed `u64` return, `SF` is exactly bit 63
+/// (the `TAG_TRAP` bit, so `Ns` means "no trap") and `ZF` is exactly "the whole value is zero" —
+/// see `sys.rs`'s tag doc and `chain.rs`'s Load/Store codegen for how both flags are consumed from
+/// that single `test`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Cc {
     E,
@@ -79,6 +87,7 @@ pub enum Cc {
     Ge,
     B,
     Ae,
+    Ns,
 }
 
 impl Cc {
@@ -90,6 +99,7 @@ impl Cc {
             Cc::Ae => 0x3,
             Cc::L => 0xc,
             Cc::Ge => 0xd,
+            Cc::Ns => 0x9,
         }
     }
 }
@@ -249,6 +259,61 @@ impl Asm {
     pub fn ret(&mut self) {
         self.buf.push(0xC3);
     }
+
+    // -------------------------------------------------------------------------------------------
+    // Phase 2 additions (`docs/jit-scalar-design.md`): the handful of extra forms needed for the
+    // Load/Store call-out (`push`/`pop` to protect the pinned entry-pc register `R8` — caller-saved
+    // per SysV, and thus not guaranteed to survive a real `call` — across the shim call; `movabs`+
+    // indirect `call` to reach the shim's fixed process-lifetime address; `test`+`Jcc` for the
+    // packed-tag branch). See `chain.rs`'s module doc and `emit_skip` for how `Jcc` is used without
+    // any general label table or backpatching machinery (exactly one forward target per emission,
+    // whose length is measured by building it into a temporary buffer first).
+    // -------------------------------------------------------------------------------------------
+
+    /// `push r64` — opcode `50+rd` (no REX.W: push/pop already default to 64-bit operand size in
+    /// long mode; only REX.B is ever needed, for r8-r15).
+    pub fn push_r64(&mut self, r: Reg) {
+        self.push_rex(false, false, r.needs_ext());
+        self.buf.push(0x50 + r.low3());
+    }
+
+    /// `pop r64` — opcode `58+rd`.
+    pub fn pop_r64(&mut self, r: Reg) {
+        self.push_rex(false, false, r.needs_ext());
+        self.buf.push(0x58 + r.low3());
+    }
+
+    /// `test a, b` (64-bit) — opcode `85 /r` with REX.W. Used as `test rax, rax` to read a JIT
+    /// call-out's packed `u64` return into `SF`(=bit 63)/`ZF`(=is it all-zero) in one instruction.
+    pub fn test_r64_r64(&mut self, a: Reg, b: Reg) {
+        self.push_rex(true, b.needs_ext(), a.needs_ext());
+        self.buf.push(0x85);
+        self.buf.push(modrm(0b11, b.low3(), a.low3()));
+    }
+
+    /// `movabs dst, imm64` — opcode `B8+rd` with REX.W (the imm32 form's REX.W-set 64-bit-immediate
+    /// sibling), for loading a shim function's absolute, process-lifetime-stable address (never a
+    /// `rel32` direct call — the mmap'd arena can be arbitrarily far from it in the address space).
+    pub fn mov_r64_imm64(&mut self, dst: Reg, imm: u64) {
+        self.push_rex(true, false, dst.needs_ext());
+        self.buf.push(0xB8 + dst.low3());
+        self.buf.extend_from_slice(&imm.to_le_bytes());
+    }
+
+    /// `call r64` (indirect) — opcode `FF /2`, mod=11 reg=2(digit) rm=dst. No REX.W needed (call's
+    /// operand size already defaults to 64-bit in long mode); REX.B if `dst` is r8-r15.
+    pub fn call_r64(&mut self, dst: Reg) {
+        self.push_rex(false, false, dst.needs_ext());
+        self.buf.push(0xFF);
+        self.buf.push(modrm(0b11, 2, dst.low3()));
+    }
+
+    /// `Jcc rel32` (near conditional jump) — opcode `0F 80+cc id`. No REX (no register operand).
+    pub fn jcc_rel32(&mut self, cc: Cc, rel: i32) {
+        self.buf.push(0x0F);
+        self.buf.push(0x80 + cc.code());
+        self.buf.extend_from_slice(&rel.to_le_bytes());
+    }
 }
 
 #[cfg(test)]
@@ -275,6 +340,27 @@ mod tests {
         let text = String::from_utf8_lossy(&out.stdout).to_string();
         assert!(!text.contains("db 0x"), "ndisasm could not decode some bytes:\n{text}");
         assert!(!text.trim().is_empty(), "ndisasm produced no output for {bytes:02x?}");
+        text
+    }
+
+    /// Same cross-check idea as [`assert_disassembles_cleanly`], but via `objdump` instead of
+    /// `ndisasm`. Needed for `FF /2` (indirect `CALL r/m64`): the `ndisasm` build available in this
+    /// environment (NDISASM 3.01) mis-decodes that whole opcode group in 64-bit mode (confirmed:
+    /// it fails identically on `call rax`/`jmp rax`, bytes `ff d0`/`ff e0`, which `objdump` reads
+    /// correctly) — a real tool limitation here, not an encoding bug, so `call_r64`'s test uses
+    /// this instead.
+    fn assert_disassembles_via_objdump(bytes: &[u8]) -> String {
+        let mut tmp = std::env::temp_dir();
+        tmp.push(format!("fs-jit-emit-test-{:x}.bin", std::process::id()));
+        std::fs::write(&tmp, bytes).unwrap();
+        let out = Command::new("objdump")
+            .args(["-D", "-b", "binary", "-m", "i386:x86-64", "-M", "intel"])
+            .arg(&tmp)
+            .output()
+            .expect("objdump not found for this cross-check");
+        let _ = std::fs::remove_file(&tmp);
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(!text.contains("(bad)"), "objdump could not decode some bytes:\n{text}");
         text
     }
 
@@ -422,6 +508,7 @@ mod tests {
                 Cc::Ge => &["setge", "setnl"],
                 Cc::B => &["setb", "setc"],
                 Cc::Ae => &["setae", "setnb", "setnc"],
+                Cc::Ns => unreachable!("not exercised by this SETcc sweep"),
             };
             assert!(mnemonics.iter().any(|m| text.contains(m)), "{cc:?}: {text}");
             assert!(text.contains("movzx eax,r9b"), "{cc:?}: {text}");
@@ -441,6 +528,7 @@ mod tests {
                 Cc::Ge => &["cmovge", "cmovnl"],
                 Cc::B => &["cmovb", "cmovc"],
                 Cc::Ae => &["cmovae", "cmovnb", "cmovnc"],
+                Cc::Ns => unreachable!("not exercised by this CMOVcc sweep"),
             };
             assert!(mnemonics.iter().any(|m| text.contains(m)), "{cc:?}: {text}");
             assert!(text.contains("r9d,r10d"), "{cc:?}: {text}");
@@ -489,5 +577,77 @@ mod tests {
         assert!(text.contains("add eax,0x5"), "{text}");
         assert!(text.contains("mov [rdi+0x0],eax"), "{text}");
         assert!(text.contains("ret"), "{text}");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Phase 2 additions.
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn push_pop_r64_low_and_extended_regs() {
+        let mut a = Asm::new();
+        a.push_r64(Reg::RDI);
+        a.pop_r64(Reg::RDI);
+        assert_eq!(a.buf, vec![0x57, 0x5F]);
+        let text = assert_disassembles_cleanly(&a.buf);
+        assert!(text.contains("push rdi"), "{text}");
+        assert!(text.contains("pop rdi"), "{text}");
+
+        let mut a = Asm::new();
+        a.push_r64(Reg::R8);
+        a.pop_r64(Reg::R8);
+        // REX.B(0x41) + 50+0(r8's low3) ; REX.B(0x41) + 58+0.
+        assert_eq!(a.buf, vec![0x41, 0x50, 0x41, 0x58]);
+        let text = assert_disassembles_cleanly(&a.buf);
+        assert!(text.contains("push r8"), "{text}");
+        assert!(text.contains("pop r8"), "{text}");
+    }
+
+    #[test]
+    fn test_r64_r64_encoding() {
+        let mut a = Asm::new();
+        a.test_r64_r64(Reg::RAX, Reg::RAX);
+        // REX.W(0x48), 85 /r, mod=11 reg=000(rax) rm=000(rax) => 0xC0.
+        assert_eq!(a.buf, vec![0x48, 0x85, 0xC0]);
+        let text = assert_disassembles_cleanly(&a.buf);
+        assert!(text.contains("test rax,rax"), "{text}");
+    }
+
+    #[test]
+    fn mov_r64_imm64_movabs() {
+        let mut a = Asm::new();
+        a.mov_r64_imm64(Reg::R11, 0x1122_3344_5566_7788);
+        let text = assert_disassembles_cleanly(&a.buf);
+        assert!(text.contains("mov r11,0x1122334455667788"), "{text}");
+    }
+
+    #[test]
+    fn call_r64_indirect() {
+        let mut a = Asm::new();
+        a.call_r64(Reg::R11);
+        // REX.B(0x41), FF /2, mod=11 reg=010(digit 2) rm=011(r11's low3) => 0xD3.
+        assert_eq!(a.buf, vec![0x41, 0xFF, 0xD3]);
+        let text = assert_disassembles_via_objdump(&a.buf);
+        assert!(text.contains("call") && text.contains("r11"), "{text}");
+    }
+
+    #[test]
+    fn jcc_rel32_sign_and_not_sign() {
+        // `test rax,rax; jns +5; ret` (the 5 skips exactly one 1-byte `ret` plus... just checking
+        // the jcc's own encoding + a plausible disassembly here; `chain.rs`'s `emit_skip` is what
+        // exercises real skip-distance arithmetic end-to-end).
+        let mut a = Asm::new();
+        a.test_r64_r64(Reg::RAX, Reg::RAX);
+        a.jcc_rel32(Cc::Ns, 1);
+        a.ret();
+        let text = assert_disassembles_cleanly(&a.buf);
+        assert!(text.contains("jns"), "{text}");
+
+        let mut a = Asm::new();
+        a.test_r64_r64(Reg::RAX, Reg::RAX);
+        a.jcc_rel32(Cc::E, 1);
+        a.ret();
+        let text = assert_disassembles_cleanly(&a.buf);
+        assert!(text.contains("je") || text.contains("jz"), "{text}");
     }
 }

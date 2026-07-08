@@ -16,3 +16,10 @@ license.workspace = true
 fs-mmu = { path = "../fs-mmu" }
 fs-riscv = { path = "../fs-riscv" }
 libc = "0.2"
+
+# Test-only: Phase 2's CLINT-store early-exit differential test needs a real CLINT-bearing `Bus`
+# (`fs_platform::Machine`), not just the plain `fs_mmu::Mmu` production code uses. `fs-platform`
+# does not depend on `fs-jit`, so this adds no cycle; it is not a production dependency of this
+# crate (see `lib.rs`'s module doc — `fs-jit` still only depends on `fs-mmu`+`fs-riscv` at runtime).
+[dev-dependencies]
+fs-platform = { path = "../fs-platform" }

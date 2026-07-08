@@ -94,6 +94,23 @@ pub trait Bus {
     fn read_raw_state(&self, _addr: u32, _len: u8) -> u32 {
         0
     }
+
+    /// Does a (just-completed, successful) store to physical `addr` of `size` bytes potentially
+    /// newly assert an interrupt that a per-instruction driver loop must observe before continuing
+    /// (`docs/jit-scalar-design.md`'s Phase 2 "CLINT store early-exit" discussion)? Default `false`
+    /// (plain [`Mmu`], with no MMIO devices, never does). Full-system `Bus` impls (`fs-platform`'s
+    /// `Machine`/`CowMachine`) override this for their CLINT MMIO window: a native chain-JIT
+    /// compiled run (`fs-jit`) can retire many instructions — including a `Store` — without
+    /// returning control to the driver loop that normally resyncs the CLINT
+    /// (`mtime`/`mtimecmp`/`msip` -> CSRs) before every single instruction; a `Store` into CLINT's
+    /// window can make an interrupt newly deliverable, so the compiled chain must stop and return
+    /// immediately after such a store (its own retirement/pc-advance already happened) rather than
+    /// continuing to execute further chained instructions with a stale interrupt-pending view.
+    /// Named generically (not `in_clint`) since any future MMIO device with the same "a store here
+    /// can change interrupt-pending state" property would need the identical treatment.
+    fn store_may_assert_interrupt(&self, _addr: u32, _size: u8) -> bool {
+        false
+    }
 }
 
 /// Reset granularity for snapshot fuzzing: one cache line (decision #11).

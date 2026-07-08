@@ -839,6 +839,14 @@ pub struct Cpu {
     /// case — a bare array would be a 128-byte memcpy per case even with KMSAN off, whereas `None`
     /// keeps the off-cost at one pointer, exactly mirroring [`Cpu::cmplog`]'s cost model.
     regs_taint: Option<Box<[u32; 32]>>,
+    /// Phase 2 of `docs/jit-scalar-design.md`: a `Trap` a compiled JIT chain's Load/Store call-out
+    /// could not return directly (the packed `u64` `JitFn` ABI has no room for the full `Trap`
+    /// value), stashed here just before the chain returns its `TrapPending` sentinel tag. The
+    /// runner (`fs_jit::ChainCache::run_block`) `take()`s this immediately after the call and
+    /// feeds it to [`Cpu::finish_exit`] exactly as the interpreter would have propagated the same
+    /// `Err(trap)` from `exec_one`. `None` at every other time (interpreter path, ALU-only chains,
+    /// between dispatches) — never read except right after a `TrapPending` return.
+    pub jit_pending_trap: Option<Trap>,
 }
 
 impl Cpu {
@@ -856,6 +864,7 @@ impl Cpu {
             cmplog: None,
             ubsan: None,
             regs_taint: None,
+            jit_pending_trap: None,
         }
     }
 
@@ -1728,8 +1737,10 @@ impl Cpu {
 /// Load call-out (`docs/jit-scalar-design.md`'s Phase 2), guaranteeing that path has provably
 /// zero drift from the interpreter. `size` in bytes; `signed` sign-extends sub-word loads.
 /// Unaligned and page-crossing accesses are serviced byte-wise (native unaligned support — the
-/// kernel's `check_unaligned_access_emulated` probe expects this to just work).
-pub(crate) fn load_impl(
+/// kernel's `check_unaligned_access_emulated` probe expects this to just work). `pub` (not
+/// `pub(crate)`) is the one visibility relaxation Phase 2 makes to this crate: `fs-jit` is a
+/// separate crate and needs to call this directly from its Load shim.
+pub fn load_impl(
     cpu: &mut Cpu,
     bus: &mut dyn Bus,
     va: u32,
@@ -1760,9 +1771,12 @@ pub(crate) fn load_impl(
 }
 
 /// Translated store, extracted verbatim from [`Cpu::store`] (which now just forwards here) —
-/// see [`load_impl`]'s doc for why this split exists. `size` in bytes. Unaligned/page-crossing
-/// stores go byte-wise.
-pub(crate) fn store_impl(
+/// see [`load_impl`]'s doc for why this split exists, including the `pub` visibility. `size` in
+/// bytes. Unaligned/page-crossing stores go byte-wise. Callers other than `exec_one`/`fs-jit`
+/// (e.g. a future device model) must replicate `exec_one`'s HTIF-`tohost`-intercept and
+/// CLINT-repoll checks themselves — this function is deliberately just the soft-MMU write, not
+/// the full `Store` instruction semantics.
+pub fn store_impl(
     cpu: &mut Cpu,
     bus: &mut dyn Bus,
     va: u32,
