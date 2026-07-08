@@ -245,6 +245,37 @@ fn run_case(
     Stop::Budget
 }
 
+/// Replay one program to completion recording EXACT (from,to) control-flow edges into `cov`
+/// (fs_cov::Coverage's precise `BTreeSet` edge/block set, not the hashed AFL bitmap), for offline
+/// System.map attribution via `fs-covmap` (docs/bug-finding.md#3). Mirrors `run_case`'s CLINT-sync
+/// and hypercall loop but with exact edge recording and no sanitizer. The union of many replays'
+/// edges is the corpus's true reached-code set, resolvable to kernel symbols.
+fn dump_edges_replay(
+    cpu: &mut fs_riscv::Cpu,
+    m: &mut fs_platform::Machine,
+    cov: &mut fs_cov::Coverage,
+    deadline: u64,
+) -> fs_platform::Stop {
+    use fs_platform::Stop;
+    use fs_riscv::SysExit;
+    while cpu.insns_retired < deadline {
+        m.clint.mtime = cpu.virtual_time();
+        fs_platform::sync_timer(cpu, m);
+        let prev = cpu.pc;
+        match cpu.step_system(m) {
+            SysExit::Continue => {
+                let cur = cpu.pc;
+                if cur != prev.wrapping_add(4) && cur != prev.wrapping_add(2) {
+                    cov.record_edge(prev, cur);
+                }
+            }
+            SysExit::Halt(c) => return Stop::Halt(c),
+            SysExit::Hypercall(c) => return Stop::Hypercall(c),
+        }
+    }
+    Stop::Budget
+}
+
 /// Run one fuzz case via the Stage 0 JIT block cache (`fs-jit`, `docs/jit.md`) instead of
 /// per-instruction interpretation — the `--jit` analogue of `run_case`. Drives the *identical*
 /// per-instruction loop `run_case` does (CLINT sync + coverage-edge recording before/after every
@@ -903,6 +934,16 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     let mut cmplog = false;
     let mut jit = false;
     let mut ubsan = false;
+    // Fault injection (docs/bug-finding.md): when set, arm a fraction PCT of generated programs
+    // with the fail_nth preamble (`fs_prog::prepend_fail_inject`) so kmalloc/alloc_pages
+    // legitimately fail and the kernel's error/cleanup branches actually execute. None = off.
+    // Composes with --jobs (unlike --sanitize) — the arming is pure guest syscalls, and
+    // Image.failinj's agent flips the failslab/fail_page_alloc knobs pre-snapshot.
+    let mut fail_inject: Option<u32> = None;
+    // Exact-edge corpus dump (docs/bug-finding.md#3): replay the --corpus-dir corpus over the
+    // kernel snapshot recording precise (from,to) control-flow edges, write them in the
+    // `# fuzzsoft coverage` format fs-covmap consumes, and exit (no fuzzing). Serial-only.
+    let mut dump_edges: Option<String> = None;
     let ram_base = 0x8000_0000u32;
     let kernel_addr = 0x8040_0000u32;
 
@@ -936,6 +977,26 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
                 ubsan = true;
                 i += 1;
                 continue;
+            }
+            // Fault injection (docs/bug-finding.md, the #1 bug-finding lever): prepend the
+            // fail_nth arming preamble to a fraction of generated programs. `--fail-inject` uses
+            // the default 30% bias; `--fail-inject-pct N` overrides it. Requires a kernel whose
+            // agent flips the failslab/fail_page_alloc knobs pre-snapshot (firmware/Image.failinj);
+            // on a stock kernel the openat("/proc/self/fail-nth") simply returns -ENOENT, so the
+            // preamble is harmlessly inert. Composes with --jobs.
+            "--fail-inject" => {
+                fail_inject = Some(fail_inject.unwrap_or(30));
+                i += 1;
+                continue;
+            }
+            "--fail-inject-pct" => {
+                fail_inject = Some(val(i).parse().unwrap_or(30).min(100));
+            }
+            // Exact-edge dump for offline fs-covmap attribution (docs/bug-finding.md#3): replay the
+            // --corpus-dir corpus recording precise (from,to) edges, write them, and exit. Requires
+            // --corpus-dir; serial-only (a one-shot replay, not a campaign).
+            "--dump-edges" => {
+                dump_edges = Some(val(i));
             }
             // CMPLOG (comparison-coverage / RedQueen): occasionally trace a corpus entry with
             // fs-riscv's cmp-operand recording on, then feed the observed `(a, b)` pairs into
@@ -1080,6 +1141,10 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
             eprintln!("fuzz: --jobs > 1 is incompatible with --ubsan in this first cut (serial-only)");
             return ExitCode::FAILURE;
         }
+        if dump_edges.is_some() {
+            eprintln!("fuzz: --jobs > 1 is incompatible with --dump-edges (serial one-shot replay)");
+            return ExitCode::FAILURE;
+        }
         // Captured right here — after boot AND after the prog/scratch address translation above
         // (which can set PTE A/D bits) — the exact instant `Snapshot::capture` would otherwise
         // capture for the serial path below. `m` is dropped immediately after: `Golden` holds its
@@ -1132,7 +1197,7 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
         return run_parallel(
             golden, golden_cpu, golden_clint, golden_ram_base, golden_ram_size, scratch, prog_pas,
             scratch_pas, base_uart, case_insns, cases, seed, jobs, corpus_dir, seed_virgin,
-            seed_corpus,
+            seed_corpus, fail_inject,
         );
     }
 
@@ -1243,6 +1308,41 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
         let _ = cpu.ubsan_take();
     }
 
+    // Exact-edge corpus dump (docs/bug-finding.md#3): a one-shot replay of the loaded corpus that
+    // records precise control-flow edges for offline `fs-covmap` symbol attribution, then exits —
+    // no fuzzing. The union of per-program edges is the corpus's true reached-code set.
+    if let Some(path) = &dump_edges {
+        if seed_corpus.is_empty() {
+            eprintln!("fuzz: --dump-edges needs a non-empty --corpus-dir (nothing to replay)");
+            return ExitCode::FAILURE;
+        }
+        let mut cov = fs_cov::Coverage::new();
+        cov.seed_block(cpu.pc);
+        for prog in &seed_corpus {
+            let lowered = fs_prog::lower(prog, scratch);
+            snap.reset(&mut cpu, &mut m);
+            write_words(&mut m, &prog_pas, &fs_prog::to_wire(&lowered));
+            write_scratch_bytes(&mut m, &scratch_pas, &lowered.scratch);
+            let deadline = cpu.insns_retired + case_insns;
+            let _ = dump_edges_replay(&mut cpu, &mut m, &mut cov, deadline);
+        }
+        return match write_coverage(path, &cov) {
+            Ok(()) => {
+                println!(
+                    "fuzz: --dump-edges wrote {} exact edges ({} blocks) from {} corpus programs → {path}",
+                    cov.num_edges(),
+                    cov.num_blocks(),
+                    seed_corpus.len()
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("fuzz: --dump-edges write {path} failed: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     // --- coverage-guided fuzz loop over syscall *programs* ---
     let mut virgin = seed_virgin; // accumulated coverage (feedback), warm-started from the corpus
     let mut run_map = CovBitmap::new(); // per-case edge bitmap
@@ -1302,6 +1402,12 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
             }
         } else {
             fs_prog::generate(&mut rng)
+        };
+        // Fault injection: arm a fraction of programs with the fail_nth preamble so allocation
+        // failures drive the kernel's cleanup/error paths (docs/bug-finding.md).
+        let prog = match fail_inject {
+            Some(pct) if rng.chance(pct) => fs_prog::prepend_fail_inject(&mut rng, prog),
+            _ => prog,
         };
         // Compile the typed program to the wire form (call slots + fixup table + scratch image),
         // placing pointer pointees at `scratch`'s guest VA so runtime pointers are valid.
@@ -1499,6 +1605,7 @@ fn run_parallel(
     corpus_dir: Option<String>,
     seed_virgin: fs_cov::VirginMap,
     seed_corpus: Vec<fs_prog::Prog>,
+    fail_inject: Option<u32>,
 ) -> ExitCode {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
@@ -1559,6 +1666,12 @@ fn run_parallel(
                     let prog = match base {
                         Some(b) => fs_prog::mutate(&mut rng, &b),
                         None => fs_prog::generate(&mut rng),
+                    };
+                    // Fault injection: arm a fraction of programs with the fail_nth preamble
+                    // (docs/bug-finding.md). Per-worker `rng`, so it composes with --jobs.
+                    let prog = match fail_inject {
+                        Some(pct) if rng.chance(pct) => fs_prog::prepend_fail_inject(&mut rng, prog),
+                        _ => prog,
                     };
                     let lowered = fs_prog::lower(&prog, scratch_va);
 
