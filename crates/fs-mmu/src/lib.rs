@@ -9,6 +9,7 @@
 //! the byte-level permission model here is deliberately identical so it ports upward.
 
 use std::fmt;
+use std::sync::Arc;
 
 /// Load-permitted.
 pub const PERM_READ: u8 = 1 << 0;
@@ -440,6 +441,408 @@ impl Bus for Mmu {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// PR1 of the software COW shared-guest-RAM design (see `docs/cow-shared-ram.md`): an immutable
+// golden snapshot of an `Mmu`'s two planes, shared read-only via `Arc<Golden>` across every lane
+// / core, plus a per-lane `CowRam` that copy-on-writes individual 4 KiB pages on first divergence.
+// Everything below is purely additive — no existing `Mmu` method signature or behavior changes.
+// ---------------------------------------------------------------------------------------------
+
+/// Page granularity for the copy-on-write overlay: the guest's own 4 KiB paging unit (matches
+/// sv32), so a shared read-only sv32 walk (PR4) can consult the same directory.
+pub const PAGE_SIZE: usize = 4096;
+
+/// `dir[pn]` sentinel meaning "page `pn` has no overlay yet — still golden".
+const SENTINEL: u32 = u32::MAX;
+
+/// An immutable golden guest-RAM snapshot, in the *exact* [`Mmu`] byte encoding (`mem` + `perms`
+/// planes, byte-granular RWX/RAW preserved). Captured once (typically post-boot) via
+/// [`Golden::from_mmu`]; from then on every lane/core shares the same image read-only. `Golden`
+/// holds only `Vec<u8>`/`u32` fields (no interior mutability, no raw pointers), so it is `Send +
+/// Sync` for free and nothing prevents wrapping it in `Arc<Golden>` for cheap, safe sharing.
+pub struct Golden {
+    base: u32,
+    mem: Vec<u8>,
+    perms: Vec<u8>,
+}
+
+impl Golden {
+    /// Snapshot `m`'s current planes. This is the moment "golden" is defined: whatever `m` looks
+    /// like right now is what every `CowRam::reset()` restores back to.
+    pub fn from_mmu(m: &Mmu) -> Golden {
+        let (mem, perms) = m.planes();
+        Golden {
+            base: m.base(),
+            mem: mem.to_vec(),
+            perms: perms.to_vec(),
+        }
+    }
+
+    pub fn base(&self) -> u32 {
+        self.base
+    }
+    pub fn size(&self) -> usize {
+        self.mem.len()
+    }
+    /// Number of 4 KiB pages covering the window (the final page rounds up if `size()` isn't
+    /// page-aligned — see `page_mem`/`page_perms` for how that partial tail is handled).
+    pub fn num_pages(&self) -> usize {
+        self.mem.len().div_ceil(PAGE_SIZE)
+    }
+
+    /// `[pn*4096 .. pn*4096+4096)`, clamped to `size()` for the final page.
+    ///
+    /// Tail handling: we do *not* pad `Golden`'s planes out to a whole number of pages. When
+    /// `size()` isn't a multiple of 4096 the final page's slice is simply shorter than 4096
+    /// bytes. `CowRam::offset()` mirrors `Mmu::offset` exactly (bounds-checked against `size()`,
+    /// not against a page-rounded size), so no in-page index ever reaches past this clamped
+    /// length — the missing tail bytes are never observable, and there is no golden content to
+    /// invent for them.
+    fn page_mem(&self, pn: usize) -> &[u8] {
+        let start = pn * PAGE_SIZE;
+        let end = (start + PAGE_SIZE).min(self.mem.len());
+        &self.mem[start..end]
+    }
+    fn page_perms(&self, pn: usize) -> &[u8] {
+        let start = pn * PAGE_SIZE;
+        let end = (start + PAGE_SIZE).min(self.perms.len());
+        &self.perms[start..end]
+    }
+}
+
+/// One page's private copy-on-write overlay: 4 KiB of guest memory plus its parallel permission
+/// plane, always copied together from the same golden page on first divergence (never mixed).
+struct CowPage {
+    mem: [u8; PAGE_SIZE],
+    perms: [u8; PAGE_SIZE],
+}
+
+/// A per-lane (or per-thread) working view over a shared [`Golden`] image. Unmodified pages read
+/// straight through to golden (zero copy — safe to call speculatively); a write (or any other
+/// perm mutation) copy-on-writes the containing 4 KiB page into a private overlay first. Access
+/// semantics (fast-path / `#[cold]` bytewise fallback / RAW-upgrade-on-write / exact [`Fault`]
+/// reporting) mirror `Mmu` byte-for-byte — see `tests/cow_ram.rs` for the differential proof.
+///
+/// A single call into `read`/`write`/`fetch_u16`/`fetch_u32` is expected to stay within one 4 KiB
+/// page: the emulator (`fs-riscv`) already splits misaligned/page-crossing Bus accesses into
+/// per-byte accesses upstream, and a naturally-aligned 1/2/4-byte access never crosses a 4 KiB
+/// boundary. The bytewise fallback below resolves each byte independently by its own page number,
+/// so nothing panics or misbehaves even if that assumption were ever violated — it is simply the
+/// only case that matters for the fast path's single-page slice arithmetic.
+pub struct CowRam {
+    golden: Arc<Golden>,
+    /// `dir[pn]` = index into `pages`, or `SENTINEL` if page `pn` is still golden.
+    dir: Vec<u32>,
+    pages: Vec<Box<CowPage>>,
+    /// Overlaid page numbers, in COW order — lets `reset()` be O(dirty) instead of O(all pages).
+    dirty: Vec<u32>,
+}
+
+impl CowRam {
+    /// A fresh view over `golden`: every page starts golden (no overlay allocated yet).
+    pub fn new(golden: Arc<Golden>) -> Self {
+        let n = golden.num_pages();
+        CowRam {
+            golden,
+            dir: vec![SENTINEL; n],
+            pages: Vec::new(),
+            dirty: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn offset(&self, addr: u32) -> Option<usize> {
+        let base = self.golden.base();
+        if addr < base {
+            return None;
+        }
+        let off = (addr - base) as usize;
+        (off < self.golden.size()).then_some(off)
+    }
+
+    #[inline]
+    fn fault(addr: u32, len: u32, access: Access, kind: FaultKind) -> Fault {
+        Fault { addr, len, access, kind }
+    }
+
+    /// Resolve page `pn` to its current (mem, perms) 4 KiB slices — from the overlay if this page
+    /// was COW'd, else straight from golden. Both planes always come from the same source, so
+    /// content and perms can never desync.
+    #[inline]
+    fn resolve(&self, pn: usize) -> (&[u8], &[u8]) {
+        let slot = self.dir[pn];
+        if slot == SENTINEL {
+            (self.golden.page_mem(pn), self.golden.page_perms(pn))
+        } else {
+            let page = &self.pages[slot as usize];
+            (&page.mem[..], &page.perms[..])
+        }
+    }
+
+    /// Copy-on-write page `pn` (a no-op if already overlaid): clone golden's 4096 mem + 4096 perm
+    /// bytes into a fresh private page, and record it in `dir`/`dirty`. Returns the slot in
+    /// `pages`. If `pn` is the final, partial golden page, only the valid (clamped) bytes are
+    /// copied into the start of the 4096-byte overlay; the tail is left zeroed and is never
+    /// addressable (see `Golden::page_mem`).
+    fn ensure_page(&mut self, pn: usize) -> usize {
+        let slot = self.dir[pn];
+        if slot != SENTINEL {
+            return slot as usize;
+        }
+        let mut page = Box::new(CowPage {
+            mem: [0u8; PAGE_SIZE],
+            perms: [0u8; PAGE_SIZE],
+        });
+        let gmem = self.golden.page_mem(pn);
+        let gperms = self.golden.page_perms(pn);
+        page.mem[..gmem.len()].copy_from_slice(gmem);
+        page.perms[..gperms.len()].copy_from_slice(gperms);
+        let idx = self.pages.len();
+        self.pages.push(page);
+        self.dir[pn] = idx as u32;
+        self.dirty.push(pn as u32);
+        idx
+    }
+
+    /// Read-only permission byte at `addr` (mirrors `Mmu::perm_at`). `None` outside the window.
+    pub fn perm_at(&self, addr: u32) -> Option<u8> {
+        self.offset(addr).map(|off| {
+            let pn = off / PAGE_SIZE;
+            let po = off % PAGE_SIZE;
+            self.resolve(pn).1[po]
+        })
+    }
+
+    /// Checked read: every byte must carry `PERM_READ`. Never allocates an overlay.
+    pub fn read(&self, addr: u32, buf: &mut [u8]) -> Result<(), Fault> {
+        let len = buf.len();
+        if let Some(off) = self.offset(addr) {
+            let pn = off / PAGE_SIZE;
+            let po = off % PAGE_SIZE;
+            if off + len <= self.golden.size() && po + len <= PAGE_SIZE {
+                let (mem, perms) = self.resolve(pn);
+                if perms[po..po + len].iter().all(|&p| p & PERM_READ != 0) {
+                    buf.copy_from_slice(&mem[po..po + len]);
+                    return Ok(());
+                }
+            }
+        }
+        self.read_bytewise(addr, buf)
+    }
+
+    #[cold]
+    fn read_bytewise(&self, addr: u32, buf: &mut [u8]) -> Result<(), Fault> {
+        let len = buf.len() as u32;
+        for (i, out) in buf.iter_mut().enumerate() {
+            let a = addr.wrapping_add(i as u32);
+            let off = self
+                .offset(a)
+                .ok_or_else(|| Self::fault(a, len, Access::Read, FaultKind::Unmapped))?;
+            let pn = off / PAGE_SIZE;
+            let po = off % PAGE_SIZE;
+            let (mem, perms) = self.resolve(pn);
+            if perms[po] & PERM_READ == 0 {
+                return Err(Self::fault(a, len, Access::Read, FaultKind::Permission));
+            }
+            *out = mem[po];
+        }
+        Ok(())
+    }
+
+    /// Checked write: every byte must carry `PERM_WRITE`. Copy-on-writes the containing page
+    /// (only once permission is confirmed), then upgrades written bytes RAW -> READ. Mirrors
+    /// `Mmu::write` exactly, including the bytewise fallback's partial-write-then-fault behavior
+    /// on a mid-span permission miss (bytes before the faulting one are already committed).
+    pub fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), Fault> {
+        let len = data.len();
+        if let Some(off) = self.offset(addr) {
+            let pn = off / PAGE_SIZE;
+            let po = off % PAGE_SIZE;
+            if off + len <= self.golden.size() && po + len <= PAGE_SIZE {
+                let writable = {
+                    let (_, perms) = self.resolve(pn);
+                    perms[po..po + len].iter().all(|&p| p & PERM_WRITE != 0)
+                };
+                if writable {
+                    let idx = self.ensure_page(pn);
+                    let page = &mut self.pages[idx];
+                    page.mem[po..po + len].copy_from_slice(data);
+                    for p in &mut page.perms[po..po + len] {
+                        *p = (*p | PERM_READ) & !PERM_RAW;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        self.write_bytewise(addr, data)
+    }
+
+    #[cold]
+    fn write_bytewise(&mut self, addr: u32, data: &[u8]) -> Result<(), Fault> {
+        let len = data.len() as u32;
+        for (i, b) in data.iter().enumerate() {
+            let a = addr.wrapping_add(i as u32);
+            let off = self
+                .offset(a)
+                .ok_or_else(|| Self::fault(a, len, Access::Write, FaultKind::Unmapped))?;
+            let pn = off / PAGE_SIZE;
+            let po = off % PAGE_SIZE;
+            let writable = self.resolve(pn).1[po] & PERM_WRITE != 0;
+            if !writable {
+                return Err(Self::fault(a, len, Access::Write, FaultKind::Permission));
+            }
+            let idx = self.ensure_page(pn);
+            let page = &mut self.pages[idx];
+            page.mem[po] = *b;
+            page.perms[po] = (page.perms[po] | PERM_READ) & !PERM_RAW;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn check_align(addr: u32, n: u32, access: Access) -> Result<(), Fault> {
+        if addr.is_multiple_of(n) {
+            Ok(())
+        } else {
+            Err(Self::fault(addr, n, access, FaultKind::Unaligned))
+        }
+    }
+
+    pub fn read_u8(&self, addr: u32) -> Result<u8, Fault> {
+        let mut b = [0u8; 1];
+        self.read(addr, &mut b)?;
+        Ok(b[0])
+    }
+    pub fn read_u16(&self, addr: u32) -> Result<u16, Fault> {
+        Self::check_align(addr, 2, Access::Read)?;
+        let mut b = [0u8; 2];
+        self.read(addr, &mut b)?;
+        Ok(u16::from_le_bytes(b))
+    }
+    pub fn read_u32(&self, addr: u32) -> Result<u32, Fault> {
+        Self::check_align(addr, 4, Access::Read)?;
+        let mut b = [0u8; 4];
+        self.read(addr, &mut b)?;
+        Ok(u32::from_le_bytes(b))
+    }
+
+    pub fn write_u8(&mut self, addr: u32, v: u8) -> Result<(), Fault> {
+        self.write(addr, &[v])
+    }
+    pub fn write_u16(&mut self, addr: u32, v: u16) -> Result<(), Fault> {
+        Self::check_align(addr, 2, Access::Write)?;
+        self.write(addr, &v.to_le_bytes())
+    }
+    pub fn write_u32(&mut self, addr: u32, v: u32) -> Result<(), Fault> {
+        Self::check_align(addr, 4, Access::Write)?;
+        self.write(addr, &v.to_le_bytes())
+    }
+
+    #[inline]
+    fn fetch_bytes<const N: usize>(&self, addr: u32) -> Result<[u8; N], Fault> {
+        let mut b = [0u8; N];
+        if let Some(off) = self.offset(addr) {
+            let pn = off / PAGE_SIZE;
+            let po = off % PAGE_SIZE;
+            if off + N <= self.golden.size() && po + N <= PAGE_SIZE {
+                let (mem, perms) = self.resolve(pn);
+                if perms[po..po + N].iter().all(|&p| p & PERM_EXEC != 0) {
+                    b.copy_from_slice(&mem[po..po + N]);
+                    return Ok(b);
+                }
+            }
+        }
+        for (i, out) in b.iter_mut().enumerate() {
+            let a = addr.wrapping_add(i as u32);
+            let off = self
+                .offset(a)
+                .ok_or_else(|| Self::fault(a, N as u32, Access::Exec, FaultKind::Unmapped))?;
+            let pn = off / PAGE_SIZE;
+            let po = off % PAGE_SIZE;
+            let (mem, perms) = self.resolve(pn);
+            if perms[po] & PERM_EXEC == 0 {
+                return Err(Self::fault(a, N as u32, Access::Exec, FaultKind::Permission));
+            }
+            *out = mem[po];
+        }
+        Ok(b)
+    }
+
+    /// Instruction half-word fetch: 2-byte aligned, every byte must carry PERM_EXEC.
+    pub fn fetch_u16(&self, addr: u32) -> Result<u16, Fault> {
+        Self::check_align(addr, 2, Access::Exec)?;
+        Ok(u16::from_le_bytes(self.fetch_bytes::<2>(addr)?))
+    }
+    /// Instruction fetch: 4-byte aligned, every byte must carry PERM_EXEC.
+    pub fn fetch_u32(&self, addr: u32) -> Result<u32, Fault> {
+        Self::check_align(addr, 4, Access::Exec)?;
+        Ok(u32::from_le_bytes(self.fetch_bytes::<4>(addr)?))
+    }
+
+    /// Bus-shaped helpers, matching how `fs_platform::Machine` calls its `Mmu` (see PR2's
+    /// `CowMachine`). `load`/`ifetch16` take `&self` (reads never allocate, safe to call
+    /// speculatively); `store` takes `&mut self` since a write may copy-on-write a page.
+    pub fn load(&self, addr: u32, size: u8) -> Result<u32, Fault> {
+        match size {
+            1 => self.read_u8(addr).map(u32::from),
+            2 => self.read_u16(addr).map(u32::from),
+            _ => self.read_u32(addr),
+        }
+    }
+    pub fn store(&mut self, addr: u32, size: u8, val: u32) -> Result<(), Fault> {
+        match size {
+            1 => self.write_u8(addr, val as u8),
+            2 => self.write_u16(addr, val as u16),
+            _ => self.write_u32(addr, val),
+        }
+    }
+    pub fn ifetch16(&self, addr: u32) -> Result<u16, Fault> {
+        self.fetch_u16(addr)
+    }
+
+    /// O(dirty) reset: drop every overlaid page back to golden. Zero byte copy-back — golden is
+    /// never mutated, so there is nothing to copy, just overlays to forget.
+    pub fn reset(&mut self) {
+        for &pn in &self.dirty {
+            self.dir[pn as usize] = SENTINEL;
+        }
+        self.pages.clear();
+        self.dirty.clear();
+    }
+
+    /// Overlaid page numbers since the last `reset()` (diagnostics / memory-drop reporting).
+    pub fn dirty_pages(&self) -> &[u32] {
+        &self.dirty
+    }
+}
+
+/// Cross-lane "this page was privately COW'd by someone" bitmap (1 bit / 4 KiB page). Consumed by
+/// PR4's shared translate/fetch fast path to decide whether a golden-broadcast result is still
+/// safe for every lane, or a page must fall back to per-lane resolution. Defined now so the
+/// bit-twiddling is exercised in isolation; `CowRam::ensure_page` does not yet set it (that wiring
+/// is PR4's job, once there's an actual cross-lane consumer to keep in sync).
+pub struct SharedDirty(Vec<u64>);
+
+impl SharedDirty {
+    pub fn new(num_pages: usize) -> Self {
+        SharedDirty(vec![0u64; num_pages.div_ceil(64)])
+    }
+    pub fn set(&mut self, pn: usize) {
+        let (w, b) = (pn / 64, pn % 64);
+        self.0[w] |= 1u64 << b;
+    }
+    pub fn bit(&self, pn: usize) -> bool {
+        let (w, b) = (pn / 64, pn % 64);
+        self.0[w] & (1u64 << b) != 0
+    }
+    pub fn clear_pages(&mut self, pns: &[u32]) {
+        for &pn in pns {
+            let (w, b) = (pn as usize / 64, pn as usize % 64);
+            self.0[w] &= !(1u64 << b);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,5 +911,85 @@ mod tests {
         let m = Mmu::new(0x8000_0000, 0x1000);
         assert_eq!(m.perm_at(0x1234), None);
         assert_eq!(m.perm_at(0x8000_0000), Some(0));
+    }
+
+    // -- CowRam / Golden / SharedDirty targeted tests (the differential property test lives in
+    // -- `tests/cow_ram.rs`, which needs the crate as an external dependency) --
+
+    #[test]
+    fn cow_reset_drops_overlays_and_reverts_memory() {
+        let mut m = Mmu::new(0x8000_0000, 0x4000); // 4 pages
+        m.map(0x8000_0000, &[0xAA; 16], PERM_READ | PERM_WRITE)
+            .unwrap();
+        // Page 2 (0x8000_2000) is mapped RW in golden too, but starts as all-zero content.
+        m.protect(0x8000_2000, 4, PERM_READ | PERM_WRITE).unwrap();
+        let golden = Arc::new(Golden::from_mmu(&m));
+        let mut cow = CowRam::new(golden);
+
+        // Untouched: reads straight through, no overlay allocated.
+        assert_eq!(cow.read_u32(0x8000_0000).unwrap(), u32::from_le_bytes([0xAA; 4]));
+        assert!(cow.dirty_pages().is_empty());
+
+        // Diverge page 0 and page 2.
+        cow.write_u32(0x8000_0000, 0x1111_1111).unwrap();
+        cow.write_u32(0x8000_2000, 0x2222_2222).unwrap();
+        assert_eq!(cow.read_u32(0x8000_0000).unwrap(), 0x1111_1111);
+        assert_eq!(cow.read_u32(0x8000_2000).unwrap(), 0x2222_2222);
+        assert_eq!(cow.dirty_pages().len(), 2);
+
+        cow.reset();
+        assert!(cow.dirty_pages().is_empty());
+        // Both pages revert to golden content (0xAA-filled page 0, zeroed page 2), not to the
+        // values written before reset.
+        assert_eq!(cow.read_u32(0x8000_0000).unwrap(), u32::from_le_bytes([0xAA; 4]));
+        assert_eq!(cow.read_u32(0x8000_2000).unwrap(), 0);
+
+        // Re-diverge proves the page can be COW'd again after reset.
+        cow.write_u32(0x8000_0000, 0x3333_3333).unwrap();
+        assert_eq!(cow.read_u32(0x8000_0000).unwrap(), 0x3333_3333);
+        assert_eq!(cow.dirty_pages(), &[0]);
+    }
+
+    #[test]
+    fn cow_content_and_perms_come_from_same_source() {
+        // Regression guard for "never mix golden mem with overlay perms": write unlocks READ on
+        // exactly the overlay, and a subsequent poison stays consistent with the overlaid content.
+        let mut m = Mmu::new(0x8000_0000, 0x1000);
+        m.protect(0x8000_0000, 4, PERM_RAW | PERM_WRITE).unwrap();
+        let golden = Arc::new(Golden::from_mmu(&m));
+        let mut cow = CowRam::new(golden);
+
+        assert_eq!(
+            cow.read_u8(0x8000_0000).unwrap_err().kind,
+            FaultKind::Permission
+        );
+        cow.write_u8(0x8000_0000, 0xAB).unwrap();
+        assert_eq!(cow.read_u8(0x8000_0000).unwrap(), 0xAB);
+        assert_eq!(cow.perm_at(0x8000_0000), Some(PERM_READ | PERM_WRITE));
+    }
+
+    #[test]
+    fn shared_dirty_set_bit_clear() {
+        let mut sd = SharedDirty::new(200); // spans 4 u64 words
+        assert!(!sd.bit(0));
+        assert!(!sd.bit(63));
+        assert!(!sd.bit(64));
+        assert!(!sd.bit(199));
+
+        sd.set(0);
+        sd.set(63);
+        sd.set(64);
+        sd.set(199);
+        assert!(sd.bit(0));
+        assert!(sd.bit(63));
+        assert!(sd.bit(64));
+        assert!(sd.bit(199));
+        assert!(!sd.bit(1));
+
+        sd.clear_pages(&[63, 199]);
+        assert!(sd.bit(0));
+        assert!(!sd.bit(63));
+        assert!(sd.bit(64));
+        assert!(!sd.bit(199));
     }
 }
