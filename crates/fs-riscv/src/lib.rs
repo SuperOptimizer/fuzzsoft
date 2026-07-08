@@ -651,6 +651,13 @@ impl Tlb {
     }
 }
 
+/// Comparison-coverage (CMPLOG/RedQueen) log capacity — bounds the per-case recording cost so a
+/// pathological tight compare loop can't grow the log unboundedly. Recording simply stops once
+/// full (no ring eviction): the first `CMPLOG_CAP` comparisons of a case are ample signal for the
+/// mutation-time value-matching pass in `fs-prog`, and an early-case magic-value compare (the
+/// common case: an argument validated near the top of a syscall handler) is captured either way.
+const CMPLOG_CAP: usize = 8192;
+
 /// The scalar RV32IM core state.
 #[derive(Clone)]
 pub struct Cpu {
@@ -670,6 +677,13 @@ pub struct Cpu {
     pub hypercall_eid: Option<u32>,
     /// Software TLB over the sv32 walk (flushed on SFENCE.VMA / satp write).
     tlb: Tlb,
+    /// Comparison-coverage (CMPLOG) log: `Some(log)` while recording is enabled via
+    /// [`Cpu::set_cmplog`], `None` (the default) otherwise. Every retired `Branch` and every
+    /// `Op::{Sub,Xor}` (the common equality-compare lowering) appends its `(rs1_val, rs2_val)`
+    /// pair, capped at [`CMPLOG_CAP`]. `None` costs exactly one pointer-sized discriminant check
+    /// per instruction and no allocation — the hot fuzzing loop pays nothing extra unless a case
+    /// explicitly opts in via `--cmplog`.
+    cmplog: Option<Vec<(u32, u32)>>,
 }
 
 impl Cpu {
@@ -684,6 +698,29 @@ impl Cpu {
             csr: Csr::default(),
             hypercall_eid: None,
             tlb: Tlb::new(),
+            cmplog: None,
+        }
+    }
+
+    /// Enable or disable comparison-coverage recording. Enabling (re)starts from an empty log;
+    /// disabling drops any log content and reverts `step` to zero-cost. Purely observational —
+    /// toggling it never changes what a program computes, only what side-channel is recorded.
+    pub fn set_cmplog(&mut self, on: bool) {
+        self.cmplog = if on { Some(Vec::new()) } else { None };
+    }
+
+    /// True if comparison-coverage recording is currently enabled.
+    pub fn cmplog_enabled(&self) -> bool {
+        self.cmplog.is_some()
+    }
+
+    /// Drain the recorded comparison operand pairs (`(rs1_val, rs2_val)` from every executed
+    /// `Branch` and `Sub`/`Xor`), leaving recording enabled with a freshly emptied log. Returns an
+    /// empty vec if recording was never enabled.
+    pub fn cmplog_take(&mut self) -> Vec<(u32, u32)> {
+        match &mut self.cmplog {
+            Some(log) => std::mem::take(log),
+            None => Vec::new(),
         }
     }
 
@@ -971,6 +1008,11 @@ impl Cpu {
             Inst::Branch { op, rs1, rs2, imm } => {
                 let a = self.rd_reg(rs1);
                 let b = self.rd_reg(rs2);
+                if let Some(log) = self.cmplog.as_mut()
+                    && log.len() < CMPLOG_CAP
+                {
+                    log.push((a, b));
+                }
                 let taken = match op {
                     BranchOp::Eq => a == b,
                     BranchOp::Ne => a != b,
@@ -1018,7 +1060,19 @@ impl Cpu {
                 self.wr_reg(rd, v);
             }
             Inst::Op { op, rd, rs1, rs2 } => {
-                let v = alu(op, self.rd_reg(rs1), self.rd_reg(rs2));
+                let ra = self.rd_reg(rs1);
+                let rb = self.rd_reg(rs2);
+                // Sub/Xor are the common compiler lowering for an equality compare (`a - b == 0`
+                // / `a ^ b == 0`) that a later branch tests — log their operands too, same as a
+                // direct Branch, so CMPLOG catches `if (x == y)` patterns the compiler didn't
+                // lower straight to a Branch on x/y.
+                if matches!(op, AluOp::Sub | AluOp::Xor)
+                    && let Some(log) = self.cmplog.as_mut()
+                    && log.len() < CMPLOG_CAP
+                {
+                    log.push((ra, rb));
+                }
+                let v = alu(op, ra, rb);
                 self.wr_reg(rd, v);
             }
             Inst::Mul { op, rd, rs1, rs2 } => {

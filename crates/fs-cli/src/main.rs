@@ -719,6 +719,7 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     let mut corpus_dir: Option<String> = None;
     let mut sanitize = false;
     let mut san_poison = false;
+    let mut cmplog = false;
     let ram_base = 0x8000_0000u32;
     let kernel_addr = 0x8040_0000u32;
 
@@ -738,6 +739,17 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
             "--san-poison" => {
                 sanitize = true;
                 san_poison = true;
+                i += 1;
+                continue;
+            }
+            // CMPLOG (comparison-coverage / RedQueen): occasionally trace a corpus entry with
+            // fs-riscv's cmp-operand recording on, then feed the observed `(a, b)` pairs into
+            // `fs_prog::mutate_cmplog` to try substituting a matching magic value directly
+            // instead of waiting for random mutation to stumble onto it. Serial path only (see
+            // the `--jobs > 1` incompatibility check below) — first cut, decision pending on
+            // whether to thread it through the parallel `CowMachine` workers too.
+            "--cmplog" => {
+                cmplog = true;
                 i += 1;
                 continue;
             }
@@ -849,6 +861,10 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     if jobs > 1 {
         if sanitize {
             eprintln!("fuzz: --jobs > 1 is incompatible with --sanitize (PC-hook path is serial)");
+            return ExitCode::FAILURE;
+        }
+        if cmplog {
+            eprintln!("fuzz: --jobs > 1 is incompatible with --cmplog in this first cut (serial-only)");
             return ExitCode::FAILURE;
         }
         // Captured right here — after boot AND after the prog/scratch address translation above
@@ -986,13 +1002,46 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     let mut done = 0u32;
     let mut budget_hit = 0u32;
     let mut total_case_insns = 0u64;
+    // CMPLOG bookkeeping (decision: --cmplog, serial path only — see the `--jobs > 1` guard
+    // above): how many times we traced a corpus entry to learn its comparison operands, and how
+    // many of those traces actually yielded a value-substitution mutation (vs. no match, falling
+    // back to the ordinary mutator).
+    let mut cmplog_traces = 0u32;
+    let mut cmplog_hits = 0u32;
     let t0 = std::time::Instant::now();
 
     for case in 0..cases {
         // Mostly mutate the corpus, sometimes generate fresh (decision #48).
         let prog = if !corpus.is_empty() && rng.chance(85) {
-            let base = &corpus[rng.below(corpus.len())];
-            fs_prog::mutate(&mut rng, base)
+            let base_idx = rng.below(corpus.len());
+            let base = &corpus[base_idx];
+            // CMPLOG (a fraction of corpus-mutation cases): trace `base` once with fs-riscv's
+            // cmp-operand recording on, then try to substitute a matching magic value straight
+            // into the program's own data — see `fs_prog::mutate_cmplog`'s doc for the technique.
+            // Falls back to the ordinary mutator if recording found no usable match.
+            if cmplog && rng.chance(30) {
+                cmplog_traces += 1;
+                cpu.set_cmplog(true);
+                snap.reset(&mut cpu, &mut m);
+                let traced = fs_prog::lower(base, scratch);
+                write_words(&mut m, &prog_pas, &fs_prog::to_wire(&traced));
+                write_scratch_bytes(&mut m, &scratch_pas, &traced.scratch);
+                let mut trace_map = CovBitmap::new(); // scratch bitmap — this run's coverage is
+                // not fed back; only the cmp-operand log matters here.
+                let trace_deadline = cpu.insns_retired + case_insns;
+                let _ = run_case(&mut cpu, &mut m, &mut trace_map, trace_deadline, None);
+                let pairs = cpu.cmplog_take();
+                cpu.set_cmplog(false);
+                match fs_prog::mutate_cmplog(&mut rng, base, &pairs) {
+                    Some(p) => {
+                        cmplog_hits += 1;
+                        p
+                    }
+                    None => fs_prog::mutate(&mut rng, base),
+                }
+            } else {
+                fs_prog::mutate(&mut rng, base)
+            }
         } else {
             fs_prog::generate(&mut rng)
         };
@@ -1068,6 +1117,11 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
         println!(
             "  kernel allocs : {} kmalloc ({} bytes), {} kfree  [hooks fired — sanitizer path validated]",
             ctx.allocs, ctx.bytes, ctx.frees
+        );
+    }
+    if cmplog {
+        println!(
+            "  cmplog        : {cmplog_traces} traces, {cmplog_hits} produced a value-substitution mutation"
         );
     }
     println!(

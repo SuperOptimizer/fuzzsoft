@@ -13,6 +13,7 @@
 //! See `DESIGN.md` in this crate for the exact guest-agent wire protocol.
 
 pub mod batch;
+pub mod cmplog;
 pub mod genr;
 pub mod lower;
 pub mod mutate;
@@ -23,6 +24,7 @@ pub mod syscalls;
 pub mod types;
 
 pub use batch::{mutate_batch, mutate_data};
+pub use cmplog::mutate_cmplog;
 pub use genr::generate;
 pub use lower::{
     CALL_WORDS, ConcreteCall, DEFAULT_SCRATCH_CAP, FIXUP_WORDS, Fixup, FixupSrc, Lowered,
