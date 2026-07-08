@@ -49,15 +49,11 @@ impl Rng {
     }
 }
 
-fn has_marker(hay: &[u8], needle: &[u8]) -> bool {
-    hay.windows(needle.len()).any(|w| w == needle)
-}
-
-/// Run one fuzz case with coverage recording. Records non-fall-through control-flow edges.
+/// Run one fuzz case, recording non-fall-through control-flow edges into an AFL-style bitmap.
 fn run_case(
     cpu: &mut fs_riscv::Cpu,
     m: &mut fs_platform::Machine,
-    cov: &mut fs_cov::Coverage,
+    cov: &mut fs_cov::CovBitmap,
     deadline: u64,
 ) -> fs_platform::Stop {
     use fs_platform::Stop;
@@ -78,6 +74,27 @@ fn run_case(
         }
     }
     Stop::Budget
+}
+
+/// The faulting kernel PC from an oops register dump ("epc : c00185e0"), for crash dedup.
+fn parse_epc(s: &str) -> Option<u32> {
+    let i = s.find("epc : ")?;
+    let hex: String = s[i + 6..].chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+    u32::from_str_radix(&hex, 16).ok()
+}
+
+/// Classify console output produced during a case. Returns `Some(sig)` only for a genuine KERNEL
+/// fault (not a userspace segfault that merely killed init), deduped by faulting kernel PC.
+fn kernel_crash_sig(out: &[u8]) -> Option<u32> {
+    let s = String::from_utf8_lossy(out);
+    let kernel_fault = s.contains("Unable to handle kernel")
+        || s.contains("KASAN:")
+        || s.contains("kernel BUG at")
+        || (s.contains("Oops") && !s.contains("Attempted to kill init"));
+    if !kernel_fault {
+        return None;
+    }
+    Some(parse_epc(&s).unwrap_or(0))
 }
 
 const MAX_CALLS: usize = 8;
@@ -163,11 +180,6 @@ fn mutate_program(rng: &mut Rng, base: &Prog, scratch: u32, deny: &[u32]) -> Pro
     p
 }
 
-/// Program signature for crash dedup: fold the syscall-number sequence.
-fn prog_sig(p: &Prog) -> u32 {
-    p.calls.iter().fold(0u32, |s, c| s.wrapping_mul(31).wrapping_add(c.nr))
-}
-
 /// Write a program into the guest's `prog` buffer via its precomputed physical word addresses:
 /// layout is `[count][nr, a0..a5]*`.
 fn write_program(m: &mut fs_platform::Machine, prog_pas: &[u32], p: &Prog) {
@@ -186,7 +198,7 @@ fn write_program(m: &mut fs_platform::Machine, prog_pas: &[u32], p: &Prog) {
 /// Snapshot-based, coverage-guided syscall fuzzer: boot to the agent's snapshot hypercall, then
 /// loop reset -> inject (mutate corpus / generate) -> run -> feed coverage back -> detect crashes.
 fn cmd_fuzz(args: &[String]) -> ExitCode {
-    use fs_cov::Coverage;
+    use fs_cov::{CovBitmap, VirginMap};
     use fs_mmu::{PERM_EXEC, PERM_READ, PERM_WRITE};
     use fs_platform::{Machine, Snapshot, Stop, run_until};
 
@@ -284,9 +296,18 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     let base_uart = m.uart.out.len();
 
     // --- coverage-guided fuzz loop over syscall *programs* ---
-    let mut cov = Coverage::new();
+    let mut virgin = VirginMap::new(); // accumulated coverage (feedback)
+    let mut run_map = CovBitmap::new(); // per-case edge bitmap
     let mut rng = Rng(seed.max(1));
-    let deny = [93u32, 94, 142]; // exit, exit_group, reboot
+    // Deny syscalls that corrupt the single-process agent's own address space / signal state /
+    // lifetime (they crash init as a userspace false-positive rather than stressing the kernel).
+    let deny = [
+        93u32, 94, 142, // exit, exit_group, reboot
+        139, // rt_sigreturn
+        214, 215, 216, 222, 226, // brk, munmap, mremap, mmap, mprotect
+        132, 133, 134, 135, // sigaltstack, rt_sigtimedwait, rt_sigaction, rt_sigprocmask
+        220, 221, 281, 435, // clone, execve, execveat, clone3
+    ];
     let mut corpus: Vec<Prog> = Vec::new();
     let mut crash_sigs = std::collections::HashSet::new();
     let mut crashes = 0u32;
@@ -308,39 +329,36 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
         let case_start = cpu.insns_retired;
         write_program(&mut m, &prog_pas, &prog);
 
-        let before = cov.num_edges();
+        run_map.clear();
         let deadline = cpu.insns_retired + case_insns;
-        match run_case(&mut cpu, &mut m, &mut cov, deadline) {
+        match run_case(&mut cpu, &mut m, &mut run_map, deadline) {
             Stop::Hypercall(HC_DONE) => done += 1,
             Stop::Budget => budget_hit += 1,
             _ => {}
         }
         total_case_insns += cpu.insns_retired - case_start;
 
-        // Coverage feedback: a program that reached new edges joins the corpus.
-        if cov.num_edges() > before {
+        // Coverage feedback (AFL bitmap): a program that lit new buckets joins the corpus.
+        if virgin.has_new_bits(&run_map) {
             corpus.push(prog.clone());
         }
 
-        // Crash oracle (decision #19), deduped by program signature.
+        // Crash oracle (decision #19): only genuine KERNEL faults, deduped by faulting kernel PC.
         let out = &m.uart.out[base_uart.min(m.uart.out.len())..];
-        if has_marker(out, b"Oops")
-            || has_marker(out, b"Kernel panic")
-            || has_marker(out, b"Unable to handle")
-            || has_marker(out, b"BUG:")
-        {
+        if let Some(sig) = kernel_crash_sig(out) {
             crashes += 1;
-            if crash_sigs.insert(prog_sig(&prog)) {
+            if crash_sigs.insert(sig) {
                 let nrs: Vec<u32> = prog.calls.iter().map(|c| c.nr).collect();
-                eprintln!("fuzz: [CRASH] new signature: case {case} program nrs={nrs:?}");
+                eprintln!("fuzz: [KERNEL CRASH] epc={sig:#010x} case {case} nrs={nrs:?}");
+                eprintln!("{}", String::from_utf8_lossy(out));
             }
         }
 
         if case % 500 == 499 {
             eprintln!(
-                "fuzz: {} cases | {} edges | corpus {} | {} crashes ({} uniq) | {:.0} exec/s",
+                "fuzz: {} cases | {} cov | corpus {} | {} kcrash ({} uniq) | {:.0} exec/s",
                 case + 1,
-                cov.num_edges(),
+                virgin.covered_buckets(),
                 corpus.len(),
                 crashes,
                 crash_sigs.len(),
@@ -355,9 +373,9 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     println!("== fuzz complete ==");
     println!("  cases         : {cases}  in {elapsed:.1}s  ({execs_per_sec:.0} execs/sec)");
     println!("  syscalls done : {done}  (budget-hit: {budget_hit})");
-    println!("  coverage      : {} edges", cov.num_edges());
-    println!("  corpus        : {} inputs", corpus.len());
-    println!("  crashes       : {crashes}  ({} unique signatures)", crash_sigs.len());
+    println!("  coverage      : {} bitmap buckets", virgin.covered_buckets());
+    println!("  corpus        : {} programs", corpus.len());
+    println!("  kernel crashes: {crashes}  ({} unique kernel PCs)", crash_sigs.len());
     println!(
         "  guest speed   : {mips:.0} MIPS ({} insns/case avg)",
         total_case_insns / cases.max(1) as u64
