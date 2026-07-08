@@ -378,3 +378,148 @@ expected — 50 random seed-1 programs don't corrupt the heap; the point is the 
 The asymmetry is the whole trade: slower, but a crash here is a real kernel heap bug, not a
 sanitizer false positive. Use this Image for heap-focused campaigns; keep the stock `firmware/Image`
 for raw-throughput coverage growth.
+
+---
+
+## Oracle validation: planted-bug kernel
+
+The `firmware/Image.slubdebug` smoke test above is necessary but not sufficient: 0 crashes over 50
+clean-kernel programs proves the oracle *doesn't false-positive*, not that it can *detect* a real
+kernel heap bug (it has never been given one to catch). This section closes that gap with a
+**third** kernel Image, `firmware/Image.buggy`, that plants a deliberate, clearly-fenced,
+allocator-detected slab overwrite reachable only from a specific fuzzer syscall — proof the
+`kernel_crash_sig` console oracle actually fires on real corruption, not just that it stays quiet.
+
+**THIS IMAGE IS FOR ORACLE VALIDATION ONLY — never a real fuzzing target.** It has a deliberate,
+unconditional kernel heap bug and must never be confused with `firmware/Image` or
+`firmware/Image.slubdebug`.
+
+### The planted bug
+
+Built from a third clean worktree, `build/linux-buggy-src` (same pattern as
+`build/linux-slubdebug-src`: a pristine second checkout of the `linux/` repo at the same commit as
+`build/linux-src`, since Kbuild's `O=` build refuses to run against an already-in-tree-built
+source). The patch, saved as `scripts/planted-bug.patch` and applied only to that worktree, adds a
+fenced block at the top of `SYSCALL_DEFINE2(memfd_create, ...)` in `mm/memfd.c` (this kernel version
+keeps `memfd_create` in `mm/memfd.c`, not `fs/memfd.c`):
+
+```c
+	/* FUZZSOFT PLANTED BUG — NOT FOR PRODUCTION
+	 * Deliberate slab out-of-bounds write, planted here to validate that
+	 * the fuzzsoft crash oracle (console scan for SLUB_DEBUG reports)
+	 * actually detects real kernel heap corruption. This is reachable
+	 * only via the memfd_create() syscall, which the fuzzer's own boot
+	 * path never calls, so it does not affect boot-to-snapshot. Do not
+	 * upstream, do not merge into a real kernel build.
+	 */
+	{
+		char *fuzzsoft_p = kmalloc(32, GFP_KERNEL);
+		if (fuzzsoft_p) {
+			/* First byte immediately past the 32-byte object. For a
+			 * SLUB_DEBUG_ON kmalloc-32 cache, s->object_size=32 and
+			 * s->inuse=36 (object_size rounded to word size, then +4
+			 * for a non-empty Right Redzone since SLAB_RED_ZONE and
+			 * size==object_size) — so bytes [32,36) are the live,
+			 * checked "Right Redzone". Writing offset 32 lands
+			 * squarely inside it (an offset like +16 lands inside
+			 * SLAB_STORE_USER's alloc/free track metadata instead,
+			 * which SLUB does NOT sanity-check on free — verified by
+			 * smoke test to produce zero detections).
+			 */
+			fuzzsoft_p[32] = 0x41; /* 1 byte past the 32-byte object: SLUB Right Redzone corruption, caught on kfree() by SLUB_DEBUG */
+			kfree(fuzzsoft_p);
+		}
+	}
+	/* END FUZZSOFT PLANTED BUG */
+```
+
+Design notes:
+
+- **Boot-safe:** `memfd_create` is never called during plain kernel boot/init, only when the
+  fuzzer's guest agent explicitly emits it as one of its curated syscalls (`nr` 279, confirmed
+  against `include/uapi/asm-generic/unistd.h`'s `#define __NR_memfd_create 279` and
+  `crates/fs-prog/src/syscalls.rs`'s `SyscallDesc { name: "memfd_create", nr: 279, ... }`). Boot to
+  snapshot on `Image.buggy` is unaffected — it reaches `Run /init` exactly like `Image.slubdebug`.
+- **Fuzzer-reachable:** `memfd_create` is in `fs-prog`'s curated syscall table and is a common,
+  dependency-free pick in generated programs (it produces an `FD` resource other calls consume).
+- **Unconditional and unattached to user input:** the write is a fixed offset into a fixed-size
+  kernel allocation, not derived from any user-controlled pointer/length — this is a clean
+  allocator-detected corruption on the very first `memfd_create` call, not a wild/user-triggerable
+  fault, so detection doesn't depend on which arguments the fuzzer happened to generate.
+- **Offset choice matters, and the first attempt (offset 48) was wrong** — see the note in the
+  patch comment. A first pass at this experiment planted the write at `p[48]` (following the
+  original design intent: "16 bytes past a 32-byte object"). Built, booted, and ran 400 cases:
+  **zero crashes.** Reading `calculate_sizes()` in `mm/slub.c` explains why: for a `SLUB_DEBUG_ON`
+  kmalloc-32 cache, the *checked* Right Redzone is only `s->inuse - s->object_size` = 4 bytes
+  (`[32, 36)`) — byte 48 instead lands inside the `SLAB_STORE_USER` alloc/free `struct track`
+  metadata region, which SLUB writes and reads but never sanity-checks for corruption on free. That
+  overwrite was real but silent — a good reminder that "past the object" isn't automatically "in a
+  checked byte range" once `SLAB_STORE_USER`/`SLAB_RED_ZONE` reshuffle the object's tail layout.
+  Moving the write to offset 32 (the first byte of the guaranteed-checked Right Redzone) fixed it.
+
+### Build
+
+`scripts/build-buggy-kernel.sh` reproduces the whole thing deterministically: creates
+`build/linux-buggy-src` (clean worktree) if missing, applies `scripts/planted-bug.patch` if not
+already applied (checked via the fenced marker, so it's idempotent), seeds + `olddefconfig`s the
+`.config` from the stock build, flips `CONFIG_SLUB_DEBUG_ON`, verifies both that and
+`CONFIG_INITRAMFS_SOURCE` stuck, builds `Image`, and publishes `firmware/Image.buggy` +
+`firmware/System.map.buggy`. Output sizes: **`Image.buggy` 26,930,176 bytes**, **`System.map.buggy`
+4,160,369 bytes** — identical sizes to the `.slubdebug` build, as expected (same config, one
+fenced-off ~20-line function body change).
+
+### Smoke test — the oracle fires
+
+```
+./target/release/fuzzsoft fuzz --cases 400 --seed 1 --kernel firmware/Image.buggy
+```
+
+Result: **`[KERNEL CRASH]` fired at case 91** (first of 5 distinct crash signatures across 9 total
+crashes in the 400-case run — `memfd_create` gets picked often enough that several *different*
+surrounding call sequences each independently trip the same planted bug and get deduped by faulting
+PC into 5 unique signatures). Exact console excerpt from the first hit:
+
+```
+fuzz: [KERNEL CRASH] epc=0x7e9d0013 case 91 calls=["memfd_create", "dup", "statx", "ioctl$TCSETS", "recvmsg", "pidfd_getfd", "epoll_pwait", "close"] nrs=[279, 23, 291, 29, 212, 438, 22, 57]
+[  207.377195] [Right Redzone overwritten] 0xc2e33dc0-0xc2e33dc0 @offset=3520. First byte 0x41 instead of 0xcc
+[  207.379899] =============================================================================
+[  207.381986] BUG kmalloc-32 (Not tainted): Object corrupt
+[  207.383741] -----------------------------------------------------------------------------
+[  207.385996] Allocated in ___se_sys_memfd_create+0x32/0x1cc age=0 cpu=0 pid=1
+[  207.388530]  __kmalloc_cache_noprof+0x110/0x29c
+[  207.390717]  ___se_sys_memfd_create+0x32/0x1cc
+[  207.392703]  __riscv_sys_memfd_create+0x12/0x1c
+[  207.394707]  syscall_handler+0x1c/0x28
+[  207.396719]  do_trap_ecall_u+0x108/0x238
+[  207.398631]  handle_exception+0xd4/0xe2
+[  207.400483] Freed in kobject_uevent_env+0x128/0x1bc age=88 cpu=0 pid=1
+...
+[  207.430653] Slab 0xc7afd7f8 objects=32 used=28 fp=0xc2e33e20 flags=0x80000200(workingset|section=16|zone=0)
+[  207.433455] Object 0xc2e33da0 @offset=3488 fp=0xc2e33e20
+[  207.435589] Redzone  c2e33d80: cc cc cc cc cc cc cc cc cc cc cc cc cc cc cc cc  ................
+[  207.437936] Redzone  c2e33d90: cc cc cc cc cc cc cc cc cc cc cc cc cc cc cc cc  ................
+[  207.440304] Object   c2e33da0: 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b  kkkkkkkkkkkkkkkk
+[  207.442658] Object   c2e33db0: 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b a5  kkkkkkkkkkkkkkk.
+[  207.445007] Redzone  c2e33dc0: 41 cc cc cc                                      A...
+[  207.447219] Padding  c2e33df4: 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a 5a              ZZZZZZZZZZZZ
+[  207.449459] Disabling lock debugging due to kernel taint
+[  207.452346] ------------[ cut here ]------------
+[  207.452602] WARNING: mm/slub.c:1233 at object_err+0xa0/0xb0, CPU#0: init/1
+```
+
+The `Redzone c2e33dc0: 41 cc cc cc` line is a direct, byte-level confirmation: `0x41` (`'A'`, our
+planted write) sitting where the pristine `0xcc` redzone fill should be, at exactly `object_addr +
+32` (`0xc2e33da0 + 32 = 0xc2e33dc0`). SLUB's own allocator — not a guessed emulator redzone —
+declared `BUG kmalloc-32 (Not tainted): Object corrupt` and correctly attributed the allocation to
+`___se_sys_memfd_create+0x32/0x1cc`, i.e. our planted code. `kernel_crash_sig`'s `slub_report` branch
+matches this via the `"Redzone overwritten"` substring (the actual format string is `"[%s
+overwritten]"` with `%s = "Right Redzone"`, so it substring-matches as designed) and reports it as a
+genuine `[KERNEL CRASH]`, deduped by a report-line hash since this class of report has no `epc:`
+register dump line to key on.
+
+**Conclusion: the fuzzer's crash oracle is validated end-to-end.** Given a real, allocator-detected
+kernel heap corruption reachable through a fuzzer-emitted syscall, `kernel_crash_sig` catches it,
+`[KERNEL CRASH]` fires, and the console report is captured verbatim — on the very first fenced-bug
+kernel tried, well within the first few hundred cases. This closes the loop the `Image.slubdebug`
+smoke test (0 crashes on a clean kernel) left open: the oracle isn't just quiet on clean kernels, it
+is loud on planted ones.

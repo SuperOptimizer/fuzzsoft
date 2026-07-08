@@ -1,0 +1,39 @@
+diff --git a/mm/memfd.c b/mm/memfd.c
+index abe13b291ddc..fd6d19f52901 100644
+--- a/mm/memfd.c
++++ b/mm/memfd.c
+@@ -510,6 +510,34 @@ SYSCALL_DEFINE2(memfd_create,
+ 	unsigned int fd_flags;
+ 	int error;
+ 
++	/* FUZZSOFT PLANTED BUG — NOT FOR PRODUCTION
++	 * Deliberate slab out-of-bounds write, planted here to validate that
++	 * the fuzzsoft crash oracle (console scan for SLUB_DEBUG reports)
++	 * actually detects real kernel heap corruption. This is reachable
++	 * only via the memfd_create() syscall, which the fuzzer's own boot
++	 * path never calls, so it does not affect boot-to-snapshot. Do not
++	 * upstream, do not merge into a real kernel build.
++	 */
++	{
++		char *fuzzsoft_p = kmalloc(32, GFP_KERNEL);
++		if (fuzzsoft_p) {
++			/* First byte immediately past the 32-byte object. For a
++			 * SLUB_DEBUG_ON kmalloc-32 cache, s->object_size=32 and
++			 * s->inuse=36 (object_size rounded to word size, then +4
++			 * for a non-empty Right Redzone since SLAB_RED_ZONE and
++			 * size==object_size) — so bytes [32,36) are the live,
++			 * checked "Right Redzone". Writing offset 32 lands
++			 * squarely inside it (an offset like +16 lands inside
++			 * SLAB_STORE_USER's alloc/free track metadata instead,
++			 * which SLUB does NOT sanity-check on free — verified by
++			 * smoke test to produce zero detections).
++			 */
++			fuzzsoft_p[32] = 0x41; /* 1 byte past the 32-byte object: SLUB Right Redzone corruption, caught on kfree() by SLUB_DEBUG */
++			kfree(fuzzsoft_p);
++		}
++	}
++	/* END FUZZSOFT PLANTED BUG */
++
+ 	error = sanitize_flags(&flags);
+ 	if (error < 0)
+ 		return error;

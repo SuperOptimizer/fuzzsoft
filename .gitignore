@@ -70,3 +70,4 @@ dkms.conf
 /build
 /manager.cfg
 /.claude/
+/crashes/

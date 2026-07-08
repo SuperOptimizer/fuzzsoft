@@ -106,18 +106,82 @@ fn parse_epc(s: &str) -> Option<u32> {
     u32::from_str_radix(&hex, 16).ok()
 }
 
+fn fnv1a(s: &str) -> u32 {
+    let mut h = 0x811c_9dc5u32;
+    for b in s.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
+/// A stable 32-bit crash signature for reports that lack an `epc :` register dump (SLUB debug
+/// prints a `BUG <cache> …` banner + call trace but no epc). Keyed on the *allocation call site* —
+/// `SLAB_STORE_USER` prints `Allocated in <symbol>+0x…`, and that symbol (e.g.
+/// `___se_sys_memfd_create`) is identical across runs regardless of the object's runtime address,
+/// so it both dedups distinct bug sites and stays constant during minimization (whereas the
+/// `Redzone <addr>:` line embeds a per-allocation address that would make every run look unique).
+/// Falls back to the address-stripped `BUG`/report line when no allocation site is recorded.
+fn report_line_sig(s: &str) -> u32 {
+    if let Some(i) = s.find("Allocated in ") {
+        let site: &str = s[i + "Allocated in ".len()..]
+            .split(['+', ' ', '\n'])
+            .next()
+            .unwrap_or("");
+        if !site.is_empty() {
+            return fnv1a(site);
+        }
+    }
+    // Fallback: the report line with hex-looking tokens (addresses) removed, so it's run-stable.
+    let line = s
+        .lines()
+        .map(str::trim)
+        .find(|l| {
+            l.contains("Redzone")
+                || l.contains("Poison")
+                || l.contains("Object already free")
+                || l.contains("Freepointer")
+                || l.contains("Padding overwritten")
+                || l.starts_with("BUG")
+        })
+        .unwrap_or("");
+    let normalized: Vec<&str> = line
+        .split_whitespace()
+        .filter(|t| {
+            !t.contains("0x") && !(t.len() >= 6 && t.chars().all(|c| c.is_ascii_hexdigit()))
+        })
+        .collect();
+    fnv1a(&normalized.join(" "))
+}
+
 /// Classify console output produced during a case. Returns `Some(sig)` only for a genuine KERNEL
-/// fault (not a userspace segfault that merely killed init), deduped by faulting kernel PC.
+/// fault (not a userspace segfault that merely killed init), deduped by a crash signature.
+///
+/// Two families are detected: (1) hard CPU faults / assertions (`Unable to handle kernel …`,
+/// `Oops`, `kernel BUG at`, `KASAN:`) — deduped by faulting kernel PC (`epc`); and (2) *allocator*
+/// self-check reports emitted by a `CONFIG_SLUB_DEBUG_ON` kernel (`Redzone overwritten`, `Poison
+/// overwritten`, `Object already free`, `Freepointer corrupt`, `Padding overwritten`) — deduped by
+/// a hash of the report's `BUG <cache> …` line, since those don't print an `epc` register dump.
+/// The second family is what makes `firmware/Image.slubdebug`/`Image.buggy` heap-bug detection work.
 fn kernel_crash_sig(out: &[u8]) -> Option<u32> {
     let s = String::from_utf8_lossy(out);
-    let kernel_fault = s.contains("Unable to handle kernel")
+    let hard_fault = s.contains("Unable to handle kernel")
         || s.contains("KASAN:")
         || s.contains("kernel BUG at")
         || (s.contains("Oops") && !s.contains("Attempted to kill init"));
-    if !kernel_fault {
-        return None;
+    let slub_report = s.contains("Redzone overwritten")
+        || s.contains("Poison overwritten")
+        || s.contains("Object already free")
+        || s.contains("Freepointer corrupt")
+        || s.contains("Padding overwritten");
+    if hard_fault {
+        // Prefer the epc; fall back to the report-line hash if this oops lacks a register dump.
+        Some(parse_epc(&s).unwrap_or_else(|| report_line_sig(&s)))
+    } else if slub_report {
+        Some(report_line_sig(&s))
+    } else {
+        None
     }
-    Some(parse_epc(&s).unwrap_or(0))
 }
 
 // The typed, resource-threaded program model now lives in `fs-prog` (the syzlang-lite library):
@@ -152,6 +216,224 @@ fn write_scratch_bytes(m: &mut fs_platform::Machine, pas: &[u32], bytes: &[u8]) 
         }
         let _ = m.store(pa, 4, u32::from_le_bytes(word));
     }
+}
+
+/// Reset to the snapshot, inject one program, run it to completion/deadline, and report the crash
+/// signature (faulting kernel PC) with the console text if it faulted. The single primitive both
+/// the fuzz loops and the crash minimizer use to execute a candidate program.
+#[allow(clippy::too_many_arguments)]
+fn inject_and_run(
+    cpu: &mut fs_riscv::Cpu,
+    m: &mut fs_platform::Machine,
+    snap: &fs_platform::Snapshot,
+    prog: &fs_prog::Prog,
+    scratch_va: u32,
+    prog_pas: &[u32],
+    scratch_pas: &[u32],
+    case_insns: u64,
+    base_uart: usize,
+    run_map: &mut fs_cov::CovBitmap,
+) -> (fs_platform::Stop, u64, Option<(u32, String)>) {
+    let lowered = fs_prog::lower(prog, scratch_va);
+    snap.reset(cpu, m);
+    let start = cpu.insns_retired;
+    write_words(m, prog_pas, &fs_prog::to_wire(&lowered));
+    write_scratch_bytes(m, scratch_pas, &lowered.scratch);
+    run_map.clear();
+    let deadline = cpu.insns_retired + case_insns;
+    let stop = run_case(cpu, m, run_map, deadline, None);
+    let used = cpu.insns_retired - start;
+    let out = &m.uart.out[base_uart.min(m.uart.out.len())..];
+    let crash = kernel_crash_sig(out).map(|sig| (sig, String::from_utf8_lossy(out).into_owned()));
+    (stop, used, crash)
+}
+
+/// Rebuild a program from an ordered subset of its calls, keeping resource threading valid: a
+/// `Produced` reference to a kept producer is re-indexed to its new position; a reference to a
+/// *dropped* producer degrades to a harmless seed fd (so the program still lowers and is
+/// well-formed). This is what lets the minimizer delete calls out of the middle of a chain.
+fn subset_prog(prog: &fs_prog::Prog, keep: &[usize]) -> fs_prog::Prog {
+    use fs_prog::{ArgValue, ResRef, TypedCall};
+    let mut remap = std::collections::HashMap::new();
+    for (new_i, &old_i) in keep.iter().enumerate() {
+        remap.insert(old_i, new_i as u16);
+    }
+    let mut calls = Vec::with_capacity(keep.len());
+    for &old_i in keep {
+        let tc = &prog.calls[old_i];
+        let mut args = tc.args.clone();
+        for av in &mut args {
+            if let ArgValue::Res(ResRef::Produced { call_idx, .. }) = av {
+                match remap.get(&(*call_idx as usize)) {
+                    Some(&new_idx) => *call_idx = new_idx,
+                    None => *av = ArgValue::Res(ResRef::Seed(-100)), // producer dropped → bogus fd
+                }
+            }
+        }
+        calls.push(TypedCall { desc: tc.desc, args });
+    }
+    fs_prog::Prog { calls }
+}
+
+/// Delta-debug a crashing program down to a minimal call subset that still reproduces the *same*
+/// kernel crash signature. O(n²) re-runs, n ≤ MAX_CALLS = 8, so ≤ ~28 executions — cheap. Returns
+/// the minimized program plus the console text of its final reproducing run.
+#[allow(clippy::too_many_arguments)]
+fn minimize_program(
+    cpu: &mut fs_riscv::Cpu,
+    m: &mut fs_platform::Machine,
+    snap: &fs_platform::Snapshot,
+    prog: &fs_prog::Prog,
+    target_sig: u32,
+    scratch_va: u32,
+    prog_pas: &[u32],
+    scratch_pas: &[u32],
+    case_insns: u64,
+    base_uart: usize,
+) -> (fs_prog::Prog, Option<String>) {
+    let mut run_map = fs_cov::CovBitmap::new();
+    let mut keep: Vec<usize> = (0..prog.calls.len()).collect();
+    let mut console: Option<String> = None;
+    let mut changed = true;
+    while changed && keep.len() > 1 {
+        changed = false;
+        for pos in 0..keep.len() {
+            let mut cand = keep.clone();
+            cand.remove(pos);
+            let sub = subset_prog(prog, &cand);
+            let (_, _, crash) = inject_and_run(
+                cpu, m, snap, &sub, scratch_va, prog_pas, scratch_pas, case_insns, base_uart,
+                &mut run_map,
+            );
+            if let Some((sig, out)) = crash
+                && sig == target_sig
+            {
+                keep = cand;
+                console = Some(out);
+                changed = true;
+                break;
+            }
+        }
+    }
+    (subset_prog(prog, &keep), console)
+}
+
+/// Emit a standalone, compilable C reproducer for a (typically minimized) program. Mirrors
+/// `boot/agent.c`'s interpreter exactly: a `scratch[]` image, per-call `results[]`, resource args
+/// threaded from earlier calls' return values (Reg) or kernel-written out-buffers (Mem), and raw
+/// `syscall(nr, …)` invocations. Faithful because it reuses the same `lower()` output the emulator
+/// injects — pointers become `scratch + offset`, resources become `r[k]`.
+fn emit_c_reproducer(prog: &fs_prog::Prog) -> String {
+    use fs_prog::{ArgValue, FixupSrc};
+    use std::fmt::Write as _;
+    // Lower with scratch base 0 so a pointer arg's concrete value *is* its scratch byte offset.
+    let low = fs_prog::lower(prog, 0);
+    let cap = fs_prog::DEFAULT_SCRATCH_CAP as usize;
+
+    let mut s = String::new();
+    let _ = writeln!(s, "/* fuzzsoft crash reproducer — auto-generated. Build for the guest:");
+    let _ = writeln!(
+        s,
+        " *   clang --target=riscv32 -march=rv32imac -mabi=ilp32 -static -O2 -o repro repro.c */"
+    );
+    let _ = writeln!(s, "#include <sys/syscall.h>");
+    let _ = writeln!(s, "#include <unistd.h>");
+    let _ = writeln!(s, "#include <string.h>\n");
+    let _ = writeln!(s, "static unsigned char scratch[{cap}];");
+
+    // The scratch initializer bytes (only the written prefix; rest stays zero).
+    let _ = write!(s, "static const unsigned char scratch_init[] = {{");
+    for (i, b) in low.scratch.iter().enumerate() {
+        if i % 16 == 0 {
+            let _ = write!(s, "\n  ");
+        }
+        let _ = write!(s, "0x{b:02x},");
+    }
+    let _ = writeln!(s, "\n}};\n");
+
+    let _ = writeln!(s, "int main(void) {{");
+    if !low.scratch.is_empty() {
+        let _ = writeln!(s, "  memcpy(scratch, scratch_init, sizeof scratch_init);");
+    }
+    let _ = writeln!(s, "  long r[{}];", prog.calls.len().max(1));
+    let _ = writeln!(s, "  (void)r;");
+
+    for (i, (tc, cc)) in prog.calls.iter().zip(&low.calls).enumerate() {
+        // Build the six argument expressions.
+        let mut argexpr: [String; 6] = Default::default();
+        for (j, ae) in argexpr.iter_mut().enumerate() {
+            // A fixup for (i, j) overrides the concrete placeholder with a runtime value.
+            let fx = low
+                .fixups
+                .iter()
+                .find(|f| f.dst_call as usize == i && f.dst_arg as usize == j);
+            *ae = if let Some(f) = fx {
+                match f.src {
+                    FixupSrc::Reg(src) => format!("r[{src}]"),
+                    FixupSrc::Mem(off) => format!("*(unsigned *)(scratch + {off})"),
+                }
+            } else if matches!(tc.args.get(j), Some(ArgValue::Ptr(_))) {
+                // Pointer arg: concrete value is the scratch byte offset (base was 0).
+                format!("(long)(scratch + {})", cc.args[j])
+            } else {
+                format!("{}u", cc.args[j])
+            };
+        }
+        let _ = writeln!(
+            s,
+            "  r[{i}] = syscall({}, {}, {}, {}, {}, {}, {}); /* {} */",
+            cc.nr, argexpr[0], argexpr[1], argexpr[2], argexpr[3], argexpr[4], argexpr[5], tc.desc.name
+        );
+    }
+    let _ = writeln!(s, "  return 0;\n}}");
+    s
+}
+
+/// Minimize a fresh kernel crash and write two artifacts under `crashes/`: a human-readable trace
+/// (`crash_<sig>.txt`, syscall names + the oops console) and a compilable C reproducer
+/// (`crash_<sig>.c`). Best-effort — reports what it wrote to stderr.
+#[allow(clippy::too_many_arguments)]
+fn handle_new_crash(
+    cpu: &mut fs_riscv::Cpu,
+    m: &mut fs_platform::Machine,
+    snap: &fs_platform::Snapshot,
+    prog: &fs_prog::Prog,
+    sig: u32,
+    scratch_va: u32,
+    prog_pas: &[u32],
+    scratch_pas: &[u32],
+    case_insns: u64,
+    base_uart: usize,
+) {
+    let before = prog.calls.len();
+    let (minimal, console) = minimize_program(
+        cpu, m, snap, prog, sig, scratch_va, prog_pas, scratch_pas, case_insns, base_uart,
+    );
+    let names: Vec<&str> = minimal.calls.iter().map(|c| c.desc.name).collect();
+    eprintln!(
+        "fuzz: minimized crash epc={sig:#010x} from {before} → {} calls: {names:?}",
+        minimal.calls.len()
+    );
+
+    if std::fs::create_dir_all("crashes").is_err() {
+        return;
+    }
+    let mut trace = format!(
+        "fuzzsoft kernel crash\n  epc (faulting kernel PC): {sig:#010x}\n  minimized to {} calls (from {before}):\n",
+        minimal.calls.len()
+    );
+    for (i, c) in minimal.calls.iter().enumerate() {
+        trace.push_str(&format!("    {i}: {} (nr {})\n", c.desc.name, c.desc.nr));
+    }
+    if let Some(out) = &console {
+        trace.push_str("\n--- kernel console ---\n");
+        trace.push_str(out);
+    }
+    let txt = format!("crashes/crash_{sig:08x}.txt");
+    let cfile = format!("crashes/crash_{sig:08x}.c");
+    let _ = std::fs::write(&txt, trace);
+    let _ = std::fs::write(&cfile, emit_c_reproducer(&minimal));
+    eprintln!("fuzz: wrote {txt} and {cfile}");
 }
 
 /// Snapshot-based, coverage-guided syscall fuzzer: boot to the agent's snapshot hypercall, then
@@ -394,13 +676,19 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
 
         // Crash oracle (decision #19): only genuine KERNEL faults, deduped by faulting kernel PC.
         let out = &m.uart.out[base_uart.min(m.uart.out.len())..];
-        if let Some(sig) = kernel_crash_sig(out) {
+        let crash = kernel_crash_sig(out);
+        if let Some(sig) = crash {
             crashes += 1;
             if crash_sigs.insert(sig) {
                 let names: Vec<&str> = prog.calls.iter().map(|c| c.desc.name).collect();
                 let nrs: Vec<u32> = prog.calls.iter().map(|c| c.desc.nr).collect();
                 eprintln!("fuzz: [KERNEL CRASH] epc={sig:#010x} case {case} calls={names:?} nrs={nrs:?}");
                 eprintln!("{}", String::from_utf8_lossy(out));
+                // Minimize + emit a C reproducer (resets the snapshot internally; safe mid-loop).
+                handle_new_crash(
+                    &mut cpu, &mut m, &snap, &prog, sig, scratch, &prog_pas, &scratch_pas,
+                    case_insns, base_uart,
+                );
             }
         }
 
@@ -555,6 +843,7 @@ fn run_parallel(
                     if sh.virgin.has_new_bits(&run_map) {
                         sh.corpus.push(prog.clone());
                     }
+                    let mut new_crash: Option<u32> = None;
                     if let Some((sig, console)) = crash_console {
                         sh.crashes += 1;
                         if sh.crash_sigs.insert(sig) {
@@ -563,6 +852,7 @@ fn run_parallel(
                                 "fuzz: [KERNEL CRASH] epc={sig:#010x} thread {tid} calls={names:?}"
                             );
                             eprintln!("{console}");
+                            new_crash = Some(sig); // minimize *after* dropping the lock
                         }
                     }
                     sh.finished += 1;
@@ -575,6 +865,16 @@ fn run_parallel(
                             sh.crashes,
                             sh.crash_sigs.len(),
                             sh.finished as f64 / t0.elapsed().as_secs_f64(),
+                        );
+                    }
+                    drop(sh);
+
+                    // Minimize + write the reproducer outside the lock (it re-runs the guest ~n²
+                    // times on this thread's own state; other threads keep fuzzing meanwhile).
+                    if let Some(sig) = new_crash {
+                        handle_new_crash(
+                            &mut cpu_t, &mut m_t, snap, &prog, sig, scratch_va, prog_pas,
+                            scratch_pas, case_insns, base_uart,
                         );
                     }
                 }
@@ -975,6 +1275,67 @@ fn cmd_gen_elf(args: &[String]) -> ExitCode {
         Err(e) => {
             eprintln!("error: cannot write {out}: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `subset_prog` keeps any ordered subset well-formed: dropped resource producers degrade to
+    /// seed fds, kept producers are re-indexed, and the result still lowers to a valid wire buffer.
+    #[test]
+    fn subset_prog_stays_well_formed_and_lowers() {
+        for seed in 1..200u32 {
+            let mut rng = fs_prog::Rng::new(seed);
+            let prog = fs_prog::generate(&mut rng);
+            let n = prog.calls.len();
+            if n < 2 {
+                continue;
+            }
+            // Drop the first call (most likely to be a producer others depend on).
+            let keep: Vec<usize> = (1..n).collect();
+            let sub = subset_prog(&prog, &keep);
+            assert_eq!(sub.calls.len(), n - 1);
+            assert!(sub.is_well_formed(), "seed {seed}: subset not well-formed");
+            let low = fs_prog::lower(&sub, 0x1000);
+            assert!(fs_prog::to_wire(&low).len() == fs_prog::WIRE_WORDS);
+        }
+    }
+
+    /// The singleton keep-set edge case doesn't panic and stays well-formed.
+    #[test]
+    fn subset_prog_singleton_ok() {
+        let mut rng = fs_prog::Rng::new(42);
+        let prog = fs_prog::generate(&mut rng);
+        if !prog.calls.is_empty() {
+            let sub = subset_prog(&prog, &[prog.calls.len() - 1]);
+            assert_eq!(sub.calls.len(), 1);
+            assert!(sub.is_well_formed());
+        }
+    }
+
+    /// The C reproducer is structurally sound: one `syscall(nr, …)` per call, a `main`, and a
+    /// `scratch` buffer.
+    #[test]
+    fn c_reproducer_emits_one_syscall_per_call() {
+        let mut rng = fs_prog::Rng::new(7);
+        // Prefer a program with at least one resource fixup so we exercise the r[k] path.
+        let mut prog = fs_prog::generate(&mut rng);
+        for _ in 0..500 {
+            let low = fs_prog::lower(&prog, 0);
+            if !low.fixups.is_empty() && prog.calls.len() >= 2 {
+                break;
+            }
+            prog = fs_prog::generate(&mut rng);
+        }
+        let c = emit_c_reproducer(&prog);
+        assert!(c.contains("int main"));
+        assert!(c.contains("static unsigned char scratch"));
+        assert_eq!(c.matches("syscall(").count(), prog.calls.len());
+        for call in &prog.calls {
+            assert!(c.contains(&format!("{}", call.desc.nr)));
         }
     }
 }
