@@ -68,6 +68,36 @@ Name: **threaded-code-to-native, PA-keyed, escape-to-interpreter, scalar-JIT-fee
   PA-keyed cache + invalidation. This is the only place true k-mask-predicated divergent-lane execution
   (gamozolabs' technique) is built, deferred until measurement justifies it.
 
+## Measured verdict on the vector path (2026-07-08): Stages 3–4 are a NO-GO
+
+The convergence + regroup-headroom measurement (`crates/fs-vec/examples/convergence.rs`, run on the
+real full-system `VecSystem` lockstep loop off a golden OpenSBI+Linux snapshot) settles the
+"measure, don't assume" gate for vectorization:
+
+- **Honest 16-lane convergence** (all 16 lanes still active, at one `pc`): **1.6%** with independent
+  per-lane programs → **32%** with same-skeleton `mutate_batch` inputs. Batch mutation is a ~20× lift
+  and mandatory, but the ceiling is ~32%.
+- **Regroup headroom** (dynamic warp formation — the main lever that could have rescued this):
+  measured directly by pooling K=32/48/64 concurrent `VecSystem`s and counting full-16-lane-warp
+  formation → only **~7% realistic (diverse-base), flat across K.** Oversubscription buys ~nothing;
+  the 87.7% mean top-PC occupancy *overstates* headroom because it's dominated by already-converged
+  steps, while the un-converged steps scatter (p90 = 5 distinct PCs, tail to ~11).
+- **Amdahl** with the measured ~9× AVX-512 ALU speedup on converged code: **~1.4× optimistic, ~1.0×
+  realistic** (the divergent path already costs ~1.5× vs 16 independent scalars from speculative
+  fetch/translate waste). And 32% is itself an upper bound — step-weighted and PC-only; the
+  JIT-relevant lane-instruction-weighted figure is lower.
+
+**Decision:** keep the SIMD/AVX-512 tiers (Stages 3–4) **PAUSED**. The data caps kernel-syscall-fuzzing
+vectorization at ~1.3–1.5×, not the ~3–4× the multi-week AVX-512 + regroup-scheduler effort needs, and
+dynamic warp formation — the one lever that could have changed the verdict — delivers only ~7%. Invest
+the JIT effort in the **scalar path (Stage 1) × thread-parallelism (32 cores)** instead, where real
+speedup compounds without the divergence tax. Stage 2 (scalar JIT as per-lane fallback) is
+correspondingly deprioritized: at ~32% convergence a vectorized run is ~68% per-lane fallback — i.e.
+~16 scalar JITs paying SIMD overhead, no better than 16 threads each running the scalar JIT. Confidence
+medium-high (three independent measures — honest convergence, direct pool measurement, and the existing
+`VecSystem` 1.5×-slower-than-16-scalars result — all agree). Free win already applied: `fuzz_vec` now
+uses `mutate_batch` (commit `91d0fb1`).
+
 ## Open questions (measure, don't assume)
 
 Stage 0 & Stage 2 are explicit go/no-go gates. Also: profile the load/store vs ALU/branch fraction of
