@@ -436,6 +436,199 @@ fn handle_new_crash(
     eprintln!("fuzz: wrote {txt} and {cfile}");
 }
 
+// ---- Corpus persistence (decision #34): make campaigns cumulative. ----
+//
+// A typed `fs_prog::Prog` is serialized to a compact, whitespace-tokenized text form using only
+// fs-prog's *public* API (call names + a pre-order `ArgValue` token stream), so a `--corpus-dir`
+// of `.prog` files survives across runs. Deserialization maps each call name back to its
+// `&'static SyscallDesc` via `fs_prog::SYSCALLS` and rebuilds the typed arg tree, rejecting
+// anything that fails `Prog::is_well_formed` — so a corrupt/stale file can never inject an invalid
+// program.
+
+/// Append the pre-order token encoding of one `ArgValue` to `out`.
+fn enc_arg(av: &fs_prog::ArgValue, out: &mut Vec<String>) {
+    use fs_prog::{ArgValue, ResRef};
+    match av {
+        ArgValue::Imm(v) => out.push(format!("i{v}")),
+        ArgValue::Res(ResRef::Seed(s)) => out.push(format!("s{s}")),
+        ArgValue::Res(ResRef::Produced { call_idx, slot }) => {
+            out.push(format!("r{call_idx}.{slot}"))
+        }
+        ArgValue::Bytes(b) => {
+            let mut h = String::from("b");
+            if b.is_empty() {
+                h.push('-');
+            } else {
+                for byte in b {
+                    h.push_str(&format!("{byte:02x}"));
+                }
+            }
+            out.push(h);
+        }
+        ArgValue::Ptr(inner) => {
+            out.push("p".to_string());
+            enc_arg(inner, out);
+        }
+        ArgValue::Struct(vals) => {
+            out.push(format!("t{}", vals.len()));
+            for v in vals {
+                enc_arg(v, out);
+            }
+        }
+    }
+}
+
+/// Decode one `ArgValue` (pre-order) from a token iterator; `None` on any malformed token.
+fn dec_arg<'a, I: Iterator<Item = &'a str>>(it: &mut I) -> Option<fs_prog::ArgValue> {
+    use fs_prog::{ArgValue, ResRef};
+    let tok = it.next()?;
+    let (tag, rest) = tok.split_at(1);
+    Some(match tag {
+        "i" => ArgValue::Imm(rest.parse().ok()?),
+        "s" => ArgValue::Res(ResRef::Seed(rest.parse().ok()?)),
+        "r" => {
+            let (c, slot) = rest.split_once('.')?;
+            ArgValue::Res(ResRef::Produced {
+                call_idx: c.parse().ok()?,
+                slot: slot.parse().ok()?,
+            })
+        }
+        "b" => {
+            if rest == "-" {
+                ArgValue::Bytes(Vec::new())
+            } else {
+                let mut bytes = Vec::with_capacity(rest.len() / 2);
+                let hb = rest.as_bytes();
+                if !hb.len().is_multiple_of(2) {
+                    return None;
+                }
+                for pair in hb.chunks(2) {
+                    bytes.push(u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?);
+                }
+                ArgValue::Bytes(bytes)
+            }
+        }
+        "p" => ArgValue::Ptr(Box::new(dec_arg(it)?)),
+        "t" => {
+            let n: usize = rest.parse().ok()?;
+            let mut vals = Vec::with_capacity(n);
+            for _ in 0..n {
+                vals.push(dec_arg(it)?);
+            }
+            ArgValue::Struct(vals)
+        }
+        _ => return None,
+    })
+}
+
+/// Serialize a program to the corpus text form: `FSCORPUS1 <n> (CALL <name> <nargs> <argtokens…>)*`.
+fn serialize_prog(p: &fs_prog::Prog) -> String {
+    let mut toks: Vec<String> = vec!["FSCORPUS1".into(), p.calls.len().to_string()];
+    for c in &p.calls {
+        toks.push("CALL".into());
+        toks.push(c.desc.name.to_string());
+        toks.push(c.args.len().to_string());
+        for a in &c.args {
+            enc_arg(a, &mut toks);
+        }
+    }
+    toks.join(" ")
+}
+
+/// Parse the corpus text form back into a `Prog`; `None` unless it round-trips to a well-formed
+/// program whose calls all resolve to known syscall descriptions.
+fn deserialize_prog(s: &str) -> Option<fs_prog::Prog> {
+    use fs_prog::TypedCall;
+    let mut it = s.split_whitespace();
+    if it.next()? != "FSCORPUS1" {
+        return None;
+    }
+    let ncalls: usize = it.next()?.parse().ok()?;
+    let mut calls = Vec::with_capacity(ncalls);
+    for _ in 0..ncalls {
+        if it.next()? != "CALL" {
+            return None;
+        }
+        let name = it.next()?;
+        let desc = fs_prog::SYSCALLS.iter().find(|d| d.name == name)?;
+        let nargs: usize = it.next()?.parse().ok()?;
+        let mut args = Vec::with_capacity(nargs);
+        for _ in 0..nargs {
+            args.push(dec_arg(&mut it)?);
+        }
+        calls.push(TypedCall { desc, args });
+    }
+    let prog = fs_prog::Prog { calls };
+    prog.is_well_formed().then_some(prog)
+}
+
+/// Load every `*.prog` file in `dir` into a list of valid programs (silently skipping unparseable
+/// or ill-formed ones). Missing directory → empty list.
+fn load_corpus(dir: &str) -> Vec<fs_prog::Prog> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("prog") {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(&path)
+            && let Some(p) = deserialize_prog(&text)
+        {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// Persist a corpus to `dir` (created if missing), one `<hash>.prog` per program; content-addressed
+/// so re-saving an unchanged corpus is idempotent. Returns how many new files were written.
+fn save_corpus(dir: &str, corpus: &[fs_prog::Prog]) -> usize {
+    if std::fs::create_dir_all(dir).is_err() {
+        return 0;
+    }
+    let mut written = 0;
+    for p in corpus {
+        let text = serialize_prog(p);
+        let name = format!("{dir}/{:08x}.prog", fnv1a(&text));
+        if !std::path::Path::new(&name).exists() && std::fs::write(&name, &text).is_ok() {
+            written += 1;
+        }
+    }
+    written
+}
+
+/// Replay loaded seed programs once each to rebuild coverage feedback, returning the accumulated
+/// virgin map and the coverage-minimized corpus (only programs that lit new buckets are kept — the
+/// same admission rule the main loop uses). Runs on one guest; each seed resets the snapshot.
+#[allow(clippy::too_many_arguments)]
+fn replay_seeds(
+    cpu: &mut fs_riscv::Cpu,
+    m: &mut fs_platform::Machine,
+    snap: &fs_platform::Snapshot,
+    seeds: &[fs_prog::Prog],
+    scratch_va: u32,
+    prog_pas: &[u32],
+    scratch_pas: &[u32],
+    case_insns: u64,
+    base_uart: usize,
+) -> (fs_cov::VirginMap, Vec<fs_prog::Prog>) {
+    let mut virgin = fs_cov::VirginMap::new();
+    let mut run_map = fs_cov::CovBitmap::new();
+    let mut corpus = Vec::new();
+    for p in seeds {
+        let (_, _, _) = inject_and_run(
+            cpu, m, snap, p, scratch_va, prog_pas, scratch_pas, case_insns, base_uart, &mut run_map,
+        );
+        if virgin.has_new_bits(&run_map) {
+            corpus.push(p.clone());
+        }
+    }
+    (virgin, corpus)
+}
+
 /// Snapshot-based, coverage-guided syscall fuzzer: boot to the agent's snapshot hypercall, then
 /// loop reset -> inject (mutate corpus / generate) -> run -> feed coverage back -> detect crashes.
 fn cmd_fuzz(args: &[String]) -> ExitCode {
@@ -452,6 +645,7 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     let mut cases = 2000u32;
     let mut seed = 1u32;
     let mut jobs = 1u32;
+    let mut corpus_dir: Option<String> = None;
     let mut sanitize = false;
     let mut san_poison = false;
     let ram_base = 0x8000_0000u32;
@@ -489,6 +683,9 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
             // share one coverage map + corpus behind a mutex. Incompatible with --sanitize (the
             // per-instruction PC-hook path stays single-threaded).
             "--jobs" => jobs = val(i).parse().unwrap_or(1).max(1),
+            // Persist/seed the corpus across runs (decision #34): load all *.prog files from DIR at
+            // start (replayed to rebuild coverage), and save the final corpus back to DIR.
+            "--corpus-dir" => corpus_dir = Some(val(i)),
             other => {
                 eprintln!("fuzz: unexpected argument {other:?}");
                 return ExitCode::FAILURE;
@@ -612,6 +809,30 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
         None
     };
 
+    // Seed the corpus from a persisted --corpus-dir (decision #34): load saved programs and replay
+    // them once to rebuild coverage feedback, so a campaign resumes where the last one left off.
+    let (seed_virgin, seed_corpus) = if let Some(dir) = &corpus_dir {
+        let seeds = load_corpus(dir);
+        if seeds.is_empty() {
+            eprintln!("fuzz: corpus-dir {dir} — no seeds loaded (fresh start)");
+            (VirginMap::new(), Vec::new())
+        } else {
+            let (v, c) = replay_seeds(
+                &mut cpu, &mut m, &snap, &seeds, scratch, &prog_pas, &scratch_pas, case_insns,
+                base_uart,
+            );
+            eprintln!(
+                "fuzz: corpus-dir {dir} — loaded {} seeds, {} kept after coverage replay ({} buckets)",
+                seeds.len(),
+                c.len(),
+                v.covered_buckets()
+            );
+            (v, c)
+        }
+    } else {
+        (VirginMap::new(), Vec::new())
+    };
+
     // --- multi-core path: N worker threads, one guest Machine per thread, shared coverage+corpus.
     if jobs > 1 {
         if sanitize {
@@ -620,17 +841,18 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
         }
         return run_parallel(
             cpu, m, snap, scratch, prog_pas, scratch_pas, base_uart, case_insns, cases, seed, jobs,
+            corpus_dir, seed_virgin, seed_corpus,
         );
     }
 
     // --- coverage-guided fuzz loop over syscall *programs* ---
-    let mut virgin = VirginMap::new(); // accumulated coverage (feedback)
+    let mut virgin = seed_virgin; // accumulated coverage (feedback), warm-started from the corpus
     let mut run_map = CovBitmap::new(); // per-case edge bitmap
     let mut rng = fs_prog::Rng::new(seed);
     // No syscall deny-list any more: `fs-prog` only generates from its curated table of real rv32
     // syscall descriptions (no address-space/signal/lifetime-destroying calls reach the agent), so
     // the crude number-blacklist the random generator needed is gone.
-    let mut corpus: Vec<fs_prog::Prog> = Vec::new();
+    let mut corpus: Vec<fs_prog::Prog> = seed_corpus;
     let mut crash_sigs = std::collections::HashSet::new();
     let mut crashes = 0u32;
     let mut done = 0u32;
@@ -724,6 +946,10 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
         "  guest speed   : {mips:.0} MIPS ({} insns/case avg)",
         total_case_insns / cases.max(1) as u64
     );
+    if let Some(dir) = &corpus_dir {
+        let n = save_corpus(dir, &corpus);
+        println!("  corpus saved  : {n} new programs → {dir}");
+    }
     ExitCode::SUCCESS
 }
 
@@ -760,13 +986,16 @@ fn run_parallel(
     cases: u32,
     seed: u32,
     jobs: u32,
+    corpus_dir: Option<String>,
+    seed_virgin: fs_cov::VirginMap,
+    seed_corpus: Vec<fs_prog::Prog>,
 ) -> ExitCode {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
 
     let shared = Mutex::new(Shared {
-        virgin: fs_cov::VirginMap::new(),
-        corpus: Vec::new(),
+        virgin: seed_virgin,
+        corpus: seed_corpus,
         crash_sigs: std::collections::HashSet::new(),
         crashes: 0,
         done: 0,
@@ -899,6 +1128,10 @@ fn run_parallel(
         "  guest speed   : {mips:.0} MIPS aggregate ({} insns/case avg)",
         sh.total_case_insns / sh.finished.max(1)
     );
+    if let Some(dir) = &corpus_dir {
+        let n = save_corpus(dir, &sh.corpus);
+        println!("  corpus saved  : {n} new programs → {dir}");
+    }
     ExitCode::SUCCESS
 }
 
@@ -1337,6 +1570,34 @@ mod tests {
         for call in &prog.calls {
             assert!(c.contains(&format!("{}", call.desc.nr)));
         }
+    }
+
+    /// Corpus serialization round-trips: for many generated programs, serialize → deserialize
+    /// yields a program with identical calls (names + args) that is still well-formed.
+    #[test]
+    fn corpus_serialization_round_trips() {
+        for seed in 1..300u32 {
+            let mut rng = fs_prog::Rng::new(seed);
+            let prog = fs_prog::generate(&mut rng);
+            let text = serialize_prog(&prog);
+            let back = deserialize_prog(&text).expect("must deserialize");
+            assert_eq!(back.calls.len(), prog.calls.len(), "seed {seed}");
+            for (a, b) in prog.calls.iter().zip(&back.calls) {
+                assert_eq!(a.desc.name, b.desc.name, "seed {seed}");
+                assert_eq!(a.args, b.args, "seed {seed} args mismatch");
+            }
+            // And it re-serializes identically (canonical form is stable).
+            assert_eq!(serialize_prog(&back), text, "seed {seed}");
+        }
+    }
+
+    /// A malformed / unknown-syscall corpus line is rejected, never panics.
+    #[test]
+    fn corpus_deserialize_rejects_garbage() {
+        assert!(deserialize_prog("").is_none());
+        assert!(deserialize_prog("NOPE 1 CALL foo 0").is_none());
+        assert!(deserialize_prog("FSCORPUS1 1 CALL not_a_real_syscall 0").is_none());
+        assert!(deserialize_prog("FSCORPUS1 99 CALL").is_none());
     }
 }
 
