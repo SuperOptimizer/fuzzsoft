@@ -8,6 +8,14 @@ license.workspace = true
 fs-mmu = { path = "../fs-mmu" }
 fs-riscv = { path = "../fs-riscv" }
 fs-platform = { path = "../fs-platform" }
+fs-cov = { path = "../fs-cov" }
+
+[dev-dependencies]
+# Only needed by `examples/fuzz_vec.rs` (the vectorized fuzz driver): generates/mutates/lowers
+# syscall programs. `fs-cli`'s scalar fuzzer is the reference implementation this crate's fuzz
+# driver mirrors; `fs-prog` itself is a stable, dependency-free data library (decision: reused
+# verbatim, not reimplemented).
+fs-prog = { path = "../fs-prog" }
 
 [lints.rust]
 unsafe_code = "forbid"

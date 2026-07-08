@@ -77,8 +77,10 @@ dependencies = [
 name = "fs-vec"
 version = "0.0.0"
 dependencies = [
+ "fs-cov",
  "fs-mmu",
  "fs-platform",
+ "fs-prog",
  "fs-riscv",
 ]
 

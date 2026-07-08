@@ -19,13 +19,9 @@
 //! per-lane scalar path. See `DESIGN.md`'s "Full-system (VecSystem)" section for the honest
 //! accounting of how often that fast path actually fires on real kernel code.
 
-use fs_mmu::{Access, Golden, PAGE_SIZE};
-// `Bus` is only needed to call `CowMachine`'s trait methods inside the `debug_assertions`-only
-// equality guards below (`shared_fetch16`/`try_shared_load`); release builds compile those out
-// entirely, so import it conditionally to avoid an unused-import warning in release.
-#[cfg(debug_assertions)]
-use fs_mmu::Bus;
-use fs_platform::{CowMachine, Machine};
+use fs_cov::CovBitmap;
+use fs_mmu::{Access, Bus, Golden, PAGE_SIZE};
+use fs_platform::{Clint, CowMachine, Machine};
 use fs_riscv::sys::{self, Priv};
 use fs_riscv::{decode, decode_compressed, AluOp, Cpu, Inst, LoadOp, SysExit};
 use std::simd::prelude::*;
@@ -43,6 +39,10 @@ pub enum LaneExit {
     Halt(u32),
     /// A fuzzing hypercall (`ecall` with the harness's reserved a7), carrying a0.
     Hypercall(u32),
+    /// [`VecSystem::run_batch`]'s per-lane instruction budget was exhausted before this lane
+    /// reached the requested hypercall — mirrors `fs_platform::Stop::Budget` (the scalar fuzzer's
+    /// "case timed out" outcome) instead of a genuine guest-driven exit.
+    Budget,
 }
 
 /// `LANES` full-system lanes: each a real `fs_riscv::Cpu` + `fs_platform::CowMachine` pair,
@@ -61,6 +61,15 @@ pub struct VecSystem {
     pub active: [bool; LANES],
     /// Set exactly when a lane transitions from active to inactive.
     pub exit: [Option<LaneExit>; LANES],
+    /// Per-lane AFL-style edge coverage bitmap, fed by every non-fall-through `pc` transition this
+    /// lane retires (mirrors `fs-cli`'s `run_case`/`run_case_bus`: `record_edge(prev_pc, cur_pc)`
+    /// exactly when `cur != prev+4 && cur != prev+2`, and never on the step a lane halts/
+    /// hypercalls). The converged SIMD/shared-fetch paths only ever execute straight-line
+    /// fall-through instructions (ALU / same-address LOAD, both always `pc += ilen`), so in
+    /// practice every recorded edge comes from the per-lane scalar loop today — but the check is
+    /// applied uniformly to both paths so it stays correct if a future fast path ever executes a
+    /// branch/jump.
+    pub cov: Box<[CovBitmap; LANES]>,
     /// `step()` calls that executed a converged SIMD payload (ALU, or a same-address LOAD —
     /// `docs/cow-shared-ram.md` PR4) instead of the per-lane scalar loop.
     pub simd_steps: u64,
@@ -90,10 +99,22 @@ impl VecSystem {
     /// pre-swap behavior since a freshly loaded template is always CLINT/UART-default at this
     /// point).
     pub fn from_template(cpu: &Cpu, machine: &Machine) -> Self {
-        let lanes: Box<[Cpu; LANES]> = Box::new(std::array::from_fn(|_| cpu.clone()));
         let ram_base = machine.ram.base();
         let ram_size = machine.ram.size() as u32;
         let golden = Arc::new(Golden::from_mmu(&machine.ram));
+        Self::from_golden_cpu(golden, cpu, ram_base, ram_size)
+    }
+
+    /// Build all `LANES` lanes from an ALREADY-CAPTURED shared golden image (`golden`) and one
+    /// post-boot `Cpu` snapshot (typically the state at the fuzzing harness's SNAPSHOT hypercall,
+    /// captured once on a scalar `Cpu`+`Machine` — see `examples/fuzz_vec.rs`), instead of
+    /// `from_template`'s "capture golden from a `Machine` right now" convenience. This is the
+    /// entry point the vectorized fuzzer actually uses: `golden` is typically shared with other
+    /// consumers too (e.g. a future multi-thread fuzz worker, mirroring `fs-cli`'s `--jobs` path,
+    /// which threads the very same `Arc<Golden>` across worker threads), so it is taken by
+    /// reference-counted ownership here rather than re-derived from a `Machine`.
+    pub fn from_golden_cpu(golden: Arc<Golden>, cpu: &Cpu, ram_base: u32, ram_size: u32) -> Self {
+        let lanes: Box<[Cpu; LANES]> = Box::new(std::array::from_fn(|_| cpu.clone()));
         let bus: Box<[CowMachine; LANES]> =
             Box::new(std::array::from_fn(|_| CowMachine::from_golden(Arc::clone(&golden), ram_base, ram_size)));
         Self {
@@ -102,6 +123,7 @@ impl VecSystem {
             golden,
             active: [true; LANES],
             exit: [None; LANES],
+            cov: Box::new(std::array::from_fn(|_| CovBitmap::new())),
             simd_steps: 0,
             scalar_steps: 0,
             shared_fetch_steps: 0,
@@ -136,6 +158,11 @@ impl VecSystem {
         &self.bus[lane].uart.out
     }
 
+    /// This lane's accumulated AFL-style edge coverage bitmap.
+    pub fn lane_coverage(&self, lane: usize) -> &CovBitmap {
+        &self.cov[lane]
+    }
+
     pub fn any_active(&self) -> bool {
         self.active.iter().any(|&a| a)
     }
@@ -147,6 +174,89 @@ impl VecSystem {
     fn halt(&mut self, lane: usize, exit: LaneExit) {
         self.active[lane] = false;
         self.exit[lane] = Some(exit);
+    }
+
+    /// Inject one lowered fuzz program into lane `lane`'s guest physical memory: `pas[k]` is the
+    /// physical address of the k-th program word (precomputed once by translating the guest's
+    /// program-buffer VA, exactly as `fs-cli`'s `write_words` does for the scalar/parallel
+    /// fuzzers). Each lane's `CowMachine` privately copy-on-writes only the pages this touches —
+    /// the other 15 lanes' views of those same physical pages are untouched.
+    pub fn inject_lane(&mut self, lane: usize, prog_pas: &[u32], words: &[u32]) {
+        for (&pa, &w) in prog_pas.iter().zip(words) {
+            let _ = self.bus[lane].store(pa, 4, w);
+        }
+    }
+
+    /// Inject one lane's lowered scratch image (pointer-argument pointee bytes) into guest
+    /// physical memory, word-by-word via the scratch region's precomputed per-word physical
+    /// addresses — the per-lane analogue of `fs-cli`'s `write_scratch_bytes`. Bytes beyond `bytes`
+    /// up to `scratch_pas.len()` words are zero-padded (matching the scalar fuzzer's behavior:
+    /// scratch is a fixed-size region, only the lowered image's prefix is meaningful).
+    pub fn inject_scratch(&mut self, lane: usize, scratch_pas: &[u32], bytes: &[u8]) {
+        for (i, &pa) in scratch_pas.iter().enumerate() {
+            let off = i * 4;
+            let mut word = [0u8; 4];
+            for (b, wb) in word.iter_mut().enumerate() {
+                if let Some(&v) = bytes.get(off + b) {
+                    *wb = v;
+                }
+            }
+            let _ = self.bus[lane].store(pa, 4, u32::from_le_bytes(word));
+        }
+    }
+
+    /// Step every active lane until each one has either hit the fuzzing DONE hypercall
+    /// (`SysExit::Hypercall(done_code)` — masked off with [`LaneExit::Hypercall`]) or exhausted
+    /// its own per-lane instruction budget (masked off with [`LaneExit::Budget`], mirroring
+    /// `fs_platform::Stop::Budget`). Lanes finish at different times — once a lane's exit
+    /// condition is hit it stops being stepped (masked off), while the rest keep going; the
+    /// SIMD/shared-fetch fast paths only fire while the still-active subset stays converged, so
+    /// most of a batch runs per-lane scalar once lanes start diverging and dropping out. That
+    /// divergence (not a bug) is exactly the honest cost `docs/DESIGN.md`'s performance section
+    /// has to account for.
+    pub fn run_batch(&mut self, done_code: u32, budget: u64) {
+        // `step()` already masks a lane off (`LaneExit::Halt`/`LaneExit::Hypercall`) the instant
+        // its `Cpu::step_system` reports one — for this harness's guest agent the only hypercall
+        // code that can fire mid-batch is `done_code` (SNAPSHOT only ever fires once, before any
+        // `VecSystem` batch exists). `done_code` is threaded through as a documented parameter
+        // (and asserted below) rather than re-checked here, so callers get an immediate, precise
+        // panic if that assumption is ever violated instead of a silently-wrong batch.
+        let start_insns: [u64; LANES] = std::array::from_fn(|l| self.lanes[l].insns_retired);
+        while self.any_active() {
+            for (lane, &start) in start_insns.iter().enumerate() {
+                if self.active[lane] && self.lanes[lane].insns_retired - start >= budget {
+                    self.halt(lane, LaneExit::Budget);
+                }
+            }
+            if !self.any_active() {
+                break;
+            }
+            self.step();
+        }
+        for lane in 0..LANES {
+            if let Some(LaneExit::Hypercall(c)) = self.exit[lane] {
+                debug_assert_eq!(c, done_code, "lane {lane}: unexpected hypercall code {c} (expected DONE={done_code})");
+            }
+        }
+    }
+
+    /// Reset every lane back to the golden snapshot state for the next batch: drop this lane's
+    /// RAM overlays (`CowRam::reset` — O(dirty) directory entries dropped, zero byte copy-back,
+    /// mirroring `fs-cli`'s `reset_cow`), restore the hart to a fresh clone of `cpu`, restore
+    /// CLINT to a fresh clone of `clint`, truncate UART output back to `base_uart`, clear the
+    /// active mask/exit reason, and clear each lane's per-batch coverage bitmap (coverage is
+    /// merged into the caller's global `VirginMap` between batches, exactly as the scalar fuzzer
+    /// merges its per-case `CovBitmap` — see `examples/fuzz_vec.rs`).
+    pub fn reset_batch(&mut self, cpu: &Cpu, clint: &Clint, base_uart: usize) {
+        for lane in 0..LANES {
+            self.lanes[lane] = cpu.clone();
+            self.bus[lane].ram.reset();
+            self.bus[lane].clint = clint.clone();
+            self.bus[lane].uart.out.truncate(base_uart);
+            self.active[lane] = true;
+            self.exit[lane] = None;
+            self.cov[lane].clear();
+        }
     }
 
     /// Advance every active lane by exactly one instruction.
@@ -169,17 +279,44 @@ impl VecSystem {
             fs_platform::sync_timer_cow(&mut self.lanes[lane], &self.bus[lane]);
         }
 
+        // Snapshot each active lane's pre-step `pc`, for edge-coverage recording below — captured
+        // before either path mutates anything, exactly mirroring `fs-cli`'s `run_case`/
+        // `run_case_bus` (`let prev = cpu.pc;` immediately before `cpu.step_system(m)`).
+        let active_before = self.active;
+        let prev_pc: [u32; LANES] = std::array::from_fn(|lane| self.lanes[lane].pc);
+
         if self.try_converged_fast_path() {
             self.simd_steps += 1;
+            // Coverage (`docs/cow-shared-ram.md`-style honesty note): the converged SIMD/shared
+            // paths only ever execute straight-line ALU/LOAD instructions, which always advance
+            // `pc` by `ilen` (2 or 4) — i.e. always the "fall-through" case `fs-cli`'s coverage
+            // gate excludes — so this loop does not currently record anything in practice. It is
+            // still applied here (not skipped) so a future fast path that executes a branch/jump
+            // stays correct by construction instead of silently under-reporting coverage.
+            for lane in 0..LANES {
+                if !active_before[lane] {
+                    continue;
+                }
+                let (prev, cur) = (prev_pc[lane], self.lanes[lane].pc);
+                if cur != prev.wrapping_add(4) && cur != prev.wrapping_add(2) {
+                    self.cov[lane].record_edge(prev, cur);
+                }
+            }
             return;
         }
         self.scalar_steps += 1;
         for lane in 0..LANES {
-            if !self.active[lane] {
+            if !active_before[lane] {
                 continue;
             }
+            let prev = prev_pc[lane];
             match self.lanes[lane].step_system(&mut self.bus[lane]) {
-                SysExit::Continue => {}
+                SysExit::Continue => {
+                    let cur = self.lanes[lane].pc;
+                    if cur != prev.wrapping_add(4) && cur != prev.wrapping_add(2) {
+                        self.cov[lane].record_edge(prev, cur);
+                    }
+                }
                 SysExit::Halt(c) => self.halt(lane, LaneExit::Halt(c)),
                 SysExit::Hypercall(c) => self.halt(lane, LaneExit::Hypercall(c)),
             }

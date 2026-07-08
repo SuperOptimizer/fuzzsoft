@@ -63,7 +63,12 @@
 #![feature(portable_simd)]
 #![forbid(unsafe_code)]
 
-mod system;
+// `pub` (not just `pub use system::VecSystem`) so external callers (the vectorized fuzz driver,
+// `examples/fuzz_vec.rs`) can name `fs_vec::system::LaneExit` — `VecSystem::exit`'s field type —
+// to match on why a lane stopped (`Halt` / `Hypercall` / `Budget`). It cannot be re-exported as
+// plain `fs_vec::LaneExit` instead: that name is already this module's own (`VecCpu`'s user-mode
+// exit reason) below.
+pub mod system;
 mod vec_mmu;
 
 pub use system::VecSystem;
