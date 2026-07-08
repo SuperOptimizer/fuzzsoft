@@ -86,6 +86,7 @@ pub trait Bus {
 pub const DIRTY_BLOCK: usize = 64;
 
 /// A flat guest memory with a parallel permission plane.
+#[derive(Clone)]
 pub struct Mmu {
     base: u32,
     mem: Vec<u8>,

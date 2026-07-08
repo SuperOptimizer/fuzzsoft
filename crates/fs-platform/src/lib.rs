@@ -78,6 +78,7 @@ impl Uart {
 }
 
 /// The physical machine: RAM (soft-MMU) + MMIO devices.
+#[derive(Clone)]
 pub struct Machine {
     pub ram: Mmu,
     ram_base: u32,
@@ -150,6 +151,7 @@ const MIP_MSIP: u32 = 1 << 3;
 
 /// A golden whole-machine snapshot for fast reset fuzzing: full RAM contents+permissions plus the
 /// hart and device state. Reset restores only the dirtied blocks (O(bytes touched)).
+#[derive(Clone)]
 pub struct Snapshot {
     gmem: Vec<u8>,
     gperms: Vec<u8>,
