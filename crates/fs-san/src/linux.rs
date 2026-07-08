@@ -162,10 +162,70 @@ pub fn register_kernel_allocator_hooks(hooks: &mut PcHooks, syms: &HashMap<Strin
     }
 }
 
+/// RV32 Linux `PAGE_OFFSET` (`arch/riscv/include/asm/page.h`, `!CONFIG_64BIT`) — fixed, not
+/// runtime-computed on RV32.
+pub const PAGE_OFFSET: u32 = 0xc000_0000;
+
+/// The kernel lowmem linear map: a fixed affine VA↔PA offset. kmalloc/kfree pointers are always
+/// linear-map addresses in stock SLUB (slab pages come from the buddy allocator, never vmalloc),
+/// so one subtraction is the literal implementation of `__pa()` for this address class. The offset
+/// is `PAGE_OFFSET - kernel_load_pa` (the address the Image was loaded at), NOT `- ram_base`.
+pub struct LinearMap {
+    va_pa_offset: u32,
+    pa_lo: u32,
+    pa_hi: u32,
+}
+
+impl LinearMap {
+    pub fn new(kernel_load_pa: u32, ram_base: u32, ram_size: u32) -> Self {
+        Self {
+            va_pa_offset: PAGE_OFFSET.wrapping_sub(kernel_load_pa),
+            pa_lo: ram_base,
+            pa_hi: ram_base.wrapping_add(ram_size),
+        }
+    }
+
+    /// Translate a kmalloc/kfree-observed kernel VA to a physical address, or reject it (NULL,
+    /// `ZERO_SIZE_PTR` = 0x10, user addresses, or anything outside the mapped physical window —
+    /// never blindly subtract, or a mistranslation poisons unrelated memory).
+    pub fn va_to_pa(&self, va: u32) -> Option<u32> {
+        if va < PAGE_OFFSET {
+            return None;
+        }
+        let pa = va.wrapping_sub(self.va_pa_offset);
+        (pa >= self.pa_lo && pa < self.pa_hi).then_some(pa)
+    }
+}
+
+/// Round a kmalloc request up to its SLUB bucket, so the trailing redzone lands at the object
+/// boundary (the kernel may legitimately access up to `ksize()` = the full bucket size).
+pub fn kmalloc_bucket(size: u32) -> u32 {
+    const BUCKETS: &[u32] = &[8, 16, 32, 64, 96, 128, 192, 256, 512, 1024, 2048, 4096, 8192];
+    for &b in BUCKETS {
+        if size <= b {
+            return b;
+        }
+    }
+    size.next_power_of_two()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hooks::HookEvent;
+
+    #[test]
+    fn linear_map_offset_and_window() {
+        // kernel loaded at 0x8040_0000, RAM 0x8000_0000..+128MiB. _start VA 0xc0000000 -> PA.
+        let lm = LinearMap::new(0x8040_0000, 0x8000_0000, 0x0800_0000);
+        assert_eq!(lm.va_to_pa(0xc000_0000), Some(0x8040_0000)); // _start
+        assert_eq!(lm.va_to_pa(0x0000_0000), None); // NULL
+        assert_eq!(lm.va_to_pa(0x0000_0010), None); // ZERO_SIZE_PTR
+        assert_eq!(lm.va_to_pa(0x1234_5678), None); // user address
+        assert_eq!(kmalloc_bucket(30), 32);
+        assert_eq!(kmalloc_bucket(64), 64);
+        assert_eq!(kmalloc_bucket(100), 128);
+    }
 
     /// A tiny excerpt in real `System.map` shape: two allocator symbols we care about, plus
     /// assorted noise lines (blank, other symbol types, an unrelated function) that a real map
@@ -223,11 +283,13 @@ c0160000 W weak_symbol
             })
         );
 
-        // Hit kfree's entry: a0 = pointer being freed, fires immediately (no return-wait).
+        // kfree's entry: a0 = ptr, ra = return; the free is delayed to the return.
         let mut free_regs = [0u32; 32];
         free_regs[10] = 0x8010_0000;
+        free_regs[crate::REG_RETURN_ADDR] = 0xc040_0000;
+        assert_eq!(hooks.on_pc(kfree_pc, &free_regs), None);
         assert_eq!(
-            hooks.on_pc(kfree_pc, &free_regs),
+            hooks.on_pc(0xc040_0000, &[0u32; 32]),
             Some(HookEvent::Free {
                 addr: 0x8010_0000
             })
@@ -254,8 +316,10 @@ c0160000 W weak_symbol
         // a0, unlike every other free-shaped hook here.
         let mut free_regs = [0u32; 32];
         free_regs[11] = 0x8020_0000; // a1 = objp
+        free_regs[crate::REG_RETURN_ADDR] = 0xc040_1000;
+        assert_eq!(hooks.on_pc(0xc030_2000, &free_regs), None);
         assert_eq!(
-            hooks.on_pc(0xc030_2000, &free_regs),
+            hooks.on_pc(0xc040_1000, &[0u32; 32]),
             Some(HookEvent::Free {
                 addr: 0x8020_0000
             })

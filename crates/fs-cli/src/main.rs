@@ -54,6 +54,9 @@ impl Rng {
 /// gated behind the SLUB false-positive analysis (docs/kernel-san.md, pending).
 struct SanCtx {
     hooks: fs_san::PcHooks,
+    san: fs_san::Sanitizer,
+    lm: fs_san::LinearMap,
+    poison: bool,
     allocs: u64,
     frees: u64,
     bytes: u64,
@@ -75,11 +78,21 @@ fn run_case(
             && let Some(ev) = ctx.hooks.on_pc(cpu.pc, &cpu.regs)
         {
             match ev {
-                fs_san::HookEvent::Alloc { size, .. } => {
+                fs_san::HookEvent::Alloc { addr, size } => {
                     ctx.allocs += 1;
                     ctx.bytes += size as u64;
+                    if ctx.poison && let Some(pa) = ctx.lm.va_to_pa(addr) {
+                        // Redzone around the SLUB-bucket-rounded allocation (trailing guard at the
+                        // object boundary so legitimate ksize() access doesn't fault).
+                        let _ = ctx.san.alloc(&mut m.ram, pa, fs_san::kmalloc_bucket(size));
+                    }
                 }
-                fs_san::HookEvent::Free { .. } => ctx.frees += 1,
+                fs_san::HookEvent::Free { addr } => {
+                    ctx.frees += 1;
+                    if ctx.poison && let Some(pa) = ctx.lm.va_to_pa(addr) {
+                        let _ = ctx.san.free(&mut m.ram, pa);
+                    }
+                }
             }
         }
         m.clint.mtime = cpu.virtual_time();
@@ -297,6 +310,7 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     let mut cases = 2000u32;
     let mut seed = 1u32;
     let mut sanitize = false;
+    let mut san_poison = false;
     let ram_base = 0x8000_0000u32;
     let kernel_addr = 0x8040_0000u32;
 
@@ -307,6 +321,15 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
         match key {
             "--sanitize" => {
                 sanitize = true;
+                i += 1;
+                continue;
+            }
+            // Experimental: actually poison redzones. Known to false-positive on stock SLUB
+            // (packed objects) — see docs/kernel-san.md. Needs slub_debug or a KFENCE-style
+            // relocation to be usable; off by default.
+            "--san-poison" => {
+                sanitize = true;
+                san_poison = true;
                 i += 1;
                 continue;
             }
@@ -394,8 +417,27 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
                 let syms = fs_san::parse_system_map(&text);
                 let mut hooks = fs_san::PcHooks::new();
                 fs_san::register_kernel_allocator_hooks(&mut hooks, &syms);
-                eprintln!("fuzz: sanitizer ON — kernel allocator hooks registered ({} symbols parsed)", syms.len());
-                Some(SanCtx { hooks, allocs: 0, frees: 0, bytes: 0 })
+                let lm = fs_san::LinearMap::new(kernel_addr, ram_base, ram_size);
+                // Self-check the linear-map offset against _start: it must map to kernel_addr,
+                // else a mistranslation would poison unrelated physical memory.
+                let self_check = syms
+                    .get("_start")
+                    .map(|&va| lm.va_to_pa(va) == Some(kernel_addr))
+                    .unwrap_or(false);
+                let poison = san_poison && self_check;
+                if san_poison && !self_check {
+                    eprintln!("fuzz: sanitizer VA->PA self-check FAILED — poisoning disabled");
+                }
+                eprintln!("fuzz: sanitizer ON (poison={poison}) — allocator hooks registered ({} symbols)", syms.len());
+                Some(SanCtx {
+                    hooks,
+                    san: fs_san::Sanitizer::new(fs_san::DEFAULT_REDZONE),
+                    lm,
+                    poison,
+                    allocs: 0,
+                    frees: 0,
+                    bytes: 0,
+                })
             }
             Err(e) => {
                 eprintln!("fuzz: --sanitize requested but build/linux-src/System.map unreadable: {e}");
@@ -437,6 +479,11 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
         };
 
         snap.reset(&mut cpu, &mut m);
+        // Reset per-case sanitizer state (perms are restored by snap.reset; clear the tracking).
+        if let Some(ctx) = san_ctx.as_mut() {
+            ctx.san = fs_san::Sanitizer::new(fs_san::DEFAULT_REDZONE);
+            ctx.hooks.clear_pending();
+        }
         let case_start = cpu.insns_retired;
         write_program(&mut m, &prog_pas, &prog);
 

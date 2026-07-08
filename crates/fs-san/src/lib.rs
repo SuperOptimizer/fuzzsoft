@@ -25,4 +25,4 @@ pub mod linux;
 
 pub use alloc::{DEFAULT_QUARANTINE_CAP, DEFAULT_REDZONE, SanError, Sanitizer};
 pub use hooks::{AllocHook, FreeHook, HookEvent, PcHooks, REG_RETURN_ADDR, REG_RETURN_VALUE};
-pub use linux::{parse_system_map, register_kernel_allocator_hooks};
+pub use linux::{LinearMap, kmalloc_bucket, parse_system_map, register_kernel_allocator_hooks};

@@ -76,6 +76,10 @@ pub struct PcHooks {
     /// Sizes awaiting a return, keyed by the call's return address. A `Vec` (used as a stack)
     /// per address handles recursion/re-entrancy through the same call site.
     pending: HashMap<u32, Vec<u32>>,
+    /// Free pointers awaiting a return, keyed by return address. Frees are delayed to the return
+    /// (not emitted at entry) because SLUB writes its intrusive freelist pointer *into* the freed
+    /// object during the call — poisoning at entry would fault SLUB's own legitimate write.
+    pending_frees: HashMap<u32, Vec<u32>>,
 }
 
 impl PcHooks {
@@ -117,8 +121,12 @@ impl PcHooks {
             return None; // The pointer isn't known until the call returns.
         }
         if let Some(hook) = self.frees.get(&pc) {
+            // Delay the free to the return: SLUB writes its freelist pointer into the object
+            // *during* the call, so we must not poison the payload at entry.
             let addr = regs[hook.ptr_reg];
-            return Some(HookEvent::Free { addr });
+            let ret_pc = regs[REG_RETURN_ADDR];
+            self.pending_frees.entry(ret_pc).or_default().push(addr);
+            return None;
         }
         if let Some(sizes) = self.pending.get_mut(&pc)
             && let Some(size) = sizes.pop()
@@ -129,7 +137,22 @@ impl PcHooks {
             let addr = regs[REG_RETURN_VALUE];
             return Some(HookEvent::Alloc { addr, size });
         }
+        if let Some(ptrs) = self.pending_frees.get_mut(&pc)
+            && let Some(addr) = ptrs.pop()
+        {
+            if ptrs.is_empty() {
+                self.pending_frees.remove(&pc);
+            }
+            return Some(HookEvent::Free { addr });
+        }
         None
+    }
+
+    /// Drop all in-flight alloc/free calls awaiting a return. Call between snapshot-fuzzing cases
+    /// so a call left mid-flight by one case's reset doesn't leak into the next.
+    pub fn clear_pending(&mut self) {
+        self.pending.clear();
+        self.pending_frees.clear();
     }
 }
 
@@ -177,15 +200,22 @@ mod tests {
     }
 
     #[test]
-    fn free_hook_fires_immediately_at_entry() {
+    fn free_hook_fires_at_return_not_entry() {
         let mut hooks = PcHooks::new();
         hooks.hook_free(FreeHook {
             entry_pc: 0x3000,
             ptr_reg: 10,
         });
-        let regs = regs_with(|r| r[10] = 0x8000_2000);
+        // Entry: a0 = ptr, ra = return address. No event yet — SLUB writes its freelist pointer
+        // into the object during the call, so we must not poison the payload before the call runs.
+        let entry = regs_with(|r| {
+            r[10] = 0x8000_2000;
+            r[REG_RETURN_ADDR] = 0x3100;
+        });
+        assert_eq!(hooks.on_pc(0x3000, &entry), None);
+        // Return: emit Free with the pointer captured at entry.
         assert_eq!(
-            hooks.on_pc(0x3000, &regs),
+            hooks.on_pc(0x3100, &regs_with(|_| {})),
             Some(HookEvent::Free { addr: 0x8000_2000 })
         );
     }
