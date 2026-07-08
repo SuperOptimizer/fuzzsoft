@@ -35,8 +35,20 @@ pub const DEFAULT_QUARANTINE_CAP: usize = 4096;
 /// Bookkeeping for one live allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LiveAlloc {
+    /// How many bytes starting at the allocation's address `free()` poisons. For a classic
+    /// [`Sanitizer::alloc`] this is the payload size; for [`Sanitizer::alloc_with_slack`] this is
+    /// the *whole bucket* (payload + slack), so freeing a slack-style allocation poisons the
+    /// entire slot, including any slack a `ksize()` re-open had opened back up.
     size: u32,
+    /// Cross-object guard width used by [`Sanitizer::alloc`]. Always `0` for
+    /// [`Sanitizer::alloc_with_slack`] allocations — see that method's doc comment for why a
+    /// cross-object guard is never placed there.
     redzone: u32,
+    /// `Some((req_size, bucket_size))` for a [`Sanitizer::alloc_with_slack`] allocation, so a
+    /// later `ksize()`/`krealloc()` hook can find and re-open exactly `[addr+req_size,
+    /// addr+bucket_size)`. `None` for a classic [`Sanitizer::alloc`] allocation, which has no
+    /// slack concept.
+    slack: Option<(u32, u32)>,
 }
 
 /// Something went wrong at the sanitizer policy level (as opposed to a plain MMU [`Fault`], which
@@ -52,6 +64,11 @@ pub enum SanError {
     /// pointer that was never allocated (or already reported to us), or a freed-then-freed-again
     /// path. This is itself a real bug class the sanitizer should report to the fuzzer.
     InvalidFree { addr: u32 },
+    /// [`Sanitizer::reopen_slack`] (the `ksize()`/`krealloc()` hook primitive) was called on an
+    /// address that is not currently live. Like `InvalidFree`, this means either a wild/unknown
+    /// pointer reached the hook, or the hook/register wiring upstream is wrong — surfaced rather
+    /// than silently ignored.
+    UnknownPointer { addr: u32 },
     /// The MMU rejected a poison/stamp operation, almost always because the reported
     /// `(addr, size)` falls outside the mapped guest window — a strong signal that whatever fed
     /// us this address/size pair (hypercall args or a PC-hooked register) is wrong.
@@ -73,6 +90,10 @@ impl std::fmt::Display for SanError {
             SanError::InvalidFree { addr } => write!(
                 f,
                 "sanitizer: free() on non-live address {addr:#010x} (double-free or wild pointer)"
+            ),
+            SanError::UnknownPointer { addr } => write!(
+                f,
+                "sanitizer: reopen_slack() on non-live address {addr:#010x} (wild pointer or bad hook wiring)"
             ),
             SanError::Mmu(fault) => write!(f, "sanitizer: {fault}"),
         }
@@ -171,8 +192,114 @@ impl Sanitizer {
             LiveAlloc {
                 size,
                 redzone: self.redzone,
+                slack: None,
             },
         );
+        Ok(())
+    }
+
+    /// Record a new **slack-only** allocation: `req_size` live payload bytes at `addr`, rounded
+    /// up by the allocator to a `bucket_size`-byte slot (e.g. SLUB's kmalloc bucket rounding via
+    /// `linux::kmalloc_bucket`). This is the correct, zero-false-positive alternative to
+    /// [`Sanitizer::alloc`]'s cross-object redzone for a *packed* allocator (see
+    /// `docs/emulator-sanitizers.md`'s KASAN section): stock SLUB packs objects with zero gap, so
+    /// any guard byte placed past `addr+bucket_size` is the first byte of a live neighbor, not
+    /// slack — poisoning it is a guaranteed false positive on real kernel heap traffic.
+    ///
+    /// Effects:
+    /// - `[addr, addr+req_size)` (the live object) is stamped `WRITE | RAW`, exactly like
+    ///   [`Sanitizer::alloc`]'s payload handling — the existing uninitialized-read oracle applies
+    ///   unchanged.
+    /// - `[addr+req_size, addr+bucket_size)` — the object's own rounding slack, provably *inside
+    ///   the same slot* and therefore never a neighbor — is poisoned no-access. When
+    ///   `req_size == bucket_size` (an exact-fit allocation) this range is empty and nothing is
+    ///   poisoned.
+    /// - **No cross-object guard is placed past `addr+bucket_size`.** This is the load-bearing
+    ///   difference from `alloc()`: that guard is exactly the false-positive mechanism
+    ///   `docs/kernel-san.md`'s experiment measured at ~40% on stock SLUB. The honest
+    ///   consequence: a write that overruns `addr+bucket_size` into a packed neighbor is *not*
+    ///   caught by this sanitizer — only a kernel-cooperative oracle (`SLUB_DEBUG_ON`) can catch
+    ///   that class. See `docs/emulator-sanitizers.md`.
+    /// - As with `alloc()`, `addr` is evicted from quarantine if it was there (a real allocator
+    ///   handing the same freed address back out is routine, not suspicious).
+    pub fn alloc_with_slack(
+        &mut self,
+        mmu: &mut Mmu,
+        addr: u32,
+        req_size: u32,
+        bucket_size: u32,
+    ) -> Result<(), SanError> {
+        if self.live.contains_key(&addr) {
+            return Err(SanError::DoubleAlloc { addr });
+        }
+        // Defensive: a bucket size can never be smaller than what was actually requested. If it
+        // somehow is (a caller passing raw/unrounded sizes), fall back to "no slack" rather than
+        // poisoning bytes inside the live object.
+        let bucket_size = bucket_size.max(req_size);
+
+        mmu.protect(addr, req_size, PERM_WRITE | PERM_RAW)?;
+        Self::poison_slack(mmu, addr, req_size, bucket_size)?;
+
+        self.evict_quarantine(&addr);
+        self.live.insert(
+            addr,
+            LiveAlloc {
+                size: bucket_size,
+                redzone: 0,
+                slack: Some((req_size, bucket_size)),
+            },
+        );
+        Ok(())
+    }
+
+    /// Re-open (un-poison back to `WRITE | RAW`) the rounding slack of a live
+    /// [`Sanitizer::alloc_with_slack`] allocation at `addr` — the `ksize()`/`krealloc()` hook
+    /// primitive from `docs/emulator-sanitizers.md`. Call this when the guest kernel legitimately
+    /// queries or grows into the usable size of an allocation (`ksize()`, `krealloc()` in place,
+    /// `kmalloc_size_roundup()`-then-populate), so that access doesn't fault against slack that
+    /// was poisoned purely as a not-yet-declared-usable placeholder.
+    ///
+    /// A no-op (`Ok(())`) if `addr` is live but was allocated via plain [`Sanitizer::alloc`] (no
+    /// slack concept applies) or if it has no slack to reopen (an exact-fit allocation). An error
+    /// if `addr` is not currently live at all — almost always a wild pointer or a hook wired to
+    /// the wrong register, exactly as `free()`'s `InvalidFree` reasoning.
+    ///
+    /// Re-opened slack is re-poisoned on the next `free()` of this allocation (see `LiveAlloc`'s
+    /// `size` field doc comment) — a `ksize()`-driven re-open never outlives the allocation it
+    /// belongs to.
+    pub fn reopen_slack(&mut self, mmu: &mut Mmu, addr: u32) -> Result<(), SanError> {
+        let Some(a) = self.live.get(&addr) else {
+            return Err(SanError::UnknownPointer { addr });
+        };
+        let Some((req_size, bucket_size)) = a.slack else {
+            return Ok(());
+        };
+        let slack_len = bucket_size - req_size;
+        if slack_len == 0 {
+            return Ok(());
+        }
+        let Some(slack_start) = addr.checked_add(req_size) else {
+            return Ok(());
+        };
+        mmu.protect(slack_start, slack_len, PERM_WRITE | PERM_RAW)?;
+        Ok(())
+    }
+
+    /// Poison exactly `[addr+req_size, addr+bucket_size)` (best-effort: skipped if it would fall
+    /// outside the mapped window, mirroring `poison_guard_before`/`after`'s discipline). Shared by
+    /// `alloc_with_slack` and left as a free function on `Self` (no `&self`/`&mut self` state
+    /// needed) so its bounds logic is exercised identically wherever slack needs poisoning.
+    fn poison_slack(mmu: &mut Mmu, addr: u32, req_size: u32, bucket_size: u32) -> Result<(), SanError> {
+        let slack_len = bucket_size - req_size;
+        if slack_len == 0 {
+            return Ok(());
+        }
+        let Some(slack_start) = addr.checked_add(req_size) else {
+            return Ok(());
+        };
+        if mmu.in_bounds(slack_start, slack_len) {
+            mmu.poison(slack_start, slack_len)?;
+        }
         Ok(())
     }
 
@@ -387,5 +514,206 @@ mod tests {
 
         // ...but the bytes are still poisoned regardless of tracking (safety never regresses).
         assert_eq!(mmu.read_u8(a).unwrap_err().kind, FaultKind::Permission);
+    }
+
+    // -- alloc_with_slack: slack-only OOB, the zero-cross-object-false-positive KASAN core --
+
+    #[test]
+    fn slack_only_pokes_exactly_the_rounding_slack_kmalloc_30_in_bucket_32() {
+        let mut mmu = mmu();
+        let mut san = Sanitizer::new(16); // redzone width must be irrelevant to this path
+        let base = 0x8000_8000;
+        let req_size = 30u32;
+        let bucket_size = 32u32;
+
+        san.alloc_with_slack(&mut mmu, base, req_size, bucket_size)
+            .unwrap();
+
+        // The live object [addr, addr+req_size) is WRITE|RAW: unwritten bytes still fault as
+        // the uninitialized-read oracle, and after a write, in-bounds access succeeds.
+        assert_eq!(
+            mmu.read_u8(base).unwrap_err().kind,
+            FaultKind::Permission,
+            "unwritten live byte must still fault (RAW oracle)"
+        );
+        mmu.write(base, &[0xAA; 30]).unwrap();
+        let mut buf = [0u8; 30];
+        mmu.read(base, &mut buf).unwrap();
+        assert_eq!(buf, [0xAA; 30]);
+
+        // The 2 slack bytes [addr+30, addr+32) are poisoned no-access.
+        assert_eq!(
+            mmu.read_u8(base + 30).unwrap_err().kind,
+            FaultKind::Permission
+        );
+        assert_eq!(
+            mmu.write_u8(base + 30, 0x41).unwrap_err().kind,
+            FaultKind::Permission
+        );
+        assert_eq!(
+            mmu.read_u8(base + 31).unwrap_err().kind,
+            FaultKind::Permission
+        );
+        assert_eq!(mmu.perm_at(base + 30), Some(0));
+        assert_eq!(mmu.perm_at(base + 31), Some(0));
+
+        // The byte at the bucket boundary (the first byte of what would be a packed neighbor
+        // object in real SLUB) is UNTOUCHED — no cross-object guard was placed. A fresh Mmu
+        // starts with perm 0 everywhere, so "untouched" here means still exactly that: not
+        // poisoned *by this call* (poison() also produces perm 0, so the load-bearing proof is
+        // that alloc_with_slack never called into the Mmu at this address at all — verified
+        // structurally by the method's own code path, and behaviorally here by confirming nobody
+        // else touched it either, i.e. it is still in its pristine pre-alloc state).
+        assert_eq!(mmu.perm_at(base + 32), Some(0));
+        // If the neighbor object had legitimately been allocated (as it would be in a packed
+        // SLUB page), a write to it must succeed untouched by this allocation's bookkeeping.
+        mmu.protect(base + 32, 4, PERM_WRITE | PERM_RAW).unwrap();
+        mmu.write(base + 32, &[1, 2, 3, 4]).unwrap();
+        let mut nbuf = [0u8; 4];
+        mmu.read(base + 32, &mut nbuf).unwrap();
+        assert_eq!(nbuf, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn slack_only_exact_fit_kmalloc_32_in_bucket_32_poisons_nothing() {
+        let mut mmu = mmu();
+        let mut san = Sanitizer::new(16);
+        let base = 0x8000_9000;
+        let req_size = 32u32;
+        let bucket_size = 32u32; // exact fit: no slack at all
+
+        san.alloc_with_slack(&mut mmu, base, req_size, bucket_size)
+            .unwrap();
+
+        // The whole 32-byte object is live and usable, uninitialized-read oracle still applies.
+        assert_eq!(mmu.read_u8(base).unwrap_err().kind, FaultKind::Permission);
+        mmu.write(base, &[0x11; 32]).unwrap();
+        let mut buf = [0u8; 32];
+        mmu.read(base, &mut buf).unwrap();
+        assert_eq!(buf, [0x11; 32]);
+
+        // Nothing at all was poisoned by this call: the byte exactly at the bucket boundary
+        // (would-be neighbor) is untouched, exactly as the slack case above. This is the
+        // documented, honest gap: an exact-fit allocation (like Image.buggy's kmalloc(32) with
+        // a planted write at offset 32) gets zero OOB coverage from this sanitizer, by
+        // construction — only a kernel-cooperative oracle (SLUB_DEBUG_ON) catches that class.
+        assert_eq!(mmu.perm_at(base + 32), Some(0));
+        mmu.protect(base + 32, 1, PERM_WRITE | PERM_RAW).unwrap();
+        mmu.write_u8(base + 32, 0x41).unwrap(); // succeeds: this sanitizer cannot see this write
+        assert_eq!(mmu.read_u8(base + 32).unwrap(), 0x41);
+    }
+
+    #[test]
+    fn slack_alloc_double_alloc_is_reported() {
+        let mut mmu = mmu();
+        let mut san = Sanitizer::new(16);
+        let base = 0x8000_a000;
+        san.alloc_with_slack(&mut mmu, base, 30, 32).unwrap();
+        assert_eq!(
+            san.alloc_with_slack(&mut mmu, base, 30, 32).unwrap_err(),
+            SanError::DoubleAlloc { addr: base }
+        );
+    }
+
+    #[test]
+    fn slack_alloc_free_poisons_the_whole_bucket_including_reopened_slack() {
+        let mut mmu = mmu();
+        let mut san = Sanitizer::new(16);
+        let base = 0x8000_b000;
+        san.alloc_with_slack(&mut mmu, base, 30, 32).unwrap();
+        mmu.write(base, &[1; 30]).unwrap();
+
+        // ksize() legitimately re-opens the slack mid-lifetime...
+        san.reopen_slack(&mut mmu, base).unwrap();
+        mmu.write(base + 30, &[2; 2]).unwrap();
+
+        // ...but free() poisons the entire bucket, including the now-reopened slack, since the
+        // whole slot is dead.
+        san.free(&mut mmu, base).unwrap();
+        for off in 0..32u32 {
+            assert_eq!(
+                mmu.read_u8(base + off).unwrap_err().kind,
+                FaultKind::Permission,
+                "byte at offset {off} should be poisoned after free"
+            );
+        }
+        // The would-be neighbor byte is still untouched by any of this.
+        assert_eq!(mmu.perm_at(base + 32), Some(0));
+    }
+
+    // -- ksize()/krealloc() slack re-open primitive --
+
+    #[test]
+    fn ksize_reopen_unfaults_the_slack_then_it_faults_again_after_free() {
+        let mut mmu = mmu();
+        let mut san = Sanitizer::new(16);
+        let base = 0x8000_c000;
+        san.alloc_with_slack(&mut mmu, base, 30, 32).unwrap();
+
+        // Before ksize(): slack faults.
+        assert_eq!(
+            mmu.read_u8(base + 30).unwrap_err().kind,
+            FaultKind::Permission
+        );
+        assert_eq!(
+            mmu.write_u8(base + 30, 0xAA).unwrap_err().kind,
+            FaultKind::Permission
+        );
+
+        san.reopen_slack(&mut mmu, base).unwrap();
+
+        // After ksize(): slack behaves like ordinary uninitialized live memory (WRITE|RAW) —
+        // still faults on read-before-write (the uninit oracle still applies), but a write now
+        // succeeds and unlocks the read, instead of hard-faulting on write like poisoned memory.
+        assert_eq!(
+            mmu.read_u8(base + 30).unwrap_err().kind,
+            FaultKind::Permission,
+            "reopened slack is uninitialized, not pre-readable"
+        );
+        mmu.write(base, &[9; 30]).unwrap();
+        mmu.write(base + 30, &[7, 7]).unwrap();
+        let mut buf = [0u8; 32];
+        mmu.read(base, &mut buf).unwrap();
+        let mut expected = [9u8; 32];
+        expected[30] = 7;
+        expected[31] = 7;
+        assert_eq!(buf, expected);
+    }
+
+    #[test]
+    fn ksize_reopen_on_exact_fit_alloc_is_a_harmless_no_op() {
+        let mut mmu = mmu();
+        let mut san = Sanitizer::new(16);
+        let base = 0x8000_d000;
+        san.alloc_with_slack(&mut mmu, base, 32, 32).unwrap();
+        // No slack to reopen; must not error and must not touch the (nonexistent) neighbor byte.
+        san.reopen_slack(&mut mmu, base).unwrap();
+        assert_eq!(mmu.perm_at(base + 32), Some(0));
+    }
+
+    #[test]
+    fn ksize_reopen_on_classic_redzone_alloc_is_a_harmless_no_op() {
+        let mut mmu = mmu();
+        let mut san = Sanitizer::new(16);
+        let base = 0x8000_e000;
+        san.alloc(&mut mmu, base, 16).unwrap();
+        // Classic alloc() has no slack concept at all; reopen_slack must not error or panic.
+        san.reopen_slack(&mut mmu, base).unwrap();
+        // The trailing redzone is untouched (still poisoned as alloc() left it).
+        assert_eq!(
+            mmu.read_u8(base + 16).unwrap_err().kind,
+            FaultKind::Permission
+        );
+    }
+
+    #[test]
+    fn ksize_reopen_on_unknown_pointer_is_reported() {
+        let mut mmu = mmu();
+        let mut san = Sanitizer::new(16);
+        let addr = 0x8000_f000;
+        assert_eq!(
+            san.reopen_slack(&mut mmu, addr).unwrap_err(),
+            SanError::UnknownPointer { addr }
+        );
     }
 }

@@ -59,8 +59,29 @@ pub struct FreeHook {
     pub ptr_reg: usize,
 }
 
+/// A monitored "report/re-open usable size" entry function: `fn ksize(ptr) -> size_t` (also
+/// covers `__ksize`/`krealloc`'s in-place-grow path). Unlike [`FreeHook`], firing at entry is
+/// always safe here — `ksize()` only *reads* allocator metadata to compute a size, it never
+/// writes into the object's payload the way SLUB's `kfree()` writes its intrusive freelist
+/// pointer — so there is no SLUB-internal-write race to guard against and no return-address
+/// stash is needed; see [`PcHooks::ksize_hit`].
+#[derive(Debug, Clone, Copy)]
+pub struct KsizeHook {
+    /// Guest PC of the function's first instruction.
+    pub entry_pc: u32,
+    /// Register index holding the pointer argument at entry.
+    pub ptr_reg: usize,
+}
+
 /// A sanitizer-relevant event learned by watching the guest PC, ready to hand to
 /// [`crate::Sanitizer::alloc`] / [`crate::Sanitizer::free`].
+///
+/// Deliberately does **not** carry a `ksize()`-shaped variant: `HookEvent` is already matched
+/// exhaustively by existing callers (the fs-cli run loop), so adding a new required-to-handle
+/// variant here would be a breaking change to every such match, not an additive one. The
+/// `ksize()` query is exposed as its own independent method, [`PcHooks::ksize_hit`], precisely so
+/// a caller can adopt it whenever it wires up [`crate::Sanitizer::reopen_slack`] without that
+/// forcing a change everywhere `on_pc`'s return value is already matched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookEvent {
     Alloc { addr: u32, size: u32 },
@@ -73,6 +94,9 @@ pub enum HookEvent {
 pub struct PcHooks {
     allocs: HashMap<u32, AllocHook>,
     frees: HashMap<u32, FreeHook>,
+    /// `ksize()`-shaped hooks, queried independently via [`PcHooks::ksize_hit`] rather than
+    /// through `on_pc`'s [`HookEvent`] (see that enum's doc comment for why).
+    ksizes: HashMap<u32, KsizeHook>,
     /// Sizes awaiting a return, keyed by the call's return address. A `Vec` (used as a stack)
     /// per address handles recursion/re-entrancy through the same call site.
     pending: HashMap<u32, Vec<u32>>,
@@ -97,6 +121,21 @@ impl PcHooks {
         self.frees.insert(hook.entry_pc, hook);
     }
 
+    /// Watch `entry_pc` as a `ksize()`-shaped ("report/re-open usable size") function entry.
+    pub fn hook_ksize(&mut self, hook: KsizeHook) {
+        self.ksizes.insert(hook.entry_pc, hook);
+    }
+
+    /// Independent query: is `pc` a registered `ksize()`-shaped entry, and if so, what pointer is
+    /// being queried? Kept separate from [`PcHooks::on_pc`]/[`HookEvent`] deliberately (see
+    /// `HookEvent`'s doc comment) — callers that want `ksize()` support call this alongside
+    /// `on_pc` and feed a `Some(addr)` to [`crate::Sanitizer::reopen_slack`]. Never mutates any
+    /// pending-return state: firing is always safe immediately, no stash needed (see
+    /// [`KsizeHook`]'s doc comment).
+    pub fn ksize_hit(&self, pc: u32, regs: &[u32; 32]) -> Option<u32> {
+        self.ksizes.get(&pc).map(|hook| regs[hook.ptr_reg])
+    }
+
     /// Number of alloc-call returns currently awaited (i.e. calls whose entry we saw but whose
     /// return we have not yet observed). Exposed mainly for tests/diagnostics.
     pub fn pending_returns(&self) -> usize {
@@ -113,6 +152,9 @@ impl PcHooks {
     /// a test), alloc-entry takes priority, then free-entry, then return-match — entries are
     /// checked before returns so a hook that is *both* an entry and someone else's return address
     /// still registers the entry.
+    ///
+    /// This does not check `ksize()`-shaped hooks — call [`PcHooks::ksize_hit`] separately for
+    /// those (see `HookEvent`'s doc comment for why they're independent).
     pub fn on_pc(&mut self, pc: u32, regs: &[u32; 32]) -> Option<HookEvent> {
         if let Some(hook) = self.allocs.get(&pc) {
             let size = regs[hook.size_reg];
@@ -270,5 +312,27 @@ mod tests {
         });
         let regs = [0u32; 32];
         assert_eq!(hooks.on_pc(0x4242, &regs), None);
+    }
+
+    #[test]
+    fn ksize_hook_fires_at_entry_via_its_own_independent_query() {
+        let mut hooks = PcHooks::new();
+        hooks.hook_ksize(KsizeHook {
+            entry_pc: 0x5000,
+            ptr_reg: 10, // a0 = ptr
+        });
+        // Unlike FreeHook, ksize is safe to fire immediately at entry — no return-address stash.
+        let entry = regs_with(|r| {
+            r[10] = 0x8000_3000;
+            r[REG_RETURN_ADDR] = 0x5100;
+        });
+        assert_eq!(hooks.ksize_hit(0x5000, &entry), Some(0x8000_3000));
+        // `on_pc` itself never surfaces ksize hits (kept out of `HookEvent`, see its doc comment)
+        // and a ksize entry doesn't stash anything awaiting a return either.
+        assert_eq!(hooks.on_pc(0x5000, &entry), None);
+        assert_eq!(hooks.pending_returns(), 0);
+        // An unrelated PC (including the never-stashed "return address") is a plain no-op.
+        assert_eq!(hooks.ksize_hit(0x5100, &regs_with(|_| {})), None);
+        assert_eq!(hooks.on_pc(0x5100, &regs_with(|_| {})), None);
     }
 }

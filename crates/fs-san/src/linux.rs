@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 
-use crate::hooks::{AllocHook, FreeHook, PcHooks};
+use crate::hooks::{AllocHook, FreeHook, KsizeHook, PcHooks};
 
 /// Parse a Linux `System.map` (or an equivalent `nm -n vmlinux`-style listing) into a
 /// symbol-name -> address table.
@@ -76,6 +76,10 @@ enum Convention {
     AllocSizeUnavailable,
     /// Free-shaped: pointer argument lives in this register index.
     FreePtrReg(usize),
+    /// `ksize()`-shaped: the guest is reporting/re-opening the usable size of a live allocation.
+    /// Pointer argument lives in this register index. See `docs/emulator-sanitizers.md`'s KASAN
+    /// section and [`crate::Sanitizer::reopen_slack`] — this is the hook half of that primitive.
+    KsizePtrReg(usize),
 }
 
 /// Every kernel slab-allocator entry point this module knows how to hook, with its calling
@@ -132,6 +136,14 @@ const KNOWN_SYMBOLS: &[(&str, Convention)] = &[
     // `void kfree_sensitive(const void *objp)` -> like kfree but zeroes the memory first
     // (formerly `kzfree`); single pointer argument, a0.
     ("kfree_sensitive", Convention::FreePtrReg(10)),
+    // --- Usable-size query / slack re-open ---------------------------------------------------
+    // `size_t ksize(const void *objp)` -> the only argument is the pointer, a0. Called by the
+    // kernel (skb, crypto, mm code) to discover and legitimately use the full rounded-up bucket
+    // size of an allocation — must re-open `alloc_with_slack`'s poisoned slack, not fault it.
+    ("ksize", Convention::KsizePtrReg(10)),
+    // `size_t __ksize(const void *objp)` -> same shape; the internal helper `ksize()` itself (and
+    // some direct callers, e.g. mm/slab_common.c) resolve to.
+    ("__ksize", Convention::KsizePtrReg(10)),
 ];
 
 /// Register PC hooks for every kernel slab-allocator symbol in `KNOWN_SYMBOLS` that is present
@@ -157,6 +169,9 @@ pub fn register_kernel_allocator_hooks(hooks: &mut PcHooks, syms: &HashMap<Strin
             }
             Convention::FreePtrReg(ptr_reg) => {
                 hooks.hook_free(FreeHook { entry_pc, ptr_reg });
+            }
+            Convention::KsizePtrReg(ptr_reg) => {
+                hooks.hook_ksize(KsizeHook { entry_pc, ptr_reg });
             }
         }
     }
@@ -334,5 +349,26 @@ c0160000 W weak_symbol
         assert_eq!(hooks.pending_returns(), 0);
         // No panics, no hooks fire on arbitrary PCs.
         assert_eq!(hooks.on_pc(0x1234, &[0u32; 32]), None);
+    }
+
+    #[test]
+    fn ksize_and_dunder_ksize_are_registered_and_fire_at_entry() {
+        let mut syms = HashMap::new();
+        syms.insert("ksize".to_string(), 0xc050_0000u32);
+        syms.insert("__ksize".to_string(), 0xc050_1000u32);
+
+        let mut hooks = PcHooks::new();
+        register_kernel_allocator_hooks(&mut hooks, &syms);
+
+        let mut regs = [0u32; 32];
+        regs[10] = 0x8010_0000; // a0 = ptr being ksize()'d
+
+        // ksize hits are surfaced via the independent `ksize_hit` query (see `hooks.rs`'s
+        // `HookEvent` doc comment for why this is kept out of `on_pc`'s `HookEvent`).
+        assert_eq!(hooks.ksize_hit(0xc050_0000, &regs), Some(0x8010_0000));
+        assert_eq!(hooks.ksize_hit(0xc050_1000, &regs), Some(0x8010_0000));
+        assert_eq!(hooks.on_pc(0xc050_0000, &regs), None);
+        // Neither ksize hook stashes anything awaiting a return.
+        assert_eq!(hooks.pending_returns(), 0);
     }
 }
