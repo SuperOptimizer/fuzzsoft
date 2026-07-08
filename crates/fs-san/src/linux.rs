@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 
-use crate::hooks::{AllocHook, FreeHook, KsizeHook, PcHooks};
+use crate::hooks::{AllocHook, FreeHook, KsizeHook, PageAllocHook, PageFreeHook, PcHooks};
 
 /// Parse a Linux `System.map` (or an equivalent `nm -n vmlinux`-style listing) into a
 /// symbol-name -> address table.
@@ -80,6 +80,31 @@ enum Convention {
     /// Pointer argument lives in this register index. See `docs/emulator-sanitizers.md`'s KASAN
     /// section and [`crate::Sanitizer::reopen_slack`] — this is the hook half of that primitive.
     KsizePtrReg(usize),
+    /// Page-allocator alloc-shaped: `fn(..., order) -> VA`, tractable via [`LinearMap`] because
+    /// the return value is *already* a linear-map virtual address (unlike `alloc_pages`/
+    /// `__alloc_pages`, see [`Convention::PageStructUnavailable`]). Order argument lives in this
+    /// register index, or `None` if the function has no order argument at all (always order 0).
+    /// Handled by [`crate::hooks::PcHooks::hook_page_alloc`]/`on_page_pc` — see
+    /// `docs/emulator-sanitizers.md`'s KASAN section, item (d) ("emulator-native page-granularity
+    /// UAF") — rather than `hook_alloc`/`on_pc`, since page-granularity events are a separate,
+    /// independently-queried family (see [`crate::hooks::PageHookEvent`]'s doc comment).
+    PageAllocOrderReg(Option<usize>),
+    /// Page-allocator free-shaped: `fn free_pages(addr, order)`. `addr` is already a linear-map VA
+    /// (the free-side mirror of `PageAllocOrderReg`'s return value). Pointer argument register,
+    /// then order argument register (or `None` for an implicit order 0). Handled by
+    /// [`crate::hooks::PcHooks::hook_page_free`]/`on_page_pc`.
+    PageFreeAddrOrderReg(usize, Option<usize>),
+    /// Alloc- or free-shaped in principle (`alloc_pages`/`__alloc_pages`/`__free_pages`), but the
+    /// function takes/returns a `struct page *`, not a linear-map virtual address — turning that
+    /// into a physical page requires `page_to_pfn`/`mem_map` arithmetic (a guest-memory struct
+    /// walk at a kernel-version-specific offset) that this register-file-only PC-hook layer
+    /// deliberately does not do, exactly the same limitation already documented for
+    /// `kmem_cache_alloc` above (see [`Convention::AllocSizeUnavailable`]'s doc comment). Listed
+    /// here purely as documentation of a considered-but-deferred symbol, never hooked. This is the
+    /// honest gap `docs/emulator-sanitizers.md`'s KASAN section flags: `__get_free_pages`/
+    /// `free_pages` (the VA-returning family, handled by the two variants above) are the
+    /// tractable case; `alloc_pages`/`struct page*` is the harder follow-up.
+    PageStructUnavailable,
 }
 
 /// Every kernel slab-allocator entry point this module knows how to hook, with its calling
@@ -144,6 +169,45 @@ const KNOWN_SYMBOLS: &[(&str, Convention)] = &[
     // `size_t __ksize(const void *objp)` -> same shape; the internal helper `ksize()` itself (and
     // some direct callers, e.g. mm/slab_common.c) resolve to.
     ("__ksize", Convention::KsizePtrReg(10)),
+    // --- Page allocator (whole-page granularity; docs/emulator-sanitizers.md's KASAN "stretch"
+    // item (d), the emulator-native equivalent of CONFIG_DEBUG_PAGEALLOC / firmware/Image.dpalloc)
+    // -----------------------------------------------------------------------------------------
+    // `unsigned long __get_free_pages(gfp_t gfp_mask, unsigned int order)` -> mm/page_alloc.c;
+    // the return value is already a linear-map VA (this is the tractable, VA-returning half of
+    // the page allocator, unlike alloc_pages/struct page* below). order is the *second* argument,
+    // a1 (x11).
+    ("__get_free_pages", Convention::PageAllocOrderReg(Some(11))),
+    // `unsigned long get_zeroed_page(gfp_t gfp_mask)` -> mm/page_alloc.c; same VA-returning shape
+    // as __get_free_pages, but it always requests order 0 internally
+    // (`__get_free_pages(gfp_mask | __GFP_ZERO, 0)`) -- there is no order argument to read here.
+    ("get_zeroed_page", Convention::PageAllocOrderReg(None)),
+    // `#define __get_free_page(gfp_mask) __get_free_pages((gfp_mask), 0)` and the equivalent
+    // `get_free_page` spelling some call sites use -- in mainline these are header-inline macros
+    // that expand directly to a call to __get_free_pages, so they have no symbol of their own in
+    // a normal build (`register_kernel_allocator_hooks` simply won't find them in `syms`, at zero
+    // cost). Listed anyway, same reasoning `KNOWN_SYMBOLS`'s doc comment gives for `kmem_cache_alloc`:
+    // documents the name was considered, and costs nothing if some future kernel version/config
+    // ever gives one of these a real out-of-line definition.
+    ("__get_free_page", Convention::PageAllocOrderReg(None)),
+    ("get_free_page", Convention::PageAllocOrderReg(None)),
+    // `void free_pages(unsigned long addr, unsigned int order)` -> mm/page_alloc.c; addr is
+    // already a linear-map VA (the free-side mirror of __get_free_pages), a0; order is a1. Fires
+    // immediately at entry (not delayed to return like `kfree`): the page allocator's own free
+    // path does not write into the freed page's payload before this entry PC, so there is no
+    // SLUB-style race to guard against here (see `hooks.rs`'s `PageFreeHook` doc comment).
+    ("free_pages", Convention::PageFreeAddrOrderReg(10, Some(11))),
+    // `#define free_page(addr) free_pages((addr), 0)` -- likewise usually a macro with no symbol
+    // of its own; listed for the same reason as `__get_free_page` above.
+    ("free_page", Convention::PageFreeAddrOrderReg(10, None)),
+    // `struct page *alloc_pages(gfp_t gfp, unsigned int order)` / `struct page
+    // *__alloc_pages(gfp_t gfp, unsigned int order, int preferred_nid, nodemask_t *nodemask)` ->
+    // return a `struct page *`, not a linear-map VA -- see `Convention::PageStructUnavailable`'s
+    // doc comment. Deliberately never hooked.
+    ("alloc_pages", Convention::PageStructUnavailable),
+    ("__alloc_pages", Convention::PageStructUnavailable),
+    // `void __free_pages(struct page *page, unsigned int order)` -> the free-side mirror of
+    // alloc_pages, with the identical struct-page limitation.
+    ("__free_pages", Convention::PageStructUnavailable),
 ];
 
 /// Register PC hooks for every kernel slab-allocator symbol in `KNOWN_SYMBOLS` that is present
@@ -172,6 +236,22 @@ pub fn register_kernel_allocator_hooks(hooks: &mut PcHooks, syms: &HashMap<Strin
             }
             Convention::KsizePtrReg(ptr_reg) => {
                 hooks.hook_ksize(KsizeHook { entry_pc, ptr_reg });
+            }
+            Convention::PageAllocOrderReg(order_reg) => {
+                hooks.hook_page_alloc(PageAllocHook {
+                    entry_pc,
+                    order_reg,
+                });
+            }
+            Convention::PageFreeAddrOrderReg(addr_reg, order_reg) => {
+                hooks.hook_page_free(PageFreeHook {
+                    entry_pc,
+                    addr_reg,
+                    order_reg,
+                });
+            }
+            Convention::PageStructUnavailable => {
+                // Deliberately not hooked; see KNOWN_SYMBOLS/Convention doc comments.
             }
         }
     }
@@ -349,6 +429,85 @@ c0160000 W weak_symbol
         assert_eq!(hooks.pending_returns(), 0);
         // No panics, no hooks fire on arbitrary PCs.
         assert_eq!(hooks.on_pc(0x1234, &[0u32; 32]), None);
+    }
+
+    #[test]
+    fn end_to_end_page_allocator_via_system_map() {
+        let mut syms = HashMap::new();
+        syms.insert("__get_free_pages".to_string(), 0xc060_0000u32);
+        syms.insert("free_pages".to_string(), 0xc060_1000u32);
+        syms.insert("get_zeroed_page".to_string(), 0xc060_2000u32);
+
+        let mut hooks = PcHooks::new();
+        register_kernel_allocator_hooks(&mut hooks, &syms);
+
+        // __get_free_pages(gfp_mask, order): order is a1, pointer known only at return.
+        let mut entry_regs = [0u32; 32];
+        entry_regs[11] = 2; // order
+        entry_regs[crate::hooks::REG_RETURN_ADDR] = 0xc070_0000;
+        assert_eq!(hooks.on_page_pc(syms["__get_free_pages"], &entry_regs), None);
+        assert_eq!(hooks.page_pending_returns(), 1);
+
+        let mut ret_regs = [0u32; 32];
+        ret_regs[crate::hooks::REG_RETURN_VALUE] = 0xc010_0000;
+        assert_eq!(
+            hooks.on_page_pc(0xc070_0000, &ret_regs),
+            Some(crate::hooks::PageHookEvent::Alloc {
+                addr: 0xc010_0000,
+                order: 2
+            })
+        );
+
+        // get_zeroed_page(gfp_mask): no order argument at all, always order 0.
+        let mut gzp_entry = [0u32; 32];
+        gzp_entry[crate::hooks::REG_RETURN_ADDR] = 0xc070_1000;
+        assert_eq!(hooks.on_page_pc(syms["get_zeroed_page"], &gzp_entry), None);
+        let mut gzp_ret = [0u32; 32];
+        gzp_ret[crate::hooks::REG_RETURN_VALUE] = 0xc010_2000;
+        assert_eq!(
+            hooks.on_page_pc(0xc070_1000, &gzp_ret),
+            Some(crate::hooks::PageHookEvent::Alloc {
+                addr: 0xc010_2000,
+                order: 0
+            })
+        );
+
+        // free_pages(addr, order): fires immediately at entry, no return-address stash.
+        let mut free_regs = [0u32; 32];
+        free_regs[10] = 0xc010_0000; // addr
+        free_regs[11] = 2; // order
+        assert_eq!(
+            hooks.on_page_pc(syms["free_pages"], &free_regs),
+            Some(crate::hooks::PageHookEvent::Free {
+                addr: 0xc010_0000,
+                order: 2
+            })
+        );
+
+        // None of this ever surfaced through the unrelated kmalloc-shaped `on_pc`/`ksize_hit`.
+        assert_eq!(hooks.on_pc(syms["__get_free_pages"], &entry_regs), None);
+        assert_eq!(hooks.pending_returns(), 0);
+    }
+
+    #[test]
+    fn alloc_pages_and_free_pages_struct_page_family_is_never_registered() {
+        let mut syms = HashMap::new();
+        syms.insert("alloc_pages".to_string(), 0xc080_0000u32);
+        syms.insert("__alloc_pages".to_string(), 0xc080_1000u32);
+        syms.insert("__free_pages".to_string(), 0xc080_2000u32);
+
+        let mut hooks = PcHooks::new();
+        register_kernel_allocator_hooks(&mut hooks, &syms);
+
+        // Hitting any of these entries is simply a no-op, not a crash or a spuriously-emitted
+        // event -- confirmed via both query methods since these could in principle have been
+        // mis-registered into either family.
+        let regs = [0u32; 32];
+        for &pc in syms.values() {
+            assert_eq!(hooks.on_page_pc(pc, &regs), None);
+            assert_eq!(hooks.on_pc(pc, &regs), None);
+        }
+        assert_eq!(hooks.page_pending_returns(), 0);
     }
 
     #[test]

@@ -268,3 +268,81 @@ and only real symbol lines are captured; `register_kernel_allocator_hooks` wires
 hook (the documented size-unavailable gap) while `kmem_cache_free`'s pointer is confirmed to come
 from `a1`, not `a0`, unlike every other free-shaped hook; and registering against an empty symbol
 table is a safe no-op.
+
+`pages.rs`'s tests (§6) drive `PageSanitizer` directly against an `Mmu`: alloc is plain
+`READ | WRITE` with no RAW oracle; `free_pages` poisons *exactly* `[base_pa, base_pa + (PAGE <<
+order))` — proven by checking the byte immediately past that range is untouched (still perm `0`)
+both for `order == 0` and `order > 0` (an 8-page range); a poisoned page's independently-live
+neighbor page is unaffected by the free; UAF-of-page read/write faults; realloc of the same range
+un-poisons it; double-alloc/double-free/free-of-untracked-page/an absurd `order` are all reported
+as errors rather than silently corrupting bookkeeping or wrapping; and quarantine-cap eviction
+bounds tracking without ever un-poisoning memory, mirroring `alloc.rs`'s own quarantine test.
+`hooks.rs`/`linux.rs` gained matching tests for `PageAllocHook`/`PageFreeHook`/`on_page_pc` and the
+new page-allocator `Convention`s, including confirming the page-hook family never leaks into or
+fires through the unrelated `on_pc`/`ksize_hit` queries, and that the deferred `struct page*`
+family (`alloc_pages`/`__alloc_pages`/`__free_pages`) is never registered.
+
+## 6. Page-granularity UAF/OOB: `pages.rs`'s `PageSanitizer`
+
+`docs/emulator-sanitizers.md`'s KASAN section lists a "stretch" item (d): PC-hook the *page*
+allocator and poison/unpoison whole physical pages — the un-forged, emulator-native equivalent of
+`CONFIG_DEBUG_PAGEALLOC` (`firmware/Image.dpalloc`), catching a *different*, complementary bug
+class to §2's byte-granular kmalloc sanitizer: immediate UAF/OOB on `order > 0` allocations,
+`vmalloc`-backed pages, and fully-emptied SLUB slab pages reclaimed back to the page allocator —
+not small in-slab kmalloc overflows (SLUB packs several objects per page; that class still needs
+`firmware/Image.slubdebug`'s kernel-cooperative free-time redzone check).
+
+**Why whole pages are zero-false-positive by construction, structurally stronger than §2's guard
+even for the packed-allocator case:** the buddy allocator never hands out two live, independent
+allocations sharing one physical page — that invariant is the allocator's entire job, not a policy
+this sanitizer has to hope holds. So poisoning a whole freed page range and un-poisoning the
+identical range on the next matching allocation can never stamp a byte belonging to some other,
+still-live allocation.
+
+**A deliberately separate type from `Sanitizer`, not a new method on it:** `PageSanitizer` (in the
+new `pages.rs`) tracks page-aligned range-base addresses spanning `PAGE << order` bytes, a
+different address granularity than `Sanitizer`'s arbitrary kmalloc object addresses over the same
+physical memory. Sharing one `live` map risks a kmalloc address coinciding with an unrelated page
+base and producing a bogus `DoubleAlloc`/`InvalidFree` — keeping them as separate types with
+separate bookkeeping makes that impossible by construction. `PageSanitizer` reuses the exact same
+mechanism `Sanitizer` already established (`alloc.rs`'s redzone/quarantine model, generalized to
+this module): `alloc_pages(mmu, base_pa, order)` stamps `[base_pa, base_pa + (PAGE << order))` as
+`READ | WRITE` and evicts quarantine; `free_pages(mmu, base_pa, order)` poisons that same range
+no-access and moves it to a bounded FIFO quarantine, mirroring `DEFAULT_QUARANTINE_CAP`'s
+discipline via its own `DEFAULT_PAGE_QUARANTINE_CAP`.
+
+**No RAW oracle at page granularity, unlike `Sanitizer::alloc`:** a freshly (re)allocated page
+range is stamped plain `READ | WRITE`, deliberately *not* `WRITE | RAW`. This mirrors real
+`CONFIG_DEBUG_PAGEALLOC` semantics exactly (it only unmaps-on-free/remaps-on-alloc, no separate
+uninitialized-read check), and avoids a false-positive surface the object-level RAW oracle would
+introduce at whole-page scale: kernel code legitimately reads whole pages (DMA buffers,
+driver-mapped memory) in patterns that don't hold to kmalloc's "write before read" assumption.
+
+**Hooks — the VA-returning half is tractable today, `struct page*` is deferred:**
+`register_kernel_allocator_hooks` (§3c) now also tries `__get_free_pages`/`get_zeroed_page`
+(alloc-shaped, return value already a linear-map VA via `LinearMap`, order in `a1` or implicit 0)
+and `free_pages` (free-shaped, `addr`/`order` in `a0`/`a1`, fires at *entry* — not delayed to
+return like `kfree`, since the page allocator's own free path doesn't write into the freed page's
+payload before this hook fires, unlike SLUB's intrusive freelist pointer). `alloc_pages`/
+`__alloc_pages`/`__free_pages` return/take a `struct page *`, not a VA — resolving that to a
+physical page needs `page_to_pfn`/`mem_map` guest-memory arithmetic at a kernel-version-specific
+offset, exactly the same class of limitation already documented for `kmem_cache_alloc` (§3c) — so
+they are listed in `KNOWN_SYMBOLS` as `Convention::PageStructUnavailable` and never hooked. This is
+an honest, explicitly deferred follow-up, not a silent gap.
+
+**Events are their own independent query, not a new `HookEvent` variant:** `HookEvent` is matched
+exhaustively by existing callers (the fs-cli run loop), so — exactly like `ksize_hit` before it —
+the page-allocator events are a new `PageHookEvent` enum surfaced through a new, independent
+`PcHooks::on_page_pc` query, called alongside (not instead of) `on_pc`. `on_page_pc` reuses
+`on_pc`'s entry-then-return timing for the alloc side (order captured at entry, pointer known only
+at return) and fires the free side immediately at entry, for the reason above.
+
+**What a future run-loop integration must do:** call `hooks.on_page_pc(pc, regs)` each step
+alongside `hooks.on_pc(...)`/`hooks.ksize_hit(...)`; on `PageHookEvent::Alloc { addr, order }`,
+translate `addr` through the same `LinearMap::va_to_pa` used for kmalloc/kfree and call
+`page_sanitizer.alloc_pages(&mut mmu, pa, order)`; on `Free { addr, order }`, likewise
+`page_sanitizer.free_pages(&mut mmu, pa, order)`; route any `SanError` into the same crash-signal
+path `Sanitizer`'s errors should already feed. `PageSanitizer` derives `Clone`, exactly like
+`Sanitizer` needs to (per §3's snapshot/reset lifecycle note in `docs/kernel-san.md`) — a future
+integration must clone-and-restore it every fuzzing case in lockstep with `Sanitizer` and `Mmu`'s
+own dirty-block reset, for the identical reason.

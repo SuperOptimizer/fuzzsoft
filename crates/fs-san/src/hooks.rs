@@ -88,6 +88,54 @@ pub enum HookEvent {
     Free { addr: u32 },
 }
 
+/// A monitored page-allocator entry function whose *pointer* is discovered at return
+/// (`__get_free_pages`/`get_zeroed_page`-shaped): `fn alloc_pages(gfp_mask, order) -> VA`. Mirrors
+/// [`AllocHook`]'s entry-then-return timing exactly, just with an *order* captured at entry
+/// instead of a byte size — this module stays unit-agnostic (converting `order` to
+/// `PAGE << order` bytes is [`crate::PageSanitizer`]'s job, not this framework's), same discipline
+/// [`AllocHook`] already applies to its raw `size`.
+#[derive(Debug, Clone, Copy)]
+pub struct PageAllocHook {
+    /// Guest PC of the function's first instruction.
+    pub entry_pc: u32,
+    /// Register index holding the order argument at entry, or `None` if the function has no
+    /// order argument at all — it is always order 0 (e.g. `get_zeroed_page(gfp_mask)`, which has
+    /// only the flags argument and calls `__get_free_pages(gfp_mask, 0)` internally).
+    pub order_reg: Option<usize>,
+}
+
+/// A monitored page-allocator deallocator entry function (`free_pages`-shaped): `fn
+/// free_pages(addr, order)`. Unlike [`FreeHook`] (which must delay to the return address because
+/// SLUB's intrusive freelist pointer write happens *during* the call), the page allocator's own
+/// free path does not write into the freed page's payload before this hook's entry PC fires —
+/// poisoning immediately at entry is safe, so [`PcHooks::on_page_pc`] fires this with **no**
+/// return-address stash, mirroring the free-at-entry design this module's own doc comment
+/// describes as the general shape (the SLUB-specific exception is what forced [`FreeHook`] to
+/// delay; the page allocator has no equivalent exception).
+#[derive(Debug, Clone, Copy)]
+pub struct PageFreeHook {
+    /// Guest PC of the function's first instruction.
+    pub entry_pc: u32,
+    /// Register index holding the pointer argument at entry.
+    pub addr_reg: usize,
+    /// Register index holding the order argument at entry, or `None` if the function has no
+    /// order argument at all (always order 0).
+    pub order_reg: Option<usize>,
+}
+
+/// An event learned from watching the page-allocator PC entries, ready to hand to
+/// [`crate::PageSanitizer::alloc_pages`] / [`crate::PageSanitizer::free_pages`].
+///
+/// Kept entirely separate from [`HookEvent`]/[`PcHooks::on_pc`] for the exact reason documented on
+/// that enum: `HookEvent` is matched exhaustively by existing callers, so a new event family must
+/// be its own independent query rather than a new variant — [`PcHooks::ksize_hit`] established this
+/// pattern for `ksize()`, and [`PcHooks::on_page_pc`] follows it here for the page allocator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageHookEvent {
+    Alloc { addr: u32, order: u32 },
+    Free { addr: u32, order: u32 },
+}
+
 /// Registry of PC hooks plus the small amount of state needed to bridge an alloc call's entry
 /// (where the size is known) to its return (where the pointer is known).
 #[derive(Default)]
@@ -104,6 +152,13 @@ pub struct PcHooks {
     /// (not emitted at entry) because SLUB writes its intrusive freelist pointer *into* the freed
     /// object during the call — poisoning at entry would fault SLUB's own legitimate write.
     pending_frees: HashMap<u32, Vec<u32>>,
+    /// Page-allocator hooks, queried independently via [`PcHooks::on_page_pc`] rather than through
+    /// `on_pc`'s [`HookEvent`] (see [`PageHookEvent`]'s doc comment for why).
+    page_allocs: HashMap<u32, PageAllocHook>,
+    page_frees: HashMap<u32, PageFreeHook>,
+    /// Orders awaiting a return, keyed by the call's return address — the page-allocator analogue
+    /// of `pending`.
+    page_pending: HashMap<u32, Vec<u32>>,
 }
 
 impl PcHooks {
@@ -124,6 +179,16 @@ impl PcHooks {
     /// Watch `entry_pc` as a `ksize()`-shaped ("report/re-open usable size") function entry.
     pub fn hook_ksize(&mut self, hook: KsizeHook) {
         self.ksizes.insert(hook.entry_pc, hook);
+    }
+
+    /// Watch `entry_pc` as a page-allocator function entry (`__get_free_pages`-shaped).
+    pub fn hook_page_alloc(&mut self, hook: PageAllocHook) {
+        self.page_allocs.insert(hook.entry_pc, hook);
+    }
+
+    /// Watch `entry_pc` as a page-deallocator function entry (`free_pages`-shaped).
+    pub fn hook_page_free(&mut self, hook: PageFreeHook) {
+        self.page_frees.insert(hook.entry_pc, hook);
     }
 
     /// Independent query: is `pc` a registered `ksize()`-shaped entry, and if so, what pointer is
@@ -190,11 +255,51 @@ impl PcHooks {
         None
     }
 
+    /// Independent page-allocator query, mirroring [`PcHooks::on_pc`]'s entry/return dance but for
+    /// the [`PageAllocHook`]/[`PageFreeHook`] family — kept separate from `on_pc` so its
+    /// [`PageHookEvent`] never needs to join `HookEvent`'s exhaustively-matched set (see
+    /// `PageHookEvent`'s doc comment). Call this alongside `on_pc` (and `ksize_hit`) once per PC, in
+    /// addition to it, not instead of it.
+    ///
+    /// Same entry-before-return priority discipline as `on_pc`: an alloc entry is checked first,
+    /// then a free entry (which fires immediately — no return-address stash needed, see
+    /// [`PageFreeHook`]'s doc comment), then a pending-return match.
+    pub fn on_page_pc(&mut self, pc: u32, regs: &[u32; 32]) -> Option<PageHookEvent> {
+        if let Some(hook) = self.page_allocs.get(&pc) {
+            let order = hook.order_reg.map_or(0, |r| regs[r]);
+            let ret_pc = regs[REG_RETURN_ADDR];
+            self.page_pending.entry(ret_pc).or_default().push(order);
+            return None; // The pointer isn't known until the call returns.
+        }
+        if let Some(hook) = self.page_frees.get(&pc) {
+            let addr = regs[hook.addr_reg];
+            let order = hook.order_reg.map_or(0, |r| regs[r]);
+            return Some(PageHookEvent::Free { addr, order });
+        }
+        if let Some(orders) = self.page_pending.get_mut(&pc)
+            && let Some(order) = orders.pop()
+        {
+            if orders.is_empty() {
+                self.page_pending.remove(&pc);
+            }
+            let addr = regs[REG_RETURN_VALUE];
+            return Some(PageHookEvent::Alloc { addr, order });
+        }
+        None
+    }
+
+    /// Number of page-alloc-call returns currently awaited. Exposed mainly for tests/diagnostics,
+    /// mirroring [`PcHooks::pending_returns`].
+    pub fn page_pending_returns(&self) -> usize {
+        self.page_pending.values().map(|v| v.len()).sum()
+    }
+
     /// Drop all in-flight alloc/free calls awaiting a return. Call between snapshot-fuzzing cases
     /// so a call left mid-flight by one case's reset doesn't leak into the next.
     pub fn clear_pending(&mut self) {
         self.pending.clear();
         self.pending_frees.clear();
+        self.page_pending.clear();
     }
 }
 
@@ -334,5 +439,130 @@ mod tests {
         // An unrelated PC (including the never-stashed "return address") is a plain no-op.
         assert_eq!(hooks.ksize_hit(0x5100, &regs_with(|_| {})), None);
         assert_eq!(hooks.on_pc(0x5100, &regs_with(|_| {})), None);
+    }
+
+    // -- Page-allocator hooks (PageAllocHook/PageFreeHook/on_page_pc) --
+
+    #[test]
+    fn page_alloc_hook_waits_for_return_to_learn_pointer() {
+        let mut hooks = PcHooks::new();
+        hooks.hook_page_alloc(PageAllocHook {
+            entry_pc: 0x6000,
+            order_reg: Some(11), // a1 = order at entry, like __get_free_pages(gfp_mask, order)
+        });
+
+        let entry_regs = regs_with(|r| {
+            r[11] = 2; // order 2 -> 4 pages
+            r[REG_RETURN_ADDR] = 0x6100;
+        });
+        assert_eq!(hooks.on_page_pc(0x6000, &entry_regs), None);
+        assert_eq!(hooks.page_pending_returns(), 1);
+        // `on_pc`/`ksize_hit` must not see this event family at all.
+        assert_eq!(hooks.on_pc(0x6000, &entry_regs), None);
+
+        let ret_regs = regs_with(|r| r[REG_RETURN_VALUE] = 0x8100_0000);
+        assert_eq!(
+            hooks.on_page_pc(0x6100, &ret_regs),
+            Some(PageHookEvent::Alloc {
+                addr: 0x8100_0000,
+                order: 2
+            })
+        );
+        assert_eq!(hooks.page_pending_returns(), 0);
+    }
+
+    #[test]
+    fn page_alloc_hook_with_no_order_register_is_always_order_zero() {
+        let mut hooks = PcHooks::new();
+        hooks.hook_page_alloc(PageAllocHook {
+            entry_pc: 0x6200,
+            order_reg: None, // get_zeroed_page(gfp_mask): no order argument, always order 0
+        });
+        let entry_regs = regs_with(|r| r[REG_RETURN_ADDR] = 0x6300);
+        assert_eq!(hooks.on_page_pc(0x6200, &entry_regs), None);
+        let ret_regs = regs_with(|r| r[REG_RETURN_VALUE] = 0x8110_0000);
+        assert_eq!(
+            hooks.on_page_pc(0x6300, &ret_regs),
+            Some(PageHookEvent::Alloc {
+                addr: 0x8110_0000,
+                order: 0
+            })
+        );
+    }
+
+    #[test]
+    fn page_free_hook_fires_at_entry_not_return() {
+        let mut hooks = PcHooks::new();
+        hooks.hook_page_free(PageFreeHook {
+            entry_pc: 0x7000,
+            addr_reg: 10,       // a0 = addr
+            order_reg: Some(11), // a1 = order
+        });
+        // Unlike FreeHook, this fires immediately: no SLUB-style write-into-payload race for the
+        // page allocator's own free path.
+        let entry_regs = regs_with(|r| {
+            r[10] = 0x8120_0000;
+            r[11] = 1;
+            r[REG_RETURN_ADDR] = 0x7100;
+        });
+        assert_eq!(
+            hooks.on_page_pc(0x7000, &entry_regs),
+            Some(PageHookEvent::Free {
+                addr: 0x8120_0000,
+                order: 1
+            })
+        );
+        assert_eq!(hooks.page_pending_returns(), 0);
+        // The return address never got a stash, so hitting it is a plain no-op.
+        assert_eq!(hooks.on_page_pc(0x7100, &regs_with(|_| {})), None);
+    }
+
+    #[test]
+    fn page_hooks_do_not_leak_into_or_from_the_kmalloc_hook_family() {
+        let mut hooks = PcHooks::new();
+        hooks.hook_alloc(AllocHook {
+            entry_pc: 0x1000,
+            size_reg: 10,
+        });
+        hooks.hook_page_alloc(PageAllocHook {
+            entry_pc: 0x6000,
+            order_reg: Some(11),
+        });
+        let regs = regs_with(|r| {
+            r[10] = 64;
+            r[11] = 3;
+            r[REG_RETURN_ADDR] = 0x2000;
+        });
+        // Hitting the kmalloc-shaped entry only stashes a `pending` (byte-size) entry, never a
+        // `page_pending` (order) entry, and vice versa.
+        assert_eq!(hooks.on_pc(0x1000, &regs), None);
+        assert_eq!(hooks.pending_returns(), 1);
+        assert_eq!(hooks.page_pending_returns(), 0);
+
+        assert_eq!(hooks.on_page_pc(0x6000, &regs), None);
+        assert_eq!(hooks.pending_returns(), 1);
+        assert_eq!(hooks.page_pending_returns(), 1);
+    }
+
+    #[test]
+    fn clear_pending_drops_in_flight_page_allocs_too() {
+        let mut hooks = PcHooks::new();
+        hooks.hook_page_alloc(PageAllocHook {
+            entry_pc: 0x6000,
+            order_reg: Some(11),
+        });
+        let regs = regs_with(|r| {
+            r[11] = 0;
+            r[REG_RETURN_ADDR] = 0x6100;
+        });
+        hooks.on_page_pc(0x6000, &regs);
+        assert_eq!(hooks.page_pending_returns(), 1);
+        hooks.clear_pending();
+        assert_eq!(hooks.page_pending_returns(), 0);
+        // The stashed return no longer fires anything.
+        assert_eq!(
+            hooks.on_page_pc(0x6100, &regs_with(|r| r[REG_RETURN_VALUE] = 0x8000_0000)),
+            None
+        );
     }
 }

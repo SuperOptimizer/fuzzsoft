@@ -73,6 +73,12 @@ pub enum SanError {
     /// `(addr, size)` falls outside the mapped guest window — a strong signal that whatever fed
     /// us this address/size pair (hypercall args or a PC-hooked register) is wrong.
     Mmu(Fault),
+    /// [`crate::PageSanitizer::alloc_pages`]/[`crate::PageSanitizer::free_pages`] was given an
+    /// `order` too large for `PAGE << order` to fit in a `u32` byte length — almost always a
+    /// PC-hooked register capturing garbage (wrong register, or the PC-hook fired on an unrelated
+    /// call), since no real buddy-allocator order ever gets remotely this high. Reported rather
+    /// than silently truncated/wrapped, which would poison an unpredictable, wrong-sized range.
+    InvalidPageOrder { addr: u32, order: u32 },
 }
 
 impl From<Fault> for SanError {
@@ -96,6 +102,10 @@ impl std::fmt::Display for SanError {
                 "sanitizer: reopen_slack() on non-live address {addr:#010x} (wild pointer or bad hook wiring)"
             ),
             SanError::Mmu(fault) => write!(f, "sanitizer: {fault}"),
+            SanError::InvalidPageOrder { addr, order } => write!(
+                f,
+                "sanitizer: order {order} at page {addr:#010x} is too large for PAGE << order to fit a u32 byte length (bad register/hook wiring, not a real allocation order)"
+            ),
         }
     }
 }
