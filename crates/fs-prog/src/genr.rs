@@ -35,13 +35,96 @@ pub(crate) fn build_pool(calls: &[TypedCall]) -> Vec<PoolEntry> {
     pool
 }
 
+/// A small number of hand-authored, real, bug-prone-subsystem call *sequences* (by `SyscallDesc`
+/// name, including `$variant` suffixes). `generate()` occasionally builds one of these verbatim
+/// (in order) instead of picking every call uniformly at random — this manufactures specific
+/// deep chains (tmpfs-backed mmap lifecycle, epoll/eventfd wiring, socket option + connect,
+/// double-close, pidfd duplication, ...) that are individually valuable but each too specific to
+/// reliably assemble by chance even with the resource-threading bias below. Resource threading
+/// *within* a recipe still goes through the normal `generate_args`/`pick_res` machinery (each
+/// call sees every earlier call in the recipe as its `existing` pool), so the fd/sock/vma
+/// produced by an early recipe call gets threaded into later recipe calls exactly like organic
+/// generation — recipes only fix the call *order*, not the argument values.
+pub static RECIPES: &[&[&str]] = &[
+    // tmpfs-backed vma lifecycle: memfd growth -> map -> reprotect -> advise -> unmap.
+    &[
+        "memfd_create",
+        "ftruncate64",
+        "mmap2",
+        "mprotect",
+        "madvise",
+        "munmap",
+    ],
+    // file lifecycle with a positioned write and an flag change before close.
+    &["openat", "read", "pwrite64", "fcntl64$setfl", "close"],
+    // TCP-ish socket lifecycle: option set, connect, option probe.
+    &[
+        "socket",
+        "setsockopt$tcp_nodelay",
+        "connect$inet",
+        "getsockopt",
+        "close",
+    ],
+    // listening socket lifecycle.
+    &["socket", "bind$inet", "listen", "getsockname", "close"],
+    // socketpair depth: both ends get used before either is torn down.
+    &["socketpair", "sendmsg", "recvmsg", "shutdown"],
+    // classic double-close / use-after-close signal via pipe2's two-fd OutArray.
+    &["pipe2", "write", "read", "close", "close"],
+    // epoll wiring: create the epoll fd, create something to watch, register it, wait.
+    &[
+        "epoll_create1",
+        "eventfd2",
+        "epoll_ctl",
+        "epoll_pwait",
+        "close",
+    ],
+    // fd-table depth: dup, query flags, lock, close.
+    &["openat", "dup3", "fcntl64$getfd", "flock", "close"],
+    // pidfd cross-process fd duplication.
+    &["pidfd_open", "pidfd_getfd", "close"],
+    // memfd + mmap + vectored IO against the same backing fd.
+    &["memfd_create", "mmap2", "readv", "writev", "munmap"],
+];
+
+fn find_desc(name: &str) -> Option<&'static SyscallDesc> {
+    SYSCALLS.iter().find(|d| d.name == name)
+}
+
+/// Build a `Prog` by generating each call of `recipe` in order (via the normal
+/// `generate_args`/`pick_res` path, so resource threading is organic, not forced). Returns `None`
+/// if a name in `recipe` doesn't match any current `SyscallDesc` (defensive against a future
+/// rename; `generate()` just falls back to uniform-random generation in that case).
+pub(crate) fn generate_from_recipe(rng: &mut Rng, recipe: &[&str]) -> Option<Prog> {
+    let mut calls: Vec<TypedCall> = Vec::with_capacity(recipe.len().min(MAX_CALLS));
+    for name in recipe.iter().take(MAX_CALLS) {
+        let desc = find_desc(name)?;
+        let args = generate_args(rng, desc, &calls);
+        calls.push(TypedCall { desc, args });
+    }
+    Some(Prog { calls })
+}
+
 /// Generate a fresh `Prog` of 1..=MAX_CALLS calls, each a random `SyscallDesc` from the starter
 /// table with type-directed argument generation and resource threading against earlier calls.
+///
+/// 20% of the time, build one of `RECIPES` verbatim instead — a deliberately deep, real,
+/// bug-prone-subsystem call chain (see `RECIPES`'s doc comment). The remaining 80% (or if the
+/// chosen recipe somehow doesn't resolve) falls back to per-call `pick_desc_biased`, which itself
+/// increasingly prefers descriptions that consume an already-live resource once the
+/// program-under-construction has produced one — see that function's doc comment for why this is
+/// what actually deepens organically-generated chains too.
 pub fn generate(rng: &mut Rng) -> Prog {
+    if rng.chance(20) {
+        let recipe: &'static [&'static str] = RECIPES[rng.below(RECIPES.len())];
+        if let Some(p) = generate_from_recipe(rng, recipe) {
+            return p;
+        }
+    }
     let n = 1 + rng.below(MAX_CALLS);
     let mut calls: Vec<TypedCall> = Vec::with_capacity(n);
     for _ in 0..n {
-        let desc = pick_desc(rng);
+        let desc = pick_desc_biased(rng, &calls);
         let args = generate_args(rng, desc, &calls);
         calls.push(TypedCall { desc, args });
     }
@@ -50,6 +133,36 @@ pub fn generate(rng: &mut Rng) -> Prog {
 
 pub fn pick_desc(rng: &mut Rng) -> &'static SyscallDesc {
     rng.pick(SYSCALLS)
+}
+
+/// Like `pick_desc`, but once the program-under-construction (`existing`) has produced at least
+/// one live resource, 55% of the time prefer a `SyscallDesc` that actually *consumes* a
+/// compatible resource kind from that pool over picking uniformly at random from the whole
+/// table. This is the "generation bias" half of deepening chains (the other half is `RECIPES`
+/// above and the pre-existing 70%-prefer-a-producer bias inside `pick_res`): without it, a
+/// produced fd/sock/vma competes on equal footing with every scalar-only description (`prctl`,
+/// `getcwd`, ...) for each subsequent call slot, so long dependent chains are diluted rather than
+/// compounded. Falls back to `pick_desc` whenever the pool is empty, no compatible consumer
+/// exists, or the 45% complement rolls — so untyped/no-resource descriptions still appear
+/// regularly and every description in `SYSCALLS` remains reachable.
+pub(crate) fn pick_desc_biased(rng: &mut Rng, existing: &[TypedCall]) -> &'static SyscallDesc {
+    if !existing.is_empty() && rng.chance(55) {
+        let pool = build_pool(existing);
+        if !pool.is_empty() {
+            let consumers: Vec<&'static SyscallDesc> = SYSCALLS
+                .iter()
+                .filter(|d| {
+                    d.args.iter().any(|a| {
+                        matches!(a, ArgType::Res(want) if pool.iter().any(|e| kind_compat(*want, e.kind)))
+                    })
+                })
+                .collect();
+            if !consumers.is_empty() {
+                return consumers[rng.below(consumers.len())];
+            }
+        }
+    }
+    pick_desc(rng)
 }
 
 /// Generate a full args vector for `desc`, given the calls already placed before it (used both
@@ -246,6 +359,80 @@ pub(crate) fn pick_res(rng: &mut Rng, want: ResourceKind, pool: &[PoolEntry]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_recipe_resolves_to_real_descriptions_and_lowers_cleanly() {
+        // Each RECIPES entry must name real, currently-existing SyscallDescs (a typo/rename would
+        // otherwise silently fall back to uniform generation forever without ever failing a
+        // test), and the resulting program must be well-formed and lowerable regardless of how
+        // the RNG resolves each recipe call's non-recipe-fixed argument content.
+        for (i, recipe) in RECIPES.iter().enumerate() {
+            for seed in [1u32, 2, 3, 42, 12345] {
+                let mut rng = Rng::new(seed.wrapping_add(i as u32 * 1000 + 1));
+                let p = generate_from_recipe(&mut rng, recipe)
+                    .unwrap_or_else(|| panic!("recipe {i} {recipe:?} failed to resolve"));
+                assert_eq!(p.calls.len(), recipe.len());
+                assert!(p.is_well_formed(), "recipe {i} {recipe:?} ill-formed");
+                let _ = crate::lower::lower(&p, 0xA000_0000);
+            }
+        }
+    }
+
+    #[test]
+    fn generate_sometimes_builds_a_recipe_verbatim() {
+        // Across many seeds, `generate()`'s 20% recipe path must actually fire at least once
+        // (call sequence matches one of RECIPES exactly) — otherwise the recipe mechanism would
+        // be dead code that never contributes to the corpus.
+        let mut saw_recipe = false;
+        'seeds: for seed in 1..500u32 {
+            let mut rng = Rng::new(seed);
+            let p = generate(&mut rng);
+            let names: Vec<&str> = p.calls.iter().map(|c| c.desc.name).collect();
+            for recipe in RECIPES {
+                if names == *recipe {
+                    saw_recipe = true;
+                    break 'seeds;
+                }
+            }
+        }
+        assert!(saw_recipe, "generate() never produced a verbatim recipe in 500 seeds");
+    }
+
+    #[test]
+    fn pick_desc_biased_prefers_a_resource_consumer_when_pool_nonempty() {
+        // Build a one-call pool that only produces FD (openat), then check that biased picking
+        // returns an FD/SOCK-consuming description noticeably more often than plain uniform
+        // `pick_desc` would (uniform draws a consumer roughly `consumers/total` of the time;
+        // biased should draw one distinctly more often across many tries).
+        let openat = SYSCALLS.iter().find(|d| d.name == "openat").unwrap();
+        let mut rng = Rng::new(777);
+        let existing = vec![TypedCall {
+            desc: openat,
+            args: generate_args(&mut rng, openat, &[]),
+        }];
+
+        let consumes_fd = |d: &SyscallDesc| {
+            d.args
+                .iter()
+                .any(|a| matches!(a, ArgType::Res(k) if crate::resource::kind_compat(*k, crate::resource::FD)))
+        };
+
+        let mut biased_hits = 0u32;
+        let mut uniform_hits = 0u32;
+        const TRIES: u32 = 2000;
+        for _ in 0..TRIES {
+            if consumes_fd(pick_desc_biased(&mut rng, &existing)) {
+                biased_hits += 1;
+            }
+            if consumes_fd(pick_desc(&mut rng)) {
+                uniform_hits += 1;
+            }
+        }
+        assert!(
+            biased_hits > uniform_hits,
+            "biased picker ({biased_hits}/{TRIES}) should beat uniform ({uniform_hits}/{TRIES})"
+        );
+    }
 
     #[test]
     fn generate_yields_well_formed_programs_within_call_limit() {

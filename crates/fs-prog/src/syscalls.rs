@@ -23,9 +23,11 @@ pub const OPEN_FLAGS: &[u32] = &[
     0o0,       // O_RDONLY
     0o1,       // O_WRONLY
     0o2,       // O_RDWR
+    0o200,     // O_EXCL (asm-generic/fcntl.h: 00000200)
     0o100,     // O_CREAT
     0o1000,    // O_TRUNC
     0o2000,    // O_APPEND
+    0o40000,   // O_DIRECT (asm-generic/fcntl.h: 00040000)
     0o200000,  // O_DIRECTORY
     0o2000000, // O_CLOEXEC
     0o4000,    // O_NONBLOCK
@@ -95,6 +97,9 @@ pub const MMAP_FLAGS: &[u32] = &[
     0x02,        /* MAP_PRIVATE */
     0x10,        /* MAP_FIXED */
     0x20,        /* MAP_ANONYMOUS */
+    0x4000,      /* MAP_NORESERVE (uapi/asm-generic/mman.h) */
+    0x8000,      /* MAP_POPULATE (uapi/asm-generic/mman.h) */
+    0x20000,     /* MAP_STACK (uapi/asm-generic/mman.h) */
     0x02 | 0x20, /* MAP_PRIVATE|MAP_ANONYMOUS */
 ];
 pub const MADV_ADVICE: &[u32] = &[
@@ -174,6 +179,37 @@ pub const RWF_FLAGS: &[u32] = &[
     0x04, /* RWF_SYNC */
     0x08, /* RWF_NOWAIT */
 ];
+// F_DUPFD_CLOEXEC (asm-generic/fcntl.h: F_LINUX_SPECIFIC_BASE(1024) + 6)
+pub const F_DUPFD_CLOEXEC: u32 = 1030;
+
+// ---- wave 8: ioctl request codes with REAL, well-known literal values ----
+// These are all "legacy" ioctl numbers assigned directly in uapi/asm-generic/ioctls.h /
+// uapi/linux/sockios.h *before* the generic `_IOC(dir,type,nr,size)` encoding scheme existed, so
+// they are cited as literals (per this crate's expansion brief, option 2: "well-known literal
+// values with a comment citing them") rather than re-derived via `_IOC` — deriving them would
+// require inventing a `dir`/`type`/`size` decomposition that doesn't actually correspond to how
+// these particular numbers were assigned upstream.
+pub const TCGETS: u32 = 0x5401; // struct termios* (get)
+pub const TCSETS: u32 = 0x5402; // struct termios* (set)
+pub const TIOCGWINSZ: u32 = 0x5413; // struct winsize* (get)
+pub const TIOCSWINSZ: u32 = 0x5414; // struct winsize* (set)
+pub const FIONREAD: u32 = 0x541B; // int* (bytes available to read)
+pub const FIONBIO: u32 = 0x5421; // int* (enable/disable O_NONBLOCK)
+// uapi/linux/sockios.h — also pre-_IOC legacy BSD-derived ioctl numbers.
+pub const SIOCGIFCONF: u32 = 0x8912; // struct ifconf*
+pub const SIOCGIFFLAGS: u32 = 0x8913; // struct ifreq*
+
+// ---- wave 9: real sockaddr subtype layouts + setsockopt (level,optname) pairs ----
+pub const AF_NETLINK: u32 = 16; // uapi/linux/socket.h
+pub const AF_INET_ONLY: &[u32] = &[2 /* AF_INET */];
+pub const AF_UNIX_ONLY: &[u32] = &[1 /* AF_UNIX */];
+pub const NETLINK_SOCK_TYPE: &[u32] = &[2 /* SOCK_DGRAM */, 3 /* SOCK_RAW */];
+pub const NETLINK_PROTO: &[u32] = &[0 /* NETLINK_ROUTE */, 4 /* NETLINK_FIREWALL(legacy)/generic */];
+pub const SUN_PATHS: &[&str] = &["/tmp/s", "/tmp/y", ""]; // "" => Linux autobind (abstract-ish)
+pub const IPPROTO_TCP: u32 = 6; // uapi/linux/in.h
+pub const SOL_SOCKET: u32 = 1; // uapi/asm-generic/socket.h
+pub const SO_REUSEADDR: u32 = 2; // uapi/asm-generic/socket.h
+pub const TCP_NODELAY: u32 = 1; // uapi/linux/tcp.h
 
 // struct sockaddr (generic, 16 bytes: u16 family + 14 bytes data — enough for AF_UNIX/AF_INET)
 static SOCKADDR_FIELDS: &[Field] = &[
@@ -388,6 +424,218 @@ static OPEN_HOW_FIELDS: &[Field] = &[
     },
 ];
 static OPEN_HOW: ArgType = Struct(OPEN_HOW_FIELDS);
+
+// struct winsize { u16 ws_row, ws_col, ws_xpixel, ws_ypixel; } (uapi/asm-generic/termios.h) —
+// four naturally-aligned 2-byte fields, no padding: `sizeof(struct winsize) == 8`.
+static WINSIZE_FIELDS: &[Field] = &[
+    Field {
+        name: "ws_row",
+        ty: &Int {
+            bits: 16,
+            signed: false,
+        },
+    },
+    Field {
+        name: "ws_col",
+        ty: &Int {
+            bits: 16,
+            signed: false,
+        },
+    },
+    Field {
+        name: "ws_xpixel",
+        ty: &Int {
+            bits: 16,
+            signed: false,
+        },
+    },
+    Field {
+        name: "ws_ypixel",
+        ty: &Int {
+            bits: 16,
+            signed: false,
+        },
+    },
+];
+static WINSIZE: ArgType = Struct(WINSIZE_FIELDS);
+
+// struct termios { tcflag_t c_iflag,c_oflag,c_cflag,c_lflag; cc_t c_line; cc_t c_cc[NCCS=19]; }
+// (uapi/asm-generic/termbits.h) — four 4-byte tcflag_t + one 1-byte c_line + 19-byte c_cc array
+// modeled as a fixed `Buffer` (this crate's type system has no generic fixed-size scalar array,
+// see docs/syzlang.md's deliberate omissions; a raw byte buffer is the right fit for opaque
+// `cc_t[]` control-character data anyway). Natural layout: 4+4+4+4=16, +1 (c_line)=17, +19
+// (c_cc)=36 — already a multiple of the struct's own 4-byte alignment, so no trailing padding;
+// matches the real `sizeof(struct termios) == 36` on rv32.
+static TERMIOS_FIELDS: &[Field] = &[
+    Field {
+        name: "c_iflag",
+        ty: &Int {
+            bits: 32,
+            signed: false,
+        },
+    },
+    Field {
+        name: "c_oflag",
+        ty: &Int {
+            bits: 32,
+            signed: false,
+        },
+    },
+    Field {
+        name: "c_cflag",
+        ty: &Int {
+            bits: 32,
+            signed: false,
+        },
+    },
+    Field {
+        name: "c_lflag",
+        ty: &Int {
+            bits: 32,
+            signed: false,
+        },
+    },
+    Field {
+        name: "c_line",
+        ty: &Int {
+            bits: 8,
+            signed: false,
+        },
+    },
+    Field {
+        name: "c_cc",
+        ty: &Buffer {
+            len: LenSpec::Fixed(19),
+        },
+    },
+];
+static TERMIOS: ArgType = Struct(TERMIOS_FIELDS);
+
+// struct ifreq (uapi/linux/if.h): `ifr_name[IFNAMSIZ=16]` followed by a union whose largest
+// common member (`struct sockaddr`/`ifru_ivalue`/`ifru_flags`) fits in 16 bytes on a 32-bit
+// build, giving the real `sizeof(struct ifreq) == 32`. The union is modeled as an opaque 16-byte
+// `Buffer` (its interpretation is ioctl-cmd-dependent — exactly the union-avoidance rationale in
+// docs/syzlang.md's deliberate omissions) rather than a dedicated field per member.
+static IFREQ_FIELDS: &[Field] = &[
+    Field {
+        name: "ifr_name",
+        ty: &Buffer {
+            len: LenSpec::Fixed(16),
+        },
+    },
+    Field {
+        name: "ifr_ifru",
+        ty: &Buffer {
+            len: LenSpec::Fixed(16),
+        },
+    },
+];
+static IFREQ: ArgType = Struct(IFREQ_FIELDS);
+
+// struct ifconf { int ifc_len; union { char *ifcu_buf; struct ifreq *ifcu_req; } ifc_ifcu; }
+// (uapi/linux/if.h) — modeled with a real nested `Ptr` field (like `msghdr`'s `msg_iov`) pointing
+// at scratch space sized for a handful of `ifreq`s; both fields are natural 4-byte scalars, no
+// padding, matching the real 8-byte `sizeof(struct ifconf)` on rv32.
+static IFCONF_FIELDS: &[Field] = &[
+    Field {
+        name: "ifc_len",
+        ty: &Int {
+            bits: 32,
+            signed: false,
+        },
+    },
+    Field {
+        name: "ifc_buf",
+        ty: &Ptr {
+            dir: Out,
+            inner: &Buffer {
+                len: LenSpec::Fixed(128), // room for ~4 ifreqs (32 bytes each)
+            },
+            nullable: false,
+        },
+    },
+];
+static IFCONF: ArgType = Struct(IFCONF_FIELDS);
+
+// struct sockaddr_in { sa_family_t sin_family; in_port_t sin_port; struct in_addr sin_addr;
+// unsigned char sin_zero[8]; } (uapi/linux/in.h) — family(2)+port(2)+addr(4)+zero(8) = 16 bytes,
+// every field naturally aligned already (no padding); `sin_family` is pinned to `AF_INET`(2) via
+// `Const` since this struct only ever describes an AF_INET address (unlike the generic
+// `SOCKADDR` above, which is family-polymorphic raw bytes).
+static SOCKADDR_IN_FIELDS: &[Field] = &[
+    Field {
+        name: "sin_family",
+        ty: &Const(2 /* AF_INET */),
+    },
+    Field {
+        name: "sin_port",
+        ty: &Int {
+            bits: 16,
+            signed: false,
+        },
+    },
+    Field {
+        name: "sin_addr",
+        ty: &Int {
+            bits: 32,
+            signed: false,
+        },
+    },
+    Field {
+        name: "sin_zero",
+        ty: &Buffer {
+            len: LenSpec::Fixed(8),
+        },
+    },
+];
+static SOCKADDR_IN: ArgType = Struct(SOCKADDR_IN_FIELDS);
+
+// struct sockaddr_un { sa_family_t sun_family; char sun_path[108]; } (uapi/linux/un.h) —
+// `sun_path` is modeled as a `StringConst` (variable length + NUL) rather than a fixed 108-byte
+// buffer: `Len{of}` on the enclosing `bind`/`connect` call measures the *actual* serialized size
+// (2 + strlen+1), which is exactly how real AF_UNIX programs pass `addrlen` (often shorter than
+// `sizeof(struct sockaddr_un)`), including the empty-path "" case (Linux autobind-style abstract
+// addressing when `addrlen == sizeof(sa_family_t)`).
+static SOCKADDR_UN_FIELDS: &[Field] = &[
+    Field {
+        name: "sun_family",
+        ty: &Const(1 /* AF_UNIX */),
+    },
+    Field {
+        name: "sun_path",
+        ty: &StringConst(SUN_PATHS),
+    },
+];
+static SOCKADDR_UN: ArgType = Struct(SOCKADDR_UN_FIELDS);
+
+// struct sockaddr_nl { sa_family_t nl_family; unsigned short nl_pad; __u32 nl_pid, nl_groups; }
+// (uapi/linux/netlink.h) — family(2)+pad(2)+pid(4)+groups(4) = 12 bytes, all naturally aligned,
+// no padding.
+static SOCKADDR_NL_FIELDS: &[Field] = &[
+    Field {
+        name: "nl_family",
+        ty: &Const(AF_NETLINK),
+    },
+    Field {
+        name: "nl_pad",
+        ty: &Const(0),
+    },
+    Field {
+        name: "nl_pid",
+        ty: &Int {
+            bits: 32,
+            signed: false,
+        },
+    },
+    Field {
+        name: "nl_groups",
+        ty: &Int {
+            bits: 32,
+            signed: false,
+        },
+    },
+];
+static SOCKADDR_NL: ArgType = Struct(SOCKADDR_NL_FIELDS);
 
 // ---------------- syscall descriptions ----------------
 
@@ -1643,6 +1891,322 @@ pub static SYSCALLS: &[SyscallDesc] = &[
         ],
         produces: Produces::None,
     },
+    // 64. fcntl64$dupfd_cloexec(25): fd, cmd=F_DUPFD_CLOEXEC(1030), arg:int (min new fd) -> fd.
+    //     Another FD *producer* variant (like fcntl64$dupfd) so the resource pool has one more
+    //     depth-building option besides openat/socket/pipe2/memfd_create.
+    SyscallDesc {
+        name: "fcntl64$dupfd_cloexec",
+        nr: 25,
+        args: &[
+            Res(FD),
+            Const(F_DUPFD_CLOEXEC),
+            Int {
+                bits: 32,
+                signed: false,
+            },
+        ],
+        produces: Produces::Ret(FD),
+    },
+
+    // ============ wave 8: ioctl with real request codes + correctly-shaped struct ptrs ============
+    // Every `cmd` below is a REAL literal ioctl number (see the `TCGETS`/`TIOCGWINSZ`/etc.
+    // constants' comments above this table for the exact uapi header + rationale for citing them
+    // as literals rather than `_IOC`-recomputing them).
+
+    // 65. ioctl$TIOCGWINSZ(29): fd, cmd=TIOCGWINSZ(0x5413), argp:ptr[out,winsize] -> int32
+    SyscallDesc {
+        name: "ioctl$TIOCGWINSZ",
+        nr: 29,
+        args: &[
+            Res(FD),
+            Const(TIOCGWINSZ),
+            Ptr {
+                dir: Out,
+                inner: &WINSIZE,
+                nullable: false,
+            },
+        ],
+        produces: Produces::None,
+    },
+    // 66. ioctl$TIOCSWINSZ(29): fd, cmd=TIOCSWINSZ(0x5414), argp:ptr[in,winsize] -> int32
+    SyscallDesc {
+        name: "ioctl$TIOCSWINSZ",
+        nr: 29,
+        args: &[
+            Res(FD),
+            Const(TIOCSWINSZ),
+            Ptr {
+                dir: In,
+                inner: &WINSIZE,
+                nullable: false,
+            },
+        ],
+        produces: Produces::None,
+    },
+    // 67. ioctl$TCGETS(29): fd, cmd=TCGETS(0x5401), argp:ptr[out,termios] -> int32
+    SyscallDesc {
+        name: "ioctl$TCGETS",
+        nr: 29,
+        args: &[
+            Res(FD),
+            Const(TCGETS),
+            Ptr {
+                dir: Out,
+                inner: &TERMIOS,
+                nullable: false,
+            },
+        ],
+        produces: Produces::None,
+    },
+    // 68. ioctl$TCSETS(29): fd, cmd=TCSETS(0x5402), argp:ptr[in,termios] -> int32
+    SyscallDesc {
+        name: "ioctl$TCSETS",
+        nr: 29,
+        args: &[
+            Res(FD),
+            Const(TCSETS),
+            Ptr {
+                dir: In,
+                inner: &TERMIOS,
+                nullable: false,
+            },
+        ],
+        produces: Produces::None,
+    },
+    // 69. ioctl$FIONREAD(29): fd, cmd=FIONREAD(0x541B), argp:ptr[out,int32] -> int32
+    SyscallDesc {
+        name: "ioctl$FIONREAD",
+        nr: 29,
+        args: &[
+            Res(FD),
+            Const(FIONREAD),
+            Ptr {
+                dir: Out,
+                inner: &Int {
+                    bits: 32,
+                    signed: false,
+                },
+                nullable: false,
+            },
+        ],
+        produces: Produces::None,
+    },
+    // 70. ioctl$FIONBIO(29): fd, cmd=FIONBIO(0x5421), argp:ptr[in,int32] (0/1) -> int32
+    SyscallDesc {
+        name: "ioctl$FIONBIO",
+        nr: 29,
+        args: &[
+            Res(FD),
+            Const(FIONBIO),
+            Ptr {
+                dir: In,
+                inner: &Int {
+                    bits: 32,
+                    signed: false,
+                },
+                nullable: false,
+            },
+        ],
+        produces: Produces::None,
+    },
+    // 71. ioctl$SIOCGIFFLAGS(29): fd:sock, cmd=SIOCGIFFLAGS(0x8913), argp:ptr[inout,ifreq] -> int32
+    SyscallDesc {
+        name: "ioctl$SIOCGIFFLAGS",
+        nr: 29,
+        args: &[
+            Res(SOCK),
+            Const(SIOCGIFFLAGS),
+            Ptr {
+                dir: InOut,
+                inner: &IFREQ,
+                nullable: false,
+            },
+        ],
+        produces: Produces::None,
+    },
+    // 72. ioctl$SIOCGIFCONF(29): fd:sock, cmd=SIOCGIFCONF(0x8912), argp:ptr[inout,ifconf] -> int32
+    SyscallDesc {
+        name: "ioctl$SIOCGIFCONF",
+        nr: 29,
+        args: &[
+            Res(SOCK),
+            Const(SIOCGIFCONF),
+            Ptr {
+                dir: InOut,
+                inner: &IFCONF,
+                nullable: false,
+            },
+        ],
+        produces: Produces::None,
+    },
+
+    // ============ wave 9: real sockaddr subtype layouts + netlink + typed setsockopt ============
+
+    // 73. socket$netlink(198): domain=AF_NETLINK(16), type, protocol -> sock. AF_NETLINK sockets
+    //     exercise a materially different kernel subsystem (net/netlink/af_netlink.c) than the
+    //     AF_UNIX/AF_INET paths the generic `socket` description reaches.
+    SyscallDesc {
+        name: "socket$netlink",
+        nr: 198,
+        args: &[
+            Const(AF_NETLINK),
+            Flags {
+                vals: NETLINK_SOCK_TYPE,
+                bitmask: false,
+            },
+            Flags {
+                vals: NETLINK_PROTO,
+                bitmask: false,
+            },
+        ],
+        produces: Produces::Ret(SOCK),
+    },
+    // 74. bind$inet(200): sockfd:sock, addr(in,sockaddr_in), addrlen=len(addr) -> int32
+    SyscallDesc {
+        name: "bind$inet",
+        nr: 200,
+        args: &[
+            Res(SOCK),
+            Ptr {
+                dir: In,
+                inner: &SOCKADDR_IN,
+                nullable: false,
+            },
+            Len { of: 1 },
+        ],
+        produces: Produces::None,
+    },
+    // 75. bind$un(200): sockfd:sock, addr(in,sockaddr_un), addrlen=len(addr) -> int32
+    SyscallDesc {
+        name: "bind$un",
+        nr: 200,
+        args: &[
+            Res(SOCK),
+            Ptr {
+                dir: In,
+                inner: &SOCKADDR_UN,
+                nullable: false,
+            },
+            Len { of: 1 },
+        ],
+        produces: Produces::None,
+    },
+    // 76. bind$nl(200): sockfd:sock, addr(in,sockaddr_nl), addrlen=len(addr) -> int32
+    SyscallDesc {
+        name: "bind$nl",
+        nr: 200,
+        args: &[
+            Res(SOCK),
+            Ptr {
+                dir: In,
+                inner: &SOCKADDR_NL,
+                nullable: false,
+            },
+            Len { of: 1 },
+        ],
+        produces: Produces::None,
+    },
+    // 77. connect$inet(203): sockfd:sock, addr(in,sockaddr_in), addrlen=len(addr) -> int32
+    SyscallDesc {
+        name: "connect$inet",
+        nr: 203,
+        args: &[
+            Res(SOCK),
+            Ptr {
+                dir: In,
+                inner: &SOCKADDR_IN,
+                nullable: false,
+            },
+            Len { of: 1 },
+        ],
+        produces: Produces::None,
+    },
+    // 78. connect$un(203): sockfd:sock, addr(in,sockaddr_un), addrlen=len(addr) -> int32
+    SyscallDesc {
+        name: "connect$un",
+        nr: 203,
+        args: &[
+            Res(SOCK),
+            Ptr {
+                dir: In,
+                inner: &SOCKADDR_UN,
+                nullable: false,
+            },
+            Len { of: 1 },
+        ],
+        produces: Produces::None,
+    },
+    // 79. sendto$inet(206): EXACTLY 6 args, addr(in,nullable,sockaddr_in) -> ssize
+    SyscallDesc {
+        name: "sendto$inet",
+        nr: 206,
+        args: &[
+            Res(SOCK),
+            Ptr {
+                dir: In,
+                inner: &Buffer {
+                    len: LenSpec::Range(0, 128),
+                },
+                nullable: false,
+            },
+            Len { of: 1 },
+            Flags {
+                vals: SEND_FLAGS,
+                bitmask: true,
+            },
+            Ptr {
+                dir: In,
+                inner: &SOCKADDR_IN,
+                nullable: true,
+            },
+            Len { of: 4 },
+        ],
+        produces: Produces::None,
+    },
+    // 80. setsockopt$so_reuseaddr(208): sockfd:sock, level=SOL_SOCKET(1), optname=SO_REUSEADDR(2),
+    //     optval(in,int32), optlen=len(optval) -> int32. A real (level,optname) pair with a
+    //     correctly sized (4-byte) `int*` optval, rather than the generic table's random
+    //     level/optname combination.
+    SyscallDesc {
+        name: "setsockopt$so_reuseaddr",
+        nr: 208,
+        args: &[
+            Res(SOCK),
+            Const(SOL_SOCKET),
+            Const(SO_REUSEADDR),
+            Ptr {
+                dir: In,
+                inner: &Int {
+                    bits: 32,
+                    signed: false,
+                },
+                nullable: false,
+            },
+            Len { of: 3 },
+        ],
+        produces: Produces::None,
+    },
+    // 81. setsockopt$tcp_nodelay(208): sockfd:sock, level=IPPROTO_TCP(6), optname=TCP_NODELAY(1),
+    //     optval(in,int32), optlen=len(optval) -> int32
+    SyscallDesc {
+        name: "setsockopt$tcp_nodelay",
+        nr: 208,
+        args: &[
+            Res(SOCK),
+            Const(IPPROTO_TCP),
+            Const(TCP_NODELAY),
+            Ptr {
+                dir: In,
+                inner: &Int {
+                    bits: 32,
+                    signed: false,
+                },
+                nullable: false,
+            },
+            Len { of: 3 },
+        ],
+        produces: Produces::None,
+    },
 ];
 
 #[cfg(test)]
@@ -1728,6 +2292,44 @@ mod tests {
             "close_range",
             "pidfd_open",
             "pidfd_getfd",
+        ] {
+            assert!(names.contains(&want), "missing expected desc {want}");
+        }
+    }
+
+    #[test]
+    fn table_grew_past_the_ioctl_and_sockaddr_depth_expansion() {
+        // Locks in this change's expansion (64 -> 82); a regression here means someone
+        // accidentally deleted descriptions rather than adding to them.
+        assert!(
+            SYSCALLS.len() >= 82,
+            "expected >=82 descriptions, got {}",
+            SYSCALLS.len()
+        );
+    }
+
+    #[test]
+    fn ioctl_and_sockaddr_depth_descriptions_are_represented() {
+        let names: Vec<&str> = SYSCALLS.iter().map(|d| d.name).collect();
+        for want in [
+            "ioctl$TIOCGWINSZ",
+            "ioctl$TIOCSWINSZ",
+            "ioctl$TCGETS",
+            "ioctl$TCSETS",
+            "ioctl$FIONREAD",
+            "ioctl$FIONBIO",
+            "ioctl$SIOCGIFFLAGS",
+            "ioctl$SIOCGIFCONF",
+            "socket$netlink",
+            "bind$inet",
+            "bind$un",
+            "bind$nl",
+            "connect$inet",
+            "connect$un",
+            "sendto$inet",
+            "setsockopt$so_reuseaddr",
+            "setsockopt$tcp_nodelay",
+            "fcntl64$dupfd_cloexec",
         ] {
             assert!(names.contains(&want), "missing expected desc {want}");
         }

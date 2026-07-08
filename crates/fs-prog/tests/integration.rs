@@ -518,3 +518,104 @@ fn mutation_chains_across_many_seeds_stay_lowerable_within_wire_limits() {
         }
     }
 }
+
+/// Targeted chain (a): `socket -> setsockopt$tcp_nodelay` threads the produced sock fd into
+/// setsockopt's `sockfd` arg via a `Reg` fixup, and the (level,optname) pair + optval/optlen lower
+/// to the real `IPPROTO_TCP`/`TCP_NODELAY` literals with a correctly-sized (4-byte) optval
+/// pointer landing inside scratch.
+#[test]
+fn socket_setsockopt_tcp_nodelay_threads_sock_fd_via_reg_fixup() {
+    let socket = desc("socket");
+    let setsockopt = desc("setsockopt$tcp_nodelay");
+
+    let mut rng = Rng::new(13);
+    let mut p = Prog::new();
+    p.calls.push(TypedCall {
+        desc: socket,
+        args: fs_prog::genr::generate_args(&mut rng, socket, &[]),
+    });
+    let mut args = fs_prog::genr::generate_args(&mut rng, setsockopt, &p.calls);
+    args[0] = ArgValue::Res(ResRef::Produced {
+        call_idx: 0,
+        slot: 0,
+    });
+    p.calls.push(TypedCall {
+        desc: setsockopt,
+        args,
+    });
+    assert!(p.is_well_formed());
+
+    let base = 0x9100_0000u32;
+    let lowered = lower(&p, base);
+    assert_eq!(lowered.calls[1].nr, 208); // setsockopt
+
+    // sockfd arg (slot 0) must be a placeholder patched by a Reg fixup from call 0.
+    assert_eq!(lowered.calls[1].args[0], 0);
+    let fixup = lowered
+        .fixups
+        .iter()
+        .find(|f| f.dst_call == 1 && f.dst_arg == 0)
+        .expect("setsockopt's sockfd arg must have a fixup");
+    assert_eq!(fixup.src, FixupSrc::Reg(0));
+
+    // level = IPPROTO_TCP(6), optname = TCP_NODELAY(1) — real constants, not the generic table's
+    // random SOL_SOCKET-only pairing.
+    assert_eq!(lowered.calls[1].args[1], 6);
+    assert_eq!(lowered.calls[1].args[2], 1);
+
+    // optlen (Len{of:3}) must equal the serialized optval size: a 4-byte int.
+    assert_eq!(lowered.calls[1].args[4], 4);
+
+    // optval pointer must land inside scratch.
+    let optval_ptr = lowered.calls[1].args[3];
+    let scratch_end = base as usize + lowered.scratch.len();
+    assert!((base as usize..scratch_end).contains(&(optval_ptr as usize)));
+}
+
+/// Targeted chain (b): `openat -> ioctl$TIOCGWINSZ` threads the produced fd via a `Reg` fixup and
+/// serializes a real `struct winsize` (4 naturally-aligned `u16` fields, 8 bytes total) pointer
+/// into scratch — exercises both resource threading and a real ioctl request code (`0x5413`,
+/// cited against uapi/asm-generic/ioctls.h) with a correctly-shaped struct pointer argument.
+#[test]
+fn openat_ioctl_tiocgwinsz_threads_fd_and_serializes_winsize_struct() {
+    let openat = desc("openat");
+    let ioctl = desc("ioctl$TIOCGWINSZ");
+
+    let mut rng = Rng::new(29);
+    let mut p = Prog::new();
+    p.calls.push(TypedCall {
+        desc: openat,
+        args: fs_prog::genr::generate_args(&mut rng, openat, &[]),
+    });
+    let mut args = fs_prog::genr::generate_args(&mut rng, ioctl, &p.calls);
+    args[0] = ArgValue::Res(ResRef::Produced {
+        call_idx: 0,
+        slot: 0,
+    });
+    p.calls.push(TypedCall { desc: ioctl, args });
+    assert!(p.is_well_formed());
+
+    let base = 0x9200_0000u32;
+    let lowered = lower(&p, base);
+    assert_eq!(lowered.calls[1].nr, 29); // ioctl
+
+    // fd arg (slot 0) must be a placeholder patched by a Reg fixup from openat's return value.
+    assert_eq!(lowered.calls[1].args[0], 0);
+    let fixup = lowered
+        .fixups
+        .iter()
+        .find(|f| f.dst_call == 1 && f.dst_arg == 0)
+        .expect("ioctl's fd arg must have a fixup");
+    assert_eq!(fixup.src, FixupSrc::Reg(0));
+
+    // cmd arg (slot 1) must be the real TIOCGWINSZ literal (0x5413; uapi/asm-generic/ioctls.h).
+    assert_eq!(lowered.calls[1].args[1], 0x5413);
+
+    // argp (slot 2) must point inside scratch, at a full 8-byte `struct winsize`
+    // (4 x u16, naturally aligned, no padding).
+    let argp = lowered.calls[1].args[2];
+    let scratch_end = base as usize + lowered.scratch.len();
+    assert!((base as usize..scratch_end).contains(&(argp as usize)));
+    let off = (argp - base) as usize;
+    assert!(off + 8 <= lowered.scratch.len(), "winsize must fit its 8 real bytes in scratch");
+}

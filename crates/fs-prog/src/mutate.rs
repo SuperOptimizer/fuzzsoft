@@ -5,7 +5,7 @@
 //! `docs/syzlang.md` §2.
 
 use crate::genr::{
-    PoolEntry, build_pool, gen_arg_value, generate, generate_args, pick_desc,
+    PoolEntry, build_pool, gen_arg_value, generate, generate_args, pick_desc_biased,
     pick_interesting_int, pick_res,
 };
 use crate::lower::ptr_size_of;
@@ -69,7 +69,10 @@ fn renumber_after_remove(rng: &mut Rng, p: &mut Prog, at: usize) {
 
 fn insert_call(rng: &mut Rng, p: &mut Prog) {
     let pos = rng.below(p.calls.len() + 1);
-    let desc = pick_desc(rng);
+    // Biased like `generate()`'s per-call picker: prefer a description that consumes a resource
+    // already live at `pos` (if any) over a uniform pick, so mutation-time insertion also tends
+    // to deepen existing chains rather than just diluting them with unrelated scalar-only calls.
+    let desc = pick_desc_biased(rng, &p.calls[..pos]);
     let args = generate_args(rng, desc, &p.calls[..pos]);
     renumber_after_insert(p, pos);
     p.calls.insert(pos, TypedCall { desc, args });
