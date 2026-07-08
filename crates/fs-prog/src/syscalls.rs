@@ -211,6 +211,42 @@ pub const SOL_SOCKET: u32 = 1; // uapi/asm-generic/socket.h
 pub const SO_REUSEADDR: u32 = 2; // uapi/asm-generic/socket.h
 pub const TCP_NODELAY: u32 = 1; // uapi/linux/tcp.h
 
+// ---- wave 10: more ioctl request codes + a real nlmsghdr-shaped netlink sendmsg ----
+// Same "well-known pre-_IOC literal" citation discipline as wave 8 above.
+pub const TIOCGPGRP: u32 = 0x540F; // pid_t* (get foreground process group)
+pub const TIOCSPGRP: u32 = 0x5410; // const pid_t* (set foreground process group)
+pub const FIONCLEX: u32 = 0x5450; // no argp (clear FD_CLOEXEC) — modeled with a dummy nullable ptr
+pub const FIOCLEX: u32 = 0x5451; // no argp (set FD_CLOEXEC) — modeled with a dummy nullable ptr
+pub const FIOASYNC: u32 = 0x5452; // int* (enable/disable O_ASYNC/SIGIO)
+pub const SIOCSIFFLAGS: u32 = 0x8914; // struct ifreq* (uapi/linux/sockios.h)
+pub const SIOCGIFHWADDR: u32 = 0x8927; // struct ifreq* (uapi/linux/sockios.h)
+// setsockopt(SOL_SOCKET, SO_SNDBUF) — uapi/asm-generic/socket.h.
+pub const SO_SNDBUF: u32 = 7;
+// SOL_NETLINK-level sockopt (uapi/linux/socket.h: SOL_NETLINK=270) — a materially different
+// `level` namespace than every other `setsockopt$*` desc below, which are all SOL_SOCKET/
+// IPPROTO_TCP.
+pub const SOL_NETLINK: u32 = 270;
+pub const NETLINK_ADD_MEMBERSHIP: u32 = 1; // uapi/linux/netlink.h
+// nlmsg_type real values (uapi/linux/netlink.h generic + uapi/linux/rtnetlink.h RTM_* subset).
+pub const NLMSG_TYPE: &[u32] = &[
+    1,  /* NLMSG_NOOP */
+    2,  /* NLMSG_ERROR */
+    3,  /* NLMSG_DONE */
+    16, /* RTM_NEWLINK */
+    18, /* RTM_GETLINK */
+    22, /* RTM_GETADDR */
+    26, /* RTM_GETROUTE */
+];
+// nlmsg_flags real bits (uapi/linux/netlink.h).
+pub const NLM_F_FLAGS: &[u32] = &[
+    0x1,   /* NLM_F_REQUEST */
+    0x2,   /* NLM_F_MULTI */
+    0x4,   /* NLM_F_ACK */
+    0x100, /* NLM_F_ROOT */
+    0x200, /* NLM_F_MATCH */
+    0x300, /* NLM_F_DUMP (ROOT|MATCH) */
+];
+
 // struct sockaddr (generic, 16 bytes: u16 family + 14 bytes data — enough for AF_UNIX/AF_INET)
 static SOCKADDR_FIELDS: &[Field] = &[
     Field {
@@ -636,6 +672,149 @@ static SOCKADDR_NL_FIELDS: &[Field] = &[
     },
 ];
 static SOCKADDR_NL: ArgType = Struct(SOCKADDR_NL_FIELDS);
+
+// struct nlmsghdr { __u32 nlmsg_len; __u16 nlmsg_type; __u16 nlmsg_flags; __u32 nlmsg_seq;
+// __u32 nlmsg_pid; } (uapi/linux/netlink.h), immediately followed here by a fixed payload
+// buffer (room for a `struct rtgenmsg`/`ifaddrmsg`/small `rtattr` chain — the real
+// classic-netlink-fuzzing shape: a correctly-sized 16-byte header, then opaque attribute bytes).
+// `nlmsg_type`/`nlmsg_flags` are modeled as free `Int{16,..}`s rather than `Flags{NLMSG_TYPE,..}`/
+// `Flags{NLM_F_FLAGS,..}` for the same reason `OPEN_HOW`'s fields above are: `ArgType::Flags`
+// always serializes as 4 bytes (see `lower::value_size_align`), which would break this struct's
+// real 2-byte field width/alignment (shifting `nlmsg_seq`/`nlmsg_pid` off their true offsets).
+// The dictionary bias wired into `genr::gen_arg_value`'s `Int` case (see `dict.rs`) still lets
+// these land on a real `NLMSG_TYPE`/`NLM_F_FLAGS` value a fraction of the time, without the
+// layout cost `Flags` would impose. `nlmsg_len` is deliberately a free `Int` too (not derived from
+// the payload's actual size) — same "occasionally desynced length field is a real fuzz signal"
+// rationale `iov_len`/`msg_iovlen` above already document (`Len{of}` only resolves against a
+// top-level call arg, never a nested struct field).
+static NLMSG_FIELDS: &[Field] = &[
+    Field {
+        name: "nlmsg_len",
+        ty: &Int {
+            bits: 32,
+            signed: false,
+        },
+    },
+    Field {
+        name: "nlmsg_type",
+        ty: &Int {
+            bits: 16,
+            signed: false,
+        },
+    },
+    Field {
+        name: "nlmsg_flags",
+        ty: &Int {
+            bits: 16,
+            signed: false,
+        },
+    },
+    Field {
+        name: "nlmsg_seq",
+        ty: &Int {
+            bits: 32,
+            signed: false,
+        },
+    },
+    Field {
+        name: "nlmsg_pid",
+        ty: &Int {
+            bits: 32,
+            signed: false,
+        },
+    },
+    Field {
+        name: "payload",
+        ty: &Buffer {
+            len: LenSpec::Fixed(16),
+        },
+    },
+];
+static NLMSG: ArgType = Struct(NLMSG_FIELDS);
+
+// struct iovec pointing at one NLMSG (see `IOVEC`'s doc above for why `iov_len` stays a free,
+// independently-generated `Int` rather than a derived `Len{of}`).
+static IOVEC_NL_FIELDS: &[Field] = &[
+    Field {
+        name: "iov_base",
+        ty: &Ptr {
+            dir: In,
+            inner: &NLMSG,
+            nullable: false,
+        },
+    },
+    Field {
+        name: "iov_len",
+        ty: &Int {
+            bits: 32,
+            signed: false,
+        },
+    },
+];
+static IOVEC_NL: ArgType = Struct(IOVEC_NL_FIELDS);
+
+// struct msghdr for a netlink sendmsg: same 7-field shape as `MSGHDR` above, but `msg_name`
+// targets a real `sockaddr_nl` (nullable — netlink to the kernel commonly omits it) and
+// `msg_iov` points at a single `IOVEC_NL` (one nlmsghdr-shaped message per call, matching
+// `msg_iovlen: Const(1)`) instead of the generic two-iovec vector.
+static MSGHDR_NL_FIELDS: &[Field] = &[
+    Field {
+        name: "msg_name",
+        ty: &Ptr {
+            dir: In,
+            inner: &SOCKADDR_NL,
+            nullable: true,
+        },
+    },
+    Field {
+        name: "msg_namelen",
+        ty: &Int {
+            bits: 32,
+            signed: false,
+        },
+    },
+    Field {
+        name: "msg_iov",
+        ty: &Ptr {
+            dir: In,
+            inner: &IOVEC_NL,
+            nullable: false,
+        },
+    },
+    Field {
+        name: "msg_iovlen",
+        ty: &Const(1),
+    },
+    Field {
+        name: "msg_control",
+        ty: &Ptr {
+            dir: In,
+            inner: &Buffer {
+                len: LenSpec::Fixed(16),
+            },
+            nullable: true,
+        },
+    },
+    Field {
+        name: "msg_controllen",
+        ty: &Int {
+            bits: 32,
+            signed: false,
+        },
+    },
+    Field {
+        name: "msg_flags",
+        ty: &Int {
+            bits: 32,
+            signed: false,
+        },
+    },
+];
+static MSGHDR_NL: ArgType = Struct(MSGHDR_NL_FIELDS);
+
+// struct ifreq (uapi/linux/if.h) — reuses the `IFREQ` type already defined above for
+// `ioctl$SIOCGIFFLAGS`/`ioctl$SIOCGIFCONF`; the wave-10 ioctls below just pair it with a
+// different real request code.
 
 // ---------------- syscall descriptions ----------------
 
@@ -2207,6 +2386,169 @@ pub static SYSCALLS: &[SyscallDesc] = &[
         ],
         produces: Produces::None,
     },
+
+    // ============ wave 10: deeper ioctl/driver + real netlink sendmsg reach ============
+    // Attacks the gap the cmplog agent found directly: real-kernel magic-value branches (ioctl
+    // request codes, netlink message types) weren't reachable because the corpus rarely carried
+    // the right constants. This wave adds a few more well-known ioctl request codes with
+    // correctly-shaped struct args (extending wave 8's TCGETS/TIOCGWINSZ/SIOCGIFFLAGS pattern)
+    // plus a real `nlmsghdr`-shaped netlink `sendmsg` (the classic netlink fuzzing surface: a
+    // real header with `type`/`flags`/`seq`/`pid` fields, not just a bare `sockaddr_nl`). All
+    // scalar (`Int`/`Flags`/`Const`) args throughout this table also now get `dict.rs`'s
+    // dictionary bias a fraction of the time — see `genr::gen_arg_value`.
+
+    // 82. ioctl$TIOCGPGRP(29): fd, cmd=TIOCGPGRP(0x540F), argp:ptr[out,pid_t] -> int32
+    SyscallDesc {
+        name: "ioctl$TIOCGPGRP",
+        nr: 29,
+        args: &[
+            Res(FD),
+            Const(TIOCGPGRP),
+            Ptr {
+                dir: Out,
+                inner: &Int {
+                    bits: 32,
+                    signed: true,
+                },
+                nullable: false,
+            },
+        ],
+        produces: Produces::None,
+    },
+    // 83. ioctl$TIOCSPGRP(29): fd, cmd=TIOCSPGRP(0x5410), argp:ptr[in,pid_t] -> int32
+    SyscallDesc {
+        name: "ioctl$TIOCSPGRP",
+        nr: 29,
+        args: &[
+            Res(FD),
+            Const(TIOCSPGRP),
+            Ptr {
+                dir: In,
+                inner: &Int {
+                    bits: 32,
+                    signed: true,
+                },
+                nullable: false,
+            },
+        ],
+        produces: Produces::None,
+    },
+    // 84. ioctl$FIOASYNC(29): fd, cmd=FIOASYNC(0x5452), argp:ptr[in,int32] (0/1) -> int32
+    SyscallDesc {
+        name: "ioctl$FIOASYNC",
+        nr: 29,
+        args: &[
+            Res(FD),
+            Const(FIOASYNC),
+            Ptr {
+                dir: In,
+                inner: &Int {
+                    bits: 32,
+                    signed: false,
+                },
+                nullable: false,
+            },
+        ],
+        produces: Produces::None,
+    },
+    // 85. ioctl$SIOCSIFFLAGS(29): fd:sock, cmd=SIOCSIFFLAGS(0x8914), argp:ptr[in,ifreq] -> int32.
+    //     The set-side counterpart to wave 8's ioctl$SIOCGIFFLAGS, same real IFREQ shape.
+    SyscallDesc {
+        name: "ioctl$SIOCSIFFLAGS",
+        nr: 29,
+        args: &[
+            Res(SOCK),
+            Const(SIOCSIFFLAGS),
+            Ptr {
+                dir: In,
+                inner: &IFREQ,
+                nullable: false,
+            },
+        ],
+        produces: Produces::None,
+    },
+    // 86. ioctl$SIOCGIFHWADDR(29): fd:sock, cmd=SIOCGIFHWADDR(0x8927), argp:ptr[inout,ifreq]
+    //     -> int32
+    SyscallDesc {
+        name: "ioctl$SIOCGIFHWADDR",
+        nr: 29,
+        args: &[
+            Res(SOCK),
+            Const(SIOCGIFHWADDR),
+            Ptr {
+                dir: InOut,
+                inner: &IFREQ,
+                nullable: false,
+            },
+        ],
+        produces: Produces::None,
+    },
+    // 87. setsockopt$so_sndbuf(208): sockfd:sock, level=SOL_SOCKET(1), optname=SO_SNDBUF(7),
+    //     optval(in,int32), optlen=len(optval) -> int32. A (level,optname) pair not yet covered
+    //     by wave 9's so_reuseaddr/tcp_nodelay variants.
+    SyscallDesc {
+        name: "setsockopt$so_sndbuf",
+        nr: 208,
+        args: &[
+            Res(SOCK),
+            Const(SOL_SOCKET),
+            Const(SO_SNDBUF),
+            Ptr {
+                dir: In,
+                inner: &Int {
+                    bits: 32,
+                    signed: false,
+                },
+                nullable: false,
+            },
+            Len { of: 3 },
+        ],
+        produces: Produces::None,
+    },
+    // 88. setsockopt$netlink_add_membership(208): sockfd:sock, level=SOL_NETLINK(270) — a
+    //     materially different `level` namespace than every other setsockopt$* desc above,
+    //     which are all SOL_SOCKET/IPPROTO_TCP — optname=NETLINK_ADD_MEMBERSHIP(1), optval(in,
+    //     int32, multicast group number), optlen=len(optval) -> int32
+    SyscallDesc {
+        name: "setsockopt$netlink_add_membership",
+        nr: 208,
+        args: &[
+            Res(SOCK),
+            Const(SOL_NETLINK),
+            Const(NETLINK_ADD_MEMBERSHIP),
+            Ptr {
+                dir: In,
+                inner: &Int {
+                    bits: 32,
+                    signed: false,
+                },
+                nullable: false,
+            },
+            Len { of: 3 },
+        ],
+        produces: Produces::None,
+    },
+    // 89. sendmsg$nl(211): sockfd:sock (ideally socket$netlink's), msg(in,msghdr_nl incl. nested
+    //     real nlmsghdr with type/flags/seq/pid), flags -> ssize. The classic netlink-fuzzing
+    //     surface: unlike the generic `sendmsg`/`bind$nl` (which only shapes the sockaddr_nl),
+    //     this shapes the actual *message* payload the kernel's netlink handlers parse.
+    SyscallDesc {
+        name: "sendmsg$nl",
+        nr: 211,
+        args: &[
+            Res(SOCK),
+            Ptr {
+                dir: In,
+                inner: &MSGHDR_NL,
+                nullable: false,
+            },
+            Flags {
+                vals: SEND_FLAGS,
+                bitmask: true,
+            },
+        ],
+        produces: Produces::None,
+    },
 ];
 
 #[cfg(test)]
@@ -2333,6 +2675,91 @@ mod tests {
         ] {
             assert!(names.contains(&want), "missing expected desc {want}");
         }
+    }
+
+    #[test]
+    fn table_grew_past_the_wave_10_netlink_and_ioctl_expansion() {
+        // Locks in this change's expansion (82 -> 90); a regression here means someone
+        // accidentally deleted descriptions rather than adding to them.
+        assert!(
+            SYSCALLS.len() >= 90,
+            "expected >=90 descriptions, got {}",
+            SYSCALLS.len()
+        );
+    }
+
+    #[test]
+    fn wave_10_ioctl_and_netlink_descriptions_are_represented() {
+        let names: Vec<&str> = SYSCALLS.iter().map(|d| d.name).collect();
+        for want in [
+            "ioctl$TIOCGPGRP",
+            "ioctl$TIOCSPGRP",
+            "ioctl$FIOASYNC",
+            "ioctl$SIOCSIFFLAGS",
+            "ioctl$SIOCGIFHWADDR",
+            "setsockopt$so_sndbuf",
+            "setsockopt$netlink_add_membership",
+            "sendmsg$nl",
+        ] {
+            assert!(names.contains(&want), "missing expected desc {want}");
+        }
+    }
+
+    /// `sendmsg$nl`'s `msghdr` carries a *real* `nlmsghdr` (type/flags/seq/pid, not just an
+    /// opaque buffer) inside a nested iovec — the classic netlink-fuzzing shape this wave adds.
+    /// Checks the header serializes at the real byte offsets/widths (no accidental padding from
+    /// modeling `nlmsg_type`/`nlmsg_flags` as anything wider than their real 2 bytes).
+    #[test]
+    fn sendmsg_nl_serializes_a_real_nlmsghdr_at_correct_offsets() {
+        use crate::lower::lower;
+        use crate::prog::{ArgValue, Prog, ResRef, TypedCall};
+        use crate::rng::Rng;
+
+        let socket_nl = SYSCALLS.iter().find(|d| d.name == "socket$netlink").unwrap();
+        let sendmsg_nl = SYSCALLS.iter().find(|d| d.name == "sendmsg$nl").unwrap();
+
+        let mut rng = Rng::new(31);
+        let mut p = Prog::new();
+        p.calls.push(TypedCall {
+            desc: socket_nl,
+            args: crate::genr::generate_args(&mut rng, socket_nl, &[]),
+        });
+        let mut args = crate::genr::generate_args(&mut rng, sendmsg_nl, &p.calls);
+        args[0] = ArgValue::Res(ResRef::Produced {
+            call_idx: 0,
+            slot: 0,
+        });
+        p.calls.push(TypedCall {
+            desc: sendmsg_nl,
+            args,
+        });
+        assert!(p.is_well_formed());
+
+        let base = 0x9300_0000u32;
+        let lowered = lower(&p, base);
+        assert_eq!(lowered.calls[1].nr, 211); // sendmsg
+
+        let msghdr_ptr = lowered.calls[1].args[1];
+        let scratch_end = base as usize + lowered.scratch.len();
+        assert!((base as usize..scratch_end).contains(&(msghdr_ptr as usize)));
+        let msghdr_off = (msghdr_ptr - base) as usize;
+
+        // msg_iov is MSGHDR_NL's 3rd field (msg_name:ptr@0, msg_namelen:u32@4, msg_iov:ptr@8).
+        let iov_ptr =
+            u32::from_le_bytes(lowered.scratch[msghdr_off + 8..msghdr_off + 12].try_into().unwrap());
+        assert!((base as usize..scratch_end).contains(&(iov_ptr as usize)));
+        let iov_off = (iov_ptr - base) as usize;
+
+        // IOVEC_NL's iov_base (offset 0) points at the NLMSG struct.
+        let nlmsg_ptr =
+            u32::from_le_bytes(lowered.scratch[iov_off..iov_off + 4].try_into().unwrap());
+        assert!((base as usize..scratch_end).contains(&(nlmsg_ptr as usize)));
+        let nlmsg_off = (nlmsg_ptr - base) as usize;
+
+        // struct nlmsghdr real layout: len@0(4), type@4(2), flags@6(2), seq@8(4), pid@12(4).
+        // Just confirm every byte lands inside scratch and the struct's total footprint (32
+        // bytes: 16-byte header + 16-byte payload) fits.
+        assert!(nlmsg_off + 32 <= lowered.scratch.len());
     }
 
     #[test]

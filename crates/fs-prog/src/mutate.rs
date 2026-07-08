@@ -4,8 +4,9 @@
 //! by chance. Every operation preserves the threading invariant (`Prog::is_well_formed`). See
 //! `docs/syzlang.md` §2.
 
+use crate::dict::pick_dict_const;
 use crate::genr::{
-    PoolEntry, build_pool, gen_arg_value, generate, generate_args, pick_desc_biased,
+    PoolEntry, build_pool, gen_arg_value, generate, generate_args, mask_to_bits, pick_desc_biased,
     pick_interesting_int, pick_res,
 };
 use crate::lower::ptr_size_of;
@@ -304,13 +305,41 @@ fn mutate_interesting_int(rng: &mut Rng, p: &mut Prog) {
     p.calls[i].args[j] = ArgValue::Imm(pick_interesting_int(rng, bits));
 }
 
+/// Mutation op (e): swap in a curated real-kernel constant from `crate::dict` (an ioctl request
+/// code, netlink type/flag, errno, fcntl/prctl command, ...) for an `Int`/`Flags`/`Const`-typed
+/// scalar arg. This is the dedicated mutation half of the dictionary fix described in `dict`'s
+/// module doc: `mutate_interesting_int` above only ever reaches syzkaller's generic 0/1/-1/
+/// boundary set, which rarely equals the specific magic value a real kernel branch is gated on;
+/// this operator targets that gap directly, including `Const` slots (whose value is otherwise
+/// always fixed by the description and never touched by any other mutator) so a mutation chain
+/// can still explore alternate real constants there instead of only ever the description's
+/// hard-coded one.
+fn mutate_dict_const(rng: &mut Rng, p: &mut Prog) {
+    let mut candidates: Vec<(usize, usize, u8)> = Vec::new();
+    for (i, c) in p.calls.iter().enumerate() {
+        for (j, aty) in c.desc.args.iter().enumerate() {
+            match aty {
+                ArgType::Int { bits, .. } => candidates.push((i, j, *bits)),
+                ArgType::Flags { .. } | ArgType::Const(_) => candidates.push((i, j, 32)),
+                _ => {}
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return;
+    }
+    let (i, j, bits) = *rng.pick(&candidates);
+    let v = mask_to_bits(pick_dict_const(rng) as u64, bits);
+    p.calls[i].args[j] = ArgValue::Imm(v);
+}
+
 /// Mutate `base` into a new, still well-formed `Prog`. Never mutates `base` in place.
 pub fn mutate(rng: &mut Rng, base: &Prog) -> Prog {
     let mut p = base.clone();
     if p.calls.is_empty() {
         return generate(rng);
     }
-    match rng.below(8) {
+    match rng.below(9) {
         0 if p.calls.len() < MAX_CALLS => insert_call(rng, &mut p),
         1 if p.calls.len() > 1 => remove_call(rng, &mut p),
         2 => mutate_random_arg(rng, &mut p),
@@ -318,7 +347,8 @@ pub fn mutate(rng: &mut Rng, base: &Prog) -> Prog {
         4 => splice_resource_use(rng, &mut p),
         5 => toggle_flag_bit(rng, &mut p),
         6 => resize_buffer(rng, &mut p),
-        _ => mutate_interesting_int(rng, &mut p),
+        7 => mutate_interesting_int(rng, &mut p),
+        _ => mutate_dict_const(rng, &mut p),
     }
     if p.calls.is_empty() {
         return generate(rng);
@@ -529,6 +559,59 @@ mod tests {
             matches!(a, ArgValue::Imm(v) if [0u64,1,2,u32::MAX as u64,4096,(-4096i64) as u32 as u64,i32::MAX as u64].contains(v))
         });
         assert!(saw_interesting, "never landed on a curated interesting value");
+    }
+
+    #[test]
+    fn mutate_dict_const_lands_on_a_cataloged_dictionary_value() {
+        use crate::dict::DICTIONARY_GROUPS;
+        // openat has an Int-free but Flags/Const-bearing arg list; use ioctl$generic instead,
+        // which has both a Flags (cmd) and no Const, plus prctl for Int coverage — exercised via
+        // whichever candidates mutate_dict_const finds on ioctl$generic.
+        let ioctl = SYSCALLS.iter().find(|d| d.name == "ioctl$generic").unwrap();
+        let mut rng = Rng::new(55);
+        let mut p = Prog::new();
+        p.calls.push(TypedCall {
+            desc: ioctl,
+            args: generate_args(&mut rng, ioctl, &[]),
+        });
+        let mut saw_dict_value = false;
+        for _ in 0..200 {
+            mutate_dict_const(&mut rng, &mut p);
+            assert!(p.is_well_formed());
+            if let ArgValue::Imm(v) = p.calls[0].args[1]
+                && DICTIONARY_GROUPS.iter().any(|g| g.contains(&(v as u32)))
+            {
+                saw_dict_value = true;
+            }
+        }
+        assert!(saw_dict_value, "mutate_dict_const never landed on a cataloged dictionary value");
+    }
+
+    #[test]
+    fn mutate_dict_const_can_rewrite_a_const_typed_slot() {
+        // fcntl64$setfl's 2nd arg is a fixed Const(4 /* F_SETFL */) — no other mutator ever
+        // touches a Const slot, so this checks mutate_dict_const specifically reaches it.
+        let desc = SYSCALLS.iter().find(|d| d.name == "fcntl64$setfl").unwrap();
+        let mut rng = Rng::new(66);
+        let mut p = Prog::new();
+        p.calls.push(TypedCall {
+            desc,
+            args: generate_args(&mut rng, desc, &[]),
+        });
+        let ArgValue::Imm(initial) = p.calls[0].args[1] else {
+            panic!("expected Const arg to be Imm");
+        };
+        let mut changed = false;
+        for _ in 0..200 {
+            mutate_dict_const(&mut rng, &mut p);
+            assert!(p.is_well_formed());
+            if let ArgValue::Imm(v) = p.calls[0].args[1]
+                && v != initial
+            {
+                changed = true;
+            }
+        }
+        assert!(changed, "mutate_dict_const never touched the Const slot");
     }
 
     #[test]

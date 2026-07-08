@@ -2,12 +2,21 @@
 //! producers (openat/socket/pipe2 -> fd/sock) into consumers (read/ioctl/close). See
 //! `docs/syzlang.md` §2.
 
+use crate::dict::pick_dict_const;
 use crate::lower::ptr_size_of;
 use crate::prog::{ArgValue, MAX_CALLS, Prog, ResRef, TypedCall};
 use crate::resource::{ResourceKind, kind_compat, seeds_for};
 use crate::rng::Rng;
 use crate::syscalls::SYSCALLS;
 use crate::types::{ArgType, Field, LenSpec, SyscallDesc};
+
+/// Chance (out of 100) that a fresh `Int`/`Flags` value is drawn from [`crate::dict`]'s curated
+/// "interesting" constants instead of the type's own biased/curated generation — see `dict`'s
+/// module doc for why this exists (cmplog needs real constants to already be in the corpus
+/// before it has anything to substitute/log against). Applied at [`gen_arg_value`]'s `Int`/
+/// `Flags` cases, so it reaches every description's scalar args uniformly, not just a hand-picked
+/// subset.
+pub(crate) const DICT_BIAS_PCT: u32 = 15;
 
 /// One live resource in the program-under-construction: `desc.produces`' `slot`-th resource,
 /// produced by call `call_idx`. `pub(crate)` so `mutate` can share this exact pool
@@ -207,8 +216,28 @@ fn len_of_arg(aty: &ArgType, av: &ArgValue) -> u32 {
 pub(crate) fn gen_arg_value(rng: &mut Rng, aty: &ArgType, pool: &[PoolEntry]) -> ArgValue {
     match aty {
         ArgType::Const(v) => ArgValue::Imm(*v as u64),
-        ArgType::Int { bits, signed } => ArgValue::Imm(gen_int(rng, *bits, *signed)),
-        ArgType::Flags { vals, bitmask } => ArgValue::Imm(gen_flags(rng, vals, *bitmask) as u64),
+        ArgType::Int { bits, signed } => {
+            // Dictionary bias: a fraction of the time, draw a real, cited kernel constant
+            // (ioctl cmd, netlink type, errno, ...) instead of the usual 0/1/-1/boundary/random
+            // pool — see `dict`'s module doc and `DICT_BIAS_PCT`.
+            if rng.chance(DICT_BIAS_PCT) {
+                ArgValue::Imm(mask_to_bits(pick_dict_const(rng) as u64, *bits))
+            } else {
+                ArgValue::Imm(gen_int(rng, *bits, *signed))
+            }
+        }
+        ArgType::Flags { vals, bitmask } => {
+            if rng.chance(DICT_BIAS_PCT) {
+                let v = pick_dict_const(rng);
+                // For a bitmask arg, OR the dictionary constant into a normal roll rather than
+                // replacing it outright, so the description's own curated bits (e.g. O_CREAT)
+                // usually still survive alongside the injected constant.
+                let v = if *bitmask { v | gen_flags(rng, vals, *bitmask) } else { v };
+                ArgValue::Imm(v as u64)
+            } else {
+                ArgValue::Imm(gen_flags(rng, vals, *bitmask) as u64)
+            }
+        }
         ArgType::Res(kind) => ArgValue::Res(pick_res(rng, *kind, pool)),
         ArgType::Len { .. } => ArgValue::Imm(0), // resolved by generate_args; never reached directly
         ArgType::Ptr {
@@ -503,6 +532,75 @@ mod tests {
         assert!(
             saw_produced,
             "SOCK should satisfy a Res(FD) consumer at least once in 200 tries"
+        );
+    }
+
+    /// Dictionary bias validation (a): across a generated corpus, `Int`/`Flags`-typed args carry
+    /// a dictionary constant at a rate broadly consistent with `DICT_BIAS_PCT` — proves the
+    /// `dict` wiring in `gen_arg_value` actually fires during ordinary generation, not just when
+    /// called directly.
+    #[test]
+    fn generated_corpus_carries_dictionary_constants_at_a_measurable_rate() {
+        use crate::dict::DICTIONARY_GROUPS;
+        let is_dict_value = |v: u32| DICTIONARY_GROUPS.iter().any(|g| g.contains(&v));
+
+        let mut total_scalar_args = 0u64;
+        let mut dict_hits = 0u64;
+        let mut rng = Rng::new(4242);
+        for _ in 0..3000 {
+            let p = generate(&mut rng);
+            for c in &p.calls {
+                for (aty, av) in c.desc.args.iter().zip(&c.args) {
+                    let is_scalar_slot = matches!(aty, ArgType::Int { .. } | ArgType::Flags { .. });
+                    if !is_scalar_slot {
+                        continue;
+                    }
+                    let ArgValue::Imm(v) = av else { continue };
+                    total_scalar_args += 1;
+                    if is_dict_value(*v as u32) {
+                        dict_hits += 1;
+                    }
+                }
+            }
+        }
+        assert!(total_scalar_args > 1000, "too few scalar args sampled");
+        // Some of these "hits" are coincidental (e.g. plain `gen_int`'s own 0/1/boundary pool
+        // overlapping a dictionary value), so this only checks for a clearly nonzero, measurable
+        // rate — not a tight match to DICT_BIAS_PCT.
+        let rate = dict_hits as f64 / total_scalar_args as f64;
+        assert!(
+            rate > 0.02,
+            "dictionary constants appeared in only {rate:.4} of {total_scalar_args} scalar args"
+        );
+    }
+
+    /// Dictionary bias validation, `Flags` bitmask case specifically: an injected dictionary
+    /// constant must survive as a set bit even when OR'd with the description's own curated
+    /// `vals` roll (not silently lost/masked away).
+    #[test]
+    fn dict_bias_ors_into_bitmask_flags_without_losing_the_injected_bit() {
+        // openat's 3rd arg is `Flags{vals: OPEN_FLAGS, bitmask: true}`.
+        let openat = SYSCALLS.iter().find(|d| d.name == "openat").unwrap();
+        let mut rng = Rng::new(1);
+        let mut saw_a_dict_only_bit = false;
+        for _ in 0..3000 {
+            let args = generate_args(&mut rng, openat, &[]);
+            let ArgValue::Imm(v) = args[2] else { continue };
+            let v = v as u32;
+            // A bit is "dict-only" if it's set in `v` but not producible by ORing any subset of
+            // OPEN_FLAGS's own vals table.
+            let openat_flags_union: u32 = match &openat.args[2] {
+                ArgType::Flags { vals, .. } => vals.iter().fold(0u32, |a, b| a | b),
+                _ => 0,
+            };
+            if v & !openat_flags_union != 0 {
+                saw_a_dict_only_bit = true;
+                break;
+            }
+        }
+        assert!(
+            saw_a_dict_only_bit,
+            "never observed a dictionary-injected bit outside openat's own OPEN_FLAGS union"
         );
     }
 }

@@ -29,6 +29,7 @@
 //! branches actually test; a byte that's merely copied through and never branched on gives no
 //! productive divergence between lanes.
 
+use crate::dict::pick_dict_const;
 use crate::genr::{mask_to_bits, pick_interesting_int};
 use crate::prog::{ArgValue, Prog};
 use crate::rng::Rng;
@@ -159,14 +160,17 @@ fn reroll_flags(rng: &mut Rng, vals: &[u32], bitmask: bool) -> u64 {
     }
 }
 
-/// Perturb a scalar `Imm` value in place: either swap in a curated "interesting" value (0, 1,
-/// -1, `INT_MAX`, `PAGE_SIZE`, ...), flip a single bit, or draw a fresh random value — masked to
-/// `bits`.
+/// Perturb a scalar `Imm` value in place: swap in a curated "interesting" value (0, 1, -1,
+/// `INT_MAX`, `PAGE_SIZE`, ...), swap in a real curated kernel constant from `crate::dict`
+/// (ioctl cmd, netlink type, errno, ...) — see that module's doc for why SIMD-batch data
+/// diversity benefits from real constants too, not just syzkaller's generic boundary set — flip
+/// a single bit, or draw a fresh random value. Masked to `bits`.
 fn mutate_scalar_bits(rng: &mut Rng, v: &mut u64, bits: u8) {
     let bits_nonzero = bits.max(1);
-    let nv = match rng.below(3) {
+    let nv = match rng.below(4) {
         0 => pick_interesting_int(rng, bits),
-        1 => *v ^ (1u64 << (rng.next() % bits_nonzero as u32).min(63)),
+        1 => pick_dict_const(rng) as u64,
+        2 => *v ^ (1u64 << (rng.next() % bits_nonzero as u32).min(63)),
         _ => rng.next_u64(),
     };
     *v = mask_to_bits(nv, bits);
@@ -471,5 +475,38 @@ mod tests {
         let mut rng = Rng::new(1);
         let mutated = mutate_data(&mut rng, &empty);
         assert!(mutated.calls.is_empty());
+    }
+
+    /// `mutate_batch`'s leaf-data diversification reaches `crate::dict`'s curated constants too
+    /// (not just `pick_interesting_int`'s generic 0/1/boundary set) — across enough siblings some
+    /// scalar leaf should land on a cataloged dictionary value.
+    #[test]
+    fn mutate_batch_siblings_sometimes_carry_a_dictionary_constant() {
+        use crate::dict::DICTIONARY_GROUPS;
+        let is_dict_value = |v: u32| DICTIONARY_GROUPS.iter().any(|g| g.contains(&v));
+
+        let mut saw_dict_value = false;
+        'seeds: for seed in 1..200u32 {
+            let mut gen_rng = Rng::new(seed);
+            let parent = generate(&mut gen_rng);
+            let mut rng = Rng::new(seed.wrapping_mul(101).wrapping_add(1));
+            let batch = mutate_batch(&mut rng, &parent, 32);
+            for sib in &batch {
+                for c in &sib.calls {
+                    for av in &c.args {
+                        if let ArgValue::Imm(v) = av
+                            && is_dict_value(*v as u32)
+                        {
+                            saw_dict_value = true;
+                            break 'seeds;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_dict_value,
+            "mutate_batch never produced a dictionary-constant leaf across 200 parent seeds x 32 siblings"
+        );
     }
 }

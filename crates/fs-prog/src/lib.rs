@@ -14,6 +14,7 @@
 
 pub mod batch;
 pub mod cmplog;
+pub mod dict;
 pub mod genr;
 pub mod lower;
 pub mod mutate;
@@ -25,6 +26,7 @@ pub mod types;
 
 pub use batch::{mutate_batch, mutate_data};
 pub use cmplog::mutate_cmplog;
+pub use dict::{DICTIONARY_GROUPS, dictionary_len, pick_dict_const};
 pub use genr::generate;
 pub use lower::{
     CALL_WORDS, ConcreteCall, DEFAULT_SCRATCH_CAP, FIXUP_WORDS, Fixup, FixupSrc, Lowered,

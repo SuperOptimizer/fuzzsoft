@@ -3,8 +3,8 @@
 //! and the exact wire encoding the guest agent will read).
 
 use fs_prog::{
-    ArgValue, CALL_WORDS, FIXUP_WORDS, FixupSrc, MAX_CALLS, MAX_FIXUPS, Prog, ResRef, Rng,
-    SYSCALLS, TypedCall, WIRE_WORDS, generate, kind_compat, lower, mutate, to_wire,
+    ArgValue, CALL_WORDS, DEFAULT_SCRATCH_CAP, FIXUP_WORDS, FixupSrc, MAX_CALLS, MAX_FIXUPS, Prog,
+    ResRef, Rng, SYSCALLS, TypedCall, WIRE_WORDS, generate, kind_compat, lower, mutate, to_wire,
 };
 
 fn desc(name: &str) -> &'static fs_prog::SyscallDesc {
@@ -618,4 +618,74 @@ fn openat_ioctl_tiocgwinsz_threads_fd_and_serializes_winsize_struct() {
     assert!((base as usize..scratch_end).contains(&(argp as usize)));
     let off = (argp - base) as usize;
     assert!(off + 8 <= lowered.scratch.len(), "winsize must fit its 8 real bytes in scratch");
+}
+
+/// The wire-format/public-API constants this whole crate's guest-agent contract depends on
+/// (`docs/syzlang.md` §4) must be completely unchanged by the dictionary/wave-10 expansion —
+/// this task was explicitly additive-only with respect to these.
+#[test]
+fn wire_format_constants_are_unchanged() {
+    assert_eq!(MAX_CALLS, 8);
+    assert_eq!(MAX_FIXUPS, 32);
+    assert_eq!(CALL_WORDS, 7);
+    assert_eq!(FIXUP_WORDS, 4);
+    assert_eq!(WIRE_WORDS, 1 + MAX_CALLS * CALL_WORDS + 1 + MAX_FIXUPS * FIXUP_WORDS);
+    assert_eq!(WIRE_WORDS, 186);
+    assert_eq!(DEFAULT_SCRATCH_CAP, 32 * 1024);
+}
+
+/// Big seed sweep (validation item (b)/(c) from this task's brief): every wave-10 description
+/// (the new ioctls, both new setsockopt variants, and `sendmsg$nl`) gets generated at least once
+/// across many seeds, and `lower()`/`to_wire()` never panics and always yields exactly
+/// `WIRE_WORDS` words with `nfix <= MAX_FIXUPS` — both through fresh generation and through long
+/// mutation chains (which is what actually exercises the new `mutate_dict_const` operator and the
+/// dictionary-biased `Int`/`Flags` generation path together).
+#[test]
+fn wave_10_descriptions_get_generated_and_lower_cleanly_across_a_big_seed_sweep() {
+    use std::collections::HashSet;
+    const WAVE_10: &[&str] = &[
+        "ioctl$TIOCGPGRP",
+        "ioctl$TIOCSPGRP",
+        "ioctl$FIOASYNC",
+        "ioctl$SIOCSIFFLAGS",
+        "ioctl$SIOCGIFHWADDR",
+        "setsockopt$so_sndbuf",
+        "setsockopt$netlink_add_membership",
+        "sendmsg$nl",
+    ];
+    let mut seen: HashSet<&str> = HashSet::new();
+
+    // Fresh generation.
+    for seed in 1..6000u32 {
+        let mut rng = Rng::new(seed);
+        let p = generate(&mut rng);
+        for c in &p.calls {
+            seen.insert(c.desc.name);
+        }
+        let lowered = lower(&p, 0xA000_0000);
+        let wire = to_wire(&lowered);
+        assert_eq!(wire.len(), WIRE_WORDS);
+        assert!(lowered.fixups.len() <= MAX_FIXUPS);
+    }
+
+    // Long mutation chains, so `mutate_dict_const`/`insert_call`/`wire_producer` also get a
+    // chance to introduce (or further mutate) a wave-10 call.
+    for seed in 1..400u32 {
+        let mut rng = Rng::new(seed.wrapping_add(90_000));
+        let mut p = generate(&mut rng);
+        for _ in 0..500 {
+            p = mutate(&mut rng, &p);
+            assert!(p.is_well_formed());
+            for c in &p.calls {
+                seen.insert(c.desc.name);
+            }
+            let lowered = lower(&p, 0xA100_0000);
+            let wire = to_wire(&lowered);
+            assert_eq!(wire.len(), WIRE_WORDS);
+            assert!(lowered.fixups.len() <= MAX_FIXUPS);
+        }
+    }
+
+    let missing: Vec<&str> = WAVE_10.iter().filter(|n| !seen.contains(*n)).copied().collect();
+    assert!(missing.is_empty(), "wave-10 descs never generated: {missing:?}");
 }
