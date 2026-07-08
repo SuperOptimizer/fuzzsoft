@@ -1,0 +1,16 @@
+[package]
+name = "fs-hostmem"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+# Prototype crate: host-mmap-backed guest RAM for the scalar `--jobs` fuzzing path. This is the
+# ONE crate in the workspace where `unsafe` is allowed (mmap/madvise/memfd live here); every other
+# crate keeps `forbid(unsafe_code)`. Exploratory measurement — see docs/cow-shared-ram.md.
+[dependencies]
+fs-mmu = { path = "../fs-mmu" }
+libc = "0.2"
+
+[[example]]
+name = "bench"
+path = "examples/bench.rs"
