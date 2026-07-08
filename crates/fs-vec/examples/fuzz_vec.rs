@@ -10,9 +10,11 @@
 //!
 //! CRITICAL correctness-of-approach point (see `VecSystem::step`'s convergence-gated SIMD fast
 //! path): the 16 lanes in one batch are NOT 16 unrelated fuzz inputs — they are 16 MUTATIONS OF
-//! ONE base program (`fs_prog::mutate` applied 16 times to the same parent). Related inputs keep
-//! lanes converged (same `pc`/`privilege`/`satp`) through shared kernel code paths for longer,
-//! which is the only way the SIMD/shared-fetch fast paths ever get a chance to fire. Injecting 16
+//! ONE base program (`fs_prog::mutate_batch` — same-skeleton siblings, mutate only leaf data).
+//! Related inputs keep lanes converged (same `pc`/`privilege`/`satp`) through shared kernel code
+//! paths for longer (measured ~1.6% -> ~32% honest 16-lane convergence vs skeleton-changing
+//! `mutate`, see `examples/convergence.rs`), which is the only way the SIMD/shared-fetch fast
+//! paths ever get a chance to fire. Injecting 16
 //! independently-generated programs would diverge lanes at the very first differing syscall
 //! number and make the fast path fire ~never — measuring nothing but per-lane-scalar overhead.
 //!
@@ -270,7 +272,11 @@ fn main() {
     if args.verify {
         eprintln!("fuzz_vec: --verify — running one batch through VecSystem and 16 independent scalar oracles...");
         let base = fs_prog::generate(&mut rng);
-        let lane_progs: Vec<fs_prog::Prog> = (0..LANES).map(|_| fs_prog::mutate(&mut rng, &base)).collect();
+        // Same-skeleton batch mutation (mutate ONLY leaf data, keep call skeleton/nrs/types/
+        // resource-threading identical) keeps the 16 lanes convergent far longer than skeleton-
+        // changing `mutate` — measured ~1.6% -> ~32% honest 16-lane convergence
+        // (examples/convergence.rs). This is what makes the SIMD fast path actually fire.
+        let lane_progs: Vec<fs_prog::Prog> = fs_prog::mutate_batch(&mut rng, &base, LANES);
         let lowered: Vec<fs_prog::Lowered> =
             lane_progs.iter().map(|p| fs_prog::lower(p, scratch_va)).collect();
 
@@ -339,7 +345,11 @@ fn main() {
         } else {
             fs_prog::generate(&mut rng)
         };
-        let lane_progs: Vec<fs_prog::Prog> = (0..LANES).map(|_| fs_prog::mutate(&mut rng, &base)).collect();
+        // Same-skeleton batch mutation (mutate ONLY leaf data, keep call skeleton/nrs/types/
+        // resource-threading identical) keeps the 16 lanes convergent far longer than skeleton-
+        // changing `mutate` — measured ~1.6% -> ~32% honest 16-lane convergence
+        // (examples/convergence.rs). This is what makes the SIMD fast path actually fire.
+        let lane_progs: Vec<fs_prog::Prog> = fs_prog::mutate_batch(&mut rng, &base, LANES);
         let lowered: Vec<fs_prog::Lowered> =
             lane_progs.iter().map(|p| fs_prog::lower(p, scratch_va)).collect();
         for (lane, low) in lowered.iter().enumerate() {
