@@ -30,6 +30,7 @@ crates/fs-san/src/
   alloc.rs      Sanitizer: redzone alloc()/free(), quarantine bookkeeping, SanError
   hooks.rs      PcHooks: ISA-agnostic PC-hook framework (learn calls with NO guest changes)
   hypercall.rs  Cooperative hypercall sub-protocol (learn calls WITH a guest agent)
+  linux.rs      RV32 Linux wiring: System.map -> PcHooks for the kernel slab allocator
   lib.rs        Re-exports + crate-level overview
 ```
 
@@ -141,8 +142,76 @@ This is fully implemented for the RISC-V register-convention case in `hooks.rs` 
 scope because fuzzsoft has no x86 emulation core, is: (a) an x86-64/Win64 register-convention
 instantiation of the same `on_pc` logic (same algorithm, different register indices, and a stack
 read instead of a register read for the argument that Win64 spills), and (b) a symbolizer that
-turns a Windows PDB / kernel `System.map` into `entry_pc` values automatically instead of a
-hand-written config. Both are mechanical extensions of the same design, not new ideas.
+turns a Windows PDB into `entry_pc` values automatically instead of a hand-written config. The
+kernel `System.map` half of (b) — for our own RV32 Linux target specifically — is implemented
+now, in `linux.rs`; see §3c.
+
+### 3c. `linux.rs` — wiring the PC-hook path to the RV32 Linux kernel target
+
+`linux.rs` is where §3b's generic mechanism meets our actual target: it turns a kernel build's
+`System.map` into `PcHooks` registrations for the slab allocator, with zero kernel changes.
+
+**End-to-end flow:**
+
+```
+build kernel (build/linux-src)
+        |
+        v
+System.map on disk  --parse_system_map()-->  HashMap<symbol name, u32 address>
+        |
+        v
+register_kernel_allocator_hooks(&mut hooks, &syms)
+        |   (tries every known kmalloc/kfree-family name; registers whichever the
+        |    running kernel build actually has — names drift across versions/configs)
+        v
+PcHooks now watches kmalloc/kfree entry (and kmalloc's matching return) addresses
+        |
+        v
+fuzz driver's step loop, once per retired instruction:
+    if let Some(event) = hooks.on_pc(cpu.pc, &cpu.regs) {
+        match event {
+            HookEvent::Alloc { addr, size } => { let _ = sanitizer.alloc(&mut mmu, addr, size); }
+            HookEvent::Free { addr }        => { let _ = sanitizer.free(&mut mmu, addr); }
+        }
+    }
+        |
+        v
+Sanitizer stamps/poisons bytes in the soft MMU (§2) exactly as in the userspace case
+        |
+        v
+Kernel OOB/UAF in *unmodified, non-KASAN* kernel code now faults at the byte-granular
+soft MMU, the same Permission fault as any other sanitizer-caught bug in this crate.
+```
+
+`parse_system_map(text: &str) -> HashMap<String, u32>` parses the standard `HEXADDR TYPE SYMBOL`
+line shape (both symbol-type cases accepted, e.g. `T`/`t`), skipping malformed/noise lines rather
+than erroring, since a real `System.map` is thousands of lines and only a handful are allocator
+entry points we go looking for.
+
+`register_kernel_allocator_hooks(hooks: &mut PcHooks, syms: &HashMap<String, u32>)` tries each of
+a fixed list of known allocator/deallocator symbol names against `syms` and registers a hook for
+every one present:
+
+| Symbol | Shape | Arg convention |
+|---|---|---|
+| `kmalloc`, `__kmalloc`, `__kmalloc_noprof`, `kmalloc_noprof`, `__kmalloc_node` | alloc | size is the first argument -> `a0` |
+| `kmalloc_trace` | alloc | `(cache, flags, size)` -> size is the **third** argument -> `a2`, not `a0` |
+| `kmem_cache_alloc`, `kmem_cache_alloc_noprof` | alloc | **not hooked** — size is not an argument at all, it's `cachep->object_size` (a guest-memory read of a version-specific struct offset, which `hooks.rs`'s register-only design deliberately does not do); documented in `linux.rs` and skipped rather than guessed |
+| `kfree`, `kfree_sensitive` | free | pointer is the only argument -> `a0` |
+| `kmem_cache_free` | free | `(cache, objp)` -> pointer is the **second** argument -> `a1`, not `a0` |
+
+Names vary by kernel version (e.g. the `_noprof` variants only exist under
+`CONFIG_MEM_ALLOC_PROFILING`) — this is why registration tries every known name independently
+rather than assuming a fixed set exists, mirroring the closed-source case where you likewise don't
+get to assume which symbols a given binary happens to export.
+
+**The one open gap:** `kmem_cache_alloc` allocations are currently invisible to the sanitizer
+(no hook is registered for them), since their size lives in the cache object, not the call's
+arguments. In practice a large share of kernel heap traffic still goes through the plain
+`kmalloc`/`kfree` family covered above; closing the `kmem_cache_alloc` gap would mean extending
+`AllocHook` with an optional "read size from guest memory at this struct offset instead of a
+register" mode — a small, mechanical extension, but real guest-memory access rather than pure
+register-file inspection, so it's called out here rather than silently faked with a guessed size.
 
 **Worked example config (RISC-V, matches `hooks.rs` test coverage):**
 
@@ -190,3 +259,12 @@ Unit tests in `alloc.rs`, `hooks.rs`, `hypercall.rs` construct an `Mmu` directly
 guard, uninitialized read, free -> UAF read/write, double-free, double-alloc, quarantine-then-legit
 realloc, and quarantine-cap eviction (tracking is bounded, poisoning never regresses). `fs-mmu`
 gained matching unit tests for the new `poison`/`in_bounds`/`perm_at` primitives.
+
+`linux.rs`'s tests parse a small embedded `System.map`-shaped snippet (real symbol lines plus
+assorted noise: blank lines, other symbol types, a malformed line) and assert: noise is ignored
+and only real symbol lines are captured; `register_kernel_allocator_hooks` wires up a found
+`kmalloc`/`kfree` pair end-to-end through `PcHooks::on_pc` exactly as `hooks.rs`'s own tests drive
+`PcHooks` directly; `kmem_cache_alloc`/`kmem_cache_alloc_noprof` are confirmed to never fire a
+hook (the documented size-unavailable gap) while `kmem_cache_free`'s pointer is confirmed to come
+from `a1`, not `a0`, unlike every other free-shaped hook; and registering against an empty symbol
+table is a safe no-op.

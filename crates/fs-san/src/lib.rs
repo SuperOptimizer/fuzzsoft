@@ -13,10 +13,16 @@
 //!
 //! Both paths feed the same [`Sanitizer`] in [`alloc`], which is the only place that actually
 //! touches `Mmu` permissions. See `DESIGN.md` for the full rationale and the KASAN/ASAN contrast.
+//!
+//! - [`linux`] — wires the PC-hook path to the RV32 Linux kernel target specifically: parses a
+//!   `System.map` and registers hooks for whichever slab-allocator symbols the kernel build
+//!   actually has, with no kernel-side instrumentation required.
 
 mod alloc;
 pub mod hooks;
 pub mod hypercall;
+pub mod linux;
 
 pub use alloc::{DEFAULT_QUARANTINE_CAP, DEFAULT_REDZONE, SanError, Sanitizer};
 pub use hooks::{AllocHook, FreeHook, HookEvent, PcHooks, REG_RETURN_ADDR, REG_RETURN_VALUE};
+pub use linux::{parse_system_map, register_kernel_allocator_hooks};
