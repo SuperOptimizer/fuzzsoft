@@ -69,3 +69,4 @@ dkms.conf
 /workdir
 /build
 /manager.cfg
+/.claude/

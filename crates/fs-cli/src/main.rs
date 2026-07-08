@@ -36,19 +36,6 @@ const HC_EID: u32 = 0x0A55_0000;
 const HC_SNAPSHOT: u32 = 0;
 const HC_DONE: u32 = 1;
 
-/// Deterministic xorshift32 PRNG (decision #7).
-struct Rng(u32);
-impl Rng {
-    fn next(&mut self) -> u32 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        self.0 = x;
-        x
-    }
-}
-
 /// Emulator-level sanitizer context: PC-hooks on the kernel allocator + observed-allocation stats.
 /// First step is validation-only (prove the hooks fire on the real kernel); redzone poisoning is
 /// gated behind the SLUB false-positive analysis (docs/kernel-san.md, pending).
@@ -133,164 +120,37 @@ fn kernel_crash_sig(out: &[u8]) -> Option<u32> {
     Some(parse_epc(&s).unwrap_or(0))
 }
 
-const MAX_CALLS: usize = 8;
+// The typed, resource-threaded program model now lives in `fs-prog` (the syzlang-lite library):
+// `fs_prog::generate`/`mutate` build a typed `Prog` (real rv32 syscall descriptions, fd/sock
+// resource threading), and `fs_prog::lower`+`to_wire` compile it to the flat wire buffer the guest
+// agent (`boot/agent.c`) interprets — call slots plus a resource-fixup table plus a scratch image.
+// See `crates/fs-prog/DESIGN.md` for the exact wire contract.
 
-/// One syscall: number + 6 register arguments (a0..a5).
-#[derive(Clone)]
-struct Call {
-    nr: u32,
-    args: [u32; 6],
-}
-
-/// A fuzz input is a *sequence* of syscalls (syzkaller-style program), so dependencies like
-/// open->ioctl->close are reachable (decision #20/#48).
-#[derive(Clone)]
-struct Prog {
-    calls: Vec<Call>,
-}
-
-/// Generate a plausible argument from a pool: fds, sentinels, the guest scratch buffer (so
-/// pointer args are valid), small ints, and full-random. Valid-ish args reach real kernel paths.
-fn gen_arg(rng: &mut Rng, scratch: u32) -> u32 {
-    match rng.next() % 8 {
-        0 => 0,
-        1 => 1,
-        2 => 2,
-        3 => 0xffff_ffff,
-        4 => scratch,
-        5 => scratch.wrapping_add(rng.next() % 4096),
-        6 => rng.next() % 256,
-        _ => rng.next(),
+/// Write a slice of `u32` words into guest physical memory via its precomputed per-word physical
+/// addresses (`pas[k]` is the physical address of the k-th word). Extra `pas` beyond `words` are
+/// left untouched; the guest ignores slots past the counts it reads.
+fn write_words(m: &mut fs_platform::Machine, pas: &[u32], words: &[u32]) {
+    use fs_mmu::Bus;
+    for (&pa, &w) in pas.iter().zip(words) {
+        let _ = m.store(pa, 4, w);
     }
 }
 
-fn pick_nr(rng: &mut Rng, deny: &[u32]) -> u32 {
-    loop {
-        let nr = rng.next() % 440;
-        if !deny.contains(&nr) {
-            return nr;
-        }
-    }
-}
-
-/// A typed argument kind — the first slice of the syzlang-lite model (docs/syzlang.md).
-#[derive(Clone, Copy)]
-enum A {
-    Fd,
-    Flag(&'static [u32]),
-    Ptr,
-    Len,
-    Int,
-}
-
-/// Real rv32 (asm-generic) syscall descriptions: valid numbers + roughly-typed args, so we
-/// generate *valid* syscalls (fds, flags, scratch pointers, lengths) instead of random numbers.
-/// Resource threading (fd return capture) is future work per the design doc.
-static SYS: &[(u32, &[A])] = &[
-    (56, &[A::Fd, A::Ptr, A::Flag(&[0, 1, 2, 0o100, 0o2000, 0o4000]), A::Int]), // openat(dirfd,path,flags,mode)
-    (57, &[A::Fd]),                                    // close(fd)
-    (63, &[A::Fd, A::Ptr, A::Len]),                    // read(fd,buf,count)
-    (64, &[A::Fd, A::Ptr, A::Len]),                    // write(fd,buf,count)
-    (62, &[A::Fd, A::Int, A::Flag(&[0, 1, 2])]),       // lseek(fd,off,whence)
-    (29, &[A::Fd, A::Int, A::Ptr]),                    // ioctl(fd,cmd,arg)
-    (61, &[A::Fd, A::Ptr, A::Len]),                    // getdents64(fd,buf,count)
-    (23, &[A::Fd]),                                    // dup(fd)
-    (25, &[A::Fd, A::Flag(&[0, 1, 2, 3, 4, 6]), A::Int]), // fcntl(fd,cmd,arg)
-    (59, &[A::Ptr, A::Flag(&[0, 0o4000])]),            // pipe2(fds,flags)
-    (198, &[A::Flag(&[1, 2, 10, 16]), A::Flag(&[1, 2, 3]), A::Int]), // socket(dom,type,proto)
-    (17, &[A::Ptr, A::Len]),                           // getcwd(buf,size)
-    (48, &[A::Fd, A::Ptr, A::Flag(&[0, 1, 2, 4]), A::Int]), // faccessat(dirfd,path,mode,flags)
-    (167, &[A::Int, A::Int, A::Int, A::Int, A::Int]),  // prctl
-    (291, &[A::Fd, A::Ptr, A::Flag(&[0, 0x800]), A::Int, A::Ptr]), // statx(dirfd,path,flags,mask,buf)
-    (25, &[A::Fd, A::Int, A::Int]),                    // fcntl generic
-    (66, &[A::Fd, A::Ptr, A::Len]),                    // writev
-    (172, &[]),                                        // getpid
-];
-
-fn gen_typed_arg(rng: &mut Rng, scratch: u32, kind: A) -> u32 {
-    match kind {
-        A::Fd => [0u32, 1, 2, (-1i32) as u32, (-100i32) as u32][rng.next() as usize % 5],
-        A::Flag(vals) => {
-            // one value, or an OR of a random subset (bitmask-ish)
-            if rng.next().is_multiple_of(2) {
-                vals[rng.next() as usize % vals.len()]
-            } else {
-                vals.iter().filter(|_| rng.next().is_multiple_of(2)).fold(0, |a, &v| a | v)
+/// Write a byte image (the lowered scratch region) into guest physical memory word-by-word via the
+/// scratch region's precomputed per-word physical addresses. The image is zero-padded up to the
+/// number of scratch words actually translated; anything past that is beyond the guest buffer and
+/// dropped (the pointers `lower()` handed out never exceed the region cap).
+fn write_scratch_bytes(m: &mut fs_platform::Machine, pas: &[u32], bytes: &[u8]) {
+    use fs_mmu::Bus;
+    for (i, &pa) in pas.iter().enumerate() {
+        let off = i * 4;
+        let mut word = [0u8; 4];
+        for (b, wb) in word.iter_mut().enumerate() {
+            if let Some(&v) = bytes.get(off + b) {
+                *wb = v;
             }
         }
-        A::Ptr => scratch.wrapping_add((rng.next() % 8) * 8),
-        A::Len => (rng.next() % 4097).min(4096),
-        A::Int => gen_arg(rng, scratch),
-    }
-}
-
-fn gen_call(rng: &mut Rng, scratch: u32, deny: &[u32]) -> Call {
-    // Mostly generate a typed, valid syscall; occasionally a fully-random one for exploration.
-    if !rng.next().is_multiple_of(5) {
-        let (nr, sig) = SYS[rng.next() as usize % SYS.len()];
-        let mut args = [0u32; 6];
-        for (i, a) in args.iter_mut().enumerate() {
-            *a = match sig.get(i) {
-                Some(&k) => gen_typed_arg(rng, scratch, k),
-                None => 0,
-            };
-        }
-        return Call { nr, args };
-    }
-    let mut args = [0u32; 6];
-    for a in &mut args {
-        *a = gen_arg(rng, scratch);
-    }
-    Call { nr: pick_nr(rng, deny), args }
-}
-
-fn gen_program(rng: &mut Rng, scratch: u32, deny: &[u32]) -> Prog {
-    let n = 1 + rng.next() as usize % MAX_CALLS;
-    Prog { calls: (0..n).map(|_| gen_call(rng, scratch, deny)).collect() }
-}
-
-fn mutate_program(rng: &mut Rng, base: &Prog, scratch: u32, deny: &[u32]) -> Prog {
-    let mut p = base.clone();
-    match rng.next() % 5 {
-        0 if p.calls.len() < MAX_CALLS => {
-            let idx = rng.next() as usize % (p.calls.len() + 1);
-            p.calls.insert(idx, gen_call(rng, scratch, deny));
-        }
-        1 if p.calls.len() > 1 => {
-            let idx = rng.next() as usize % p.calls.len();
-            p.calls.remove(idx);
-        }
-        2 => {
-            let idx = rng.next() as usize % p.calls.len();
-            p.calls[idx].nr = pick_nr(rng, deny);
-        }
-        _ => {
-            let idx = rng.next() as usize % p.calls.len();
-            let a = rng.next() as usize % 6;
-            p.calls[idx].args[a] = match rng.next() % 3 {
-                1 => p.calls[idx].args[a] ^ (1 << (rng.next() % 32)),
-                _ => gen_arg(rng, scratch),
-            };
-        }
-    }
-    if p.calls.is_empty() {
-        p.calls.push(gen_call(rng, scratch, deny));
-    }
-    p
-}
-
-/// Write a program into the guest's `prog` buffer via its precomputed physical word addresses:
-/// layout is `[count][nr, a0..a5]*`.
-fn write_program(m: &mut fs_platform::Machine, prog_pas: &[u32], p: &Prog) {
-    use fs_mmu::Bus;
-    let n = p.calls.len().min(MAX_CALLS);
-    let _ = m.store(prog_pas[0], 4, n as u32);
-    for (i, call) in p.calls.iter().take(MAX_CALLS).enumerate() {
-        let base = 1 + i * 7;
-        let _ = m.store(prog_pas[base], 4, call.nr);
-        for (j, &a) in call.args.iter().enumerate() {
-            let _ = m.store(prog_pas[base + 1 + j], 4, a);
-        }
+        let _ = m.store(pa, 4, u32::from_le_bytes(word));
     }
 }
 
@@ -391,13 +251,15 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     println!();
     eprintln!("fuzz: snapshot captured at pc={:#010x} after {} insns", cpu.pc, cpu.insns_retired);
 
-    // The agent passed a1 = program buffer, a2 = scratch buffer (both user VAs). Translate the
-    // program buffer's words to physical once (the mapping is stable across resets) so we can
-    // write each program cheaply.
+    // The agent passed a1 = program buffer, a2 = scratch buffer (both user VAs). Translate both
+    // regions' words to physical once (the mapping is stable across resets) so we can write each
+    // program cheaply. The program buffer is `fs_prog::WIRE_WORDS` (186) words; the scratch region
+    // is `DEFAULT_SCRATCH_CAP` bytes (32 KiB), where `lower()` places pointer-arg pointee data.
     let prog_va = cpu.regs[11];
     let scratch = cpu.regs[12];
-    let mut prog_pas = Vec::with_capacity(1 + MAX_CALLS * 7);
-    for k in 0..(1 + MAX_CALLS * 7) as u32 {
+    let scratch_words = (fs_prog::DEFAULT_SCRATCH_CAP / 4) as usize;
+    let mut prog_pas = Vec::with_capacity(fs_prog::WIRE_WORDS);
+    for k in 0..fs_prog::WIRE_WORDS as u32 {
         match cpu.xlate(&mut m, prog_va + k * 4, fs_mmu::Access::Write) {
             Ok(pa) => prog_pas.push(pa),
             Err(_) => {
@@ -406,7 +268,21 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
             }
         }
     }
-    eprintln!("fuzz: prog buffer @ {prog_va:#010x}  scratch @ {scratch:#010x}");
+    let mut scratch_pas = Vec::with_capacity(scratch_words);
+    for k in 0..scratch_words as u32 {
+        match cpu.xlate(&mut m, scratch + k * 4, fs_mmu::Access::Write) {
+            Ok(pa) => scratch_pas.push(pa),
+            Err(_) => {
+                eprintln!("fuzz: could not translate guest scratch buffer @ {scratch:#x}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    eprintln!(
+        "fuzz: prog buffer @ {prog_va:#010x} ({} words)  scratch @ {scratch:#010x} ({} words)",
+        prog_pas.len(),
+        scratch_pas.len()
+    );
     let snap = Snapshot::capture(&cpu, &mut m);
     let base_uart = m.uart.out.len();
 
@@ -451,17 +327,11 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     // --- coverage-guided fuzz loop over syscall *programs* ---
     let mut virgin = VirginMap::new(); // accumulated coverage (feedback)
     let mut run_map = CovBitmap::new(); // per-case edge bitmap
-    let mut rng = Rng(seed.max(1));
-    // Deny syscalls that corrupt the single-process agent's own address space / signal state /
-    // lifetime (they crash init as a userspace false-positive rather than stressing the kernel).
-    let deny = [
-        93u32, 94, 142, // exit, exit_group, reboot
-        139, // rt_sigreturn
-        214, 215, 216, 222, 226, // brk, munmap, mremap, mmap, mprotect
-        132, 133, 134, 135, // sigaltstack, rt_sigtimedwait, rt_sigaction, rt_sigprocmask
-        220, 221, 281, 435, // clone, execve, execveat, clone3
-    ];
-    let mut corpus: Vec<Prog> = Vec::new();
+    let mut rng = fs_prog::Rng::new(seed);
+    // No syscall deny-list any more: `fs-prog` only generates from its curated table of real rv32
+    // syscall descriptions (no address-space/signal/lifetime-destroying calls reach the agent), so
+    // the crude number-blacklist the random generator needed is gone.
+    let mut corpus: Vec<fs_prog::Prog> = Vec::new();
     let mut crash_sigs = std::collections::HashSet::new();
     let mut crashes = 0u32;
     let mut done = 0u32;
@@ -471,12 +341,15 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
 
     for case in 0..cases {
         // Mostly mutate the corpus, sometimes generate fresh (decision #48).
-        let prog = if !corpus.is_empty() && rng.next() % 100 < 85 {
-            let base = &corpus[(rng.next() as usize) % corpus.len()];
-            mutate_program(&mut rng, base, scratch, &deny)
+        let prog = if !corpus.is_empty() && rng.chance(85) {
+            let base = &corpus[rng.below(corpus.len())];
+            fs_prog::mutate(&mut rng, base)
         } else {
-            gen_program(&mut rng, scratch, &deny)
+            fs_prog::generate(&mut rng)
         };
+        // Compile the typed program to the wire form (call slots + fixup table + scratch image),
+        // placing pointer pointees at `scratch`'s guest VA so runtime pointers are valid.
+        let lowered = fs_prog::lower(&prog, scratch);
 
         snap.reset(&mut cpu, &mut m);
         // Reset per-case sanitizer state (perms are restored by snap.reset; clear the tracking).
@@ -485,7 +358,8 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
             ctx.hooks.clear_pending();
         }
         let case_start = cpu.insns_retired;
-        write_program(&mut m, &prog_pas, &prog);
+        write_words(&mut m, &prog_pas, &fs_prog::to_wire(&lowered));
+        write_scratch_bytes(&mut m, &scratch_pas, &lowered.scratch);
 
         run_map.clear();
         let deadline = cpu.insns_retired + case_insns;
@@ -506,8 +380,9 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
         if let Some(sig) = kernel_crash_sig(out) {
             crashes += 1;
             if crash_sigs.insert(sig) {
-                let nrs: Vec<u32> = prog.calls.iter().map(|c| c.nr).collect();
-                eprintln!("fuzz: [KERNEL CRASH] epc={sig:#010x} case {case} nrs={nrs:?}");
+                let names: Vec<&str> = prog.calls.iter().map(|c| c.desc.name).collect();
+                let nrs: Vec<u32> = prog.calls.iter().map(|c| c.desc.nr).collect();
+                eprintln!("fuzz: [KERNEL CRASH] epc={sig:#010x} case {case} calls={names:?} nrs={nrs:?}");
                 eprintln!("{}", String::from_utf8_lossy(out));
             }
         }

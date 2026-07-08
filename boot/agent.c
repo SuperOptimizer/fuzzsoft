@@ -1,12 +1,24 @@
 /* fuzzsoft guest fuzzing agent (runs as PID 1 / init).
  *
  * Snapshot-fuzz protocol via reserved "hypercall" ecalls (a7 == HC_EID), which the emulator
- * intercepts. Programs are syscall *sequences*: the emulator writes a program into `prog` (laid
- * out as [count][nr,a0..a5]*) at each reset, and the agent interprets it, then signals DONE.
+ * intercepts. Programs are typed syscall *sequences* with resource threading: the emulator writes
+ * a program (in the fs-prog wire format) plus a scratch data image at each reset, and the agent
+ * interprets it, then signals DONE.
  *   - hypercall(SNAPSHOT, prog, scratch): golden snapshot captured just after this; the emulator
- *     learns the program and scratch buffer addresses.
- *   - the interpret loop runs each syscall in the freshly-written program.
+ *     learns the program buffer and scratch buffer addresses.
+ *   - the interpret loop applies each call's resource fixups, runs the syscall, and records the
+ *     a0 return value into results[] so a later call can consume it (open->read->close chains).
  *   - hypercall(DONE): emulator records coverage/crashes and resets to the snapshot.
+ *
+ * Wire layout (must match crates/fs-prog/src/lower.rs exactly; see crates/fs-prog/DESIGN.md):
+ *   prog[0]                                  = n     (number of calls, <= MAX_CALLS)
+ *   prog[1 .. 1+MAX_CALLS*CALL_WORDS)        = MAX_CALLS call slots: nr, a0..a5
+ *   prog[FIXUP_BASE]                         = nfix  (number of fixups, <= MAX_FIXUPS)
+ *   prog[FIXUP_BASE+1 ..]                    = MAX_FIXUPS fixup slots: dst_call, dst_arg,
+ *                                              src_kind, src_val
+ * A fixup means: before running call dst_call, overwrite its dst_arg-th register with either
+ *   src_kind==0 (Reg): results[src_val]                     (src_val is a call index)
+ *   src_kind==1 (Mem): *(u32*)(scratch + src_val)          (src_val is a scratch byte offset)
  *
  * Build: clang --target=riscv32 -march=rv32ima -mabi=ilp32 -static -nostdlib -fuse-ld=lld -O2
  */
@@ -15,7 +27,14 @@
 #define HC_SNAPSHOT 0
 #define HC_DONE 1
 #define SYS_write 64
+
 #define MAX_CALLS 8
+#define MAX_FIXUPS 32
+#define CALL_WORDS 7  /* nr, a0..a5 */
+#define FIXUP_WORDS 4 /* dst_call, dst_arg, src_kind, src_val */
+#define FIXUP_BASE (1 + MAX_CALLS * CALL_WORDS)
+#define WIRE_WORDS (FIXUP_BASE + 1 + MAX_FIXUPS * FIXUP_WORDS) /* = 186 */
+#define SCRATCH_SIZE (32 * 1024)
 
 static long hypercall(long cmd, long a, long b) {
     register long a7 asm("a7") = HC_EID;
@@ -48,27 +67,45 @@ static void print(const char *s) {
     do_syscall(SYS_write, 1, (unsigned)(long)s, n, 0, 0, 0);
 }
 
-/* Program buffer ([count][nr,a0..a5]*) and a data buffer for pointer args. Both are handed to
- * the emulator, which writes the program here and passes `scratch` as a valid pointer argument. */
-static volatile unsigned prog[1 + MAX_CALLS * 7];
-static char scratch[4096] __attribute__((aligned(64)));
+/* Program buffer (fs-prog wire form) and a scratch data buffer for pointer args. Both are handed
+ * to the emulator, which writes the program/scratch here and passes `scratch` as a valid pointer
+ * base. results[] holds each call's a0 so later calls can thread produced resources (fds). */
+static volatile unsigned prog[WIRE_WORDS];
+static char scratch[SCRATCH_SIZE] __attribute__((aligned(64)));
+static unsigned results[MAX_CALLS];
 
 void _start(void) {
-    print("\n=== fuzzsoft agent: userspace ready, snapshot syscall-sequence fuzzing ===\n");
+    print("\n=== fuzzsoft agent: userspace ready, typed resource-threaded fuzzing ===\n");
 
     /* Fault in the buffers (Linux demand-pages .bss) so the emulator can translate them at
-     * snapshot time and write programs into them. */
-    for (unsigned i = 0; i < sizeof(prog) / 4; i++) prog[i] = 0;
-    for (unsigned i = 0; i < sizeof(scratch); i += 4096) scratch[i] = 0;
-    scratch[sizeof(scratch) - 1] = 0;
+     * snapshot time and write programs/scratch into them. */
+    for (unsigned i = 0; i < WIRE_WORDS; i++) prog[i] = 0;
+    for (unsigned i = 0; i < SCRATCH_SIZE; i += 4096) scratch[i] = 0;
+    scratch[SCRATCH_SIZE - 1] = 0;
 
     for (;;) {
         hypercall(HC_SNAPSHOT, (long)prog, (long)scratch);
+
         unsigned n = prog[0];
         if (n > MAX_CALLS) n = MAX_CALLS;
+        unsigned nfix = prog[FIXUP_BASE];
+        if (nfix > MAX_FIXUPS) nfix = MAX_FIXUPS;
+
         for (unsigned i = 0; i < n; i++) {
-            volatile unsigned *c = &prog[1 + i * 7];
-            do_syscall(c[0], c[1], c[2], c[3], c[4], c[5], c[6]);
+            volatile unsigned *c = &prog[1 + i * CALL_WORDS];
+            unsigned a[6] = {c[1], c[2], c[3], c[4], c[5], c[6]};
+
+            /* Apply all fixups targeting this call before invoking it. */
+            for (unsigned f = 0; f < nfix; f++) {
+                volatile unsigned *fr = &prog[FIXUP_BASE + 1 + f * FIXUP_WORDS];
+                if (fr[0] != i) continue;                      /* dst_call != this call */
+                unsigned v = fr[2] == 0
+                                 ? results[fr[3]]              /* Reg(src_val = call idx) */
+                                 : *(volatile unsigned *)(scratch + fr[3]); /* Mem(byte off) */
+                if (fr[1] < 6) a[fr[1]] = v;                   /* dst_arg */
+            }
+
+            results[i] = (unsigned)do_syscall(c[0], a[0], a[1], a[2], a[3], a[4], a[5]);
         }
         hypercall(HC_DONE, 0, 0);
     }

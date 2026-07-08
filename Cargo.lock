@@ -10,6 +10,7 @@ dependencies = [
  "fs-loader",
  "fs-mmu",
  "fs-platform",
+ "fs-prog",
  "fs-riscv",
  "fs-san",
 ]
