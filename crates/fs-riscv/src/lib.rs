@@ -1151,42 +1151,19 @@ impl Cpu {
     /// Translated load. `size` in bytes; `signed` sign-extends sub-word loads. Unaligned and
     /// page-crossing accesses are serviced byte-wise (native unaligned support — the kernel's
     /// `check_unaligned_access_emulated` probe expects this to just work).
+    ///
+    /// Thin forwarder to [`load_impl`] — see that function's doc for why this split exists
+    /// (Phase 2 JIT call-out reuse, `docs/jit-scalar-design.md`).
     fn load(&mut self, bus: &mut dyn Bus, va: u32, size: u8, signed: bool) -> Result<u32, Trap> {
-        let v = if Self::misaligned(va, size) || Self::crosses_page(va, size) {
-            let mut acc = 0u32;
-            for i in 0..size as u32 {
-                let pa = self.xlate(bus, va.wrapping_add(i), Access::Read)?;
-                let b = bus.load(pa, 1).map_err(Trap::Mem)?;
-                acc |= (b & 0xff) << (8 * i);
-            }
-            acc
-        } else {
-            let pa = self.xlate(bus, va, Access::Read)?;
-            bus.load(pa, size).map_err(Trap::Mem)?
-        };
-        Ok(if signed {
-            match size {
-                1 => v as u8 as i8 as i32 as u32,
-                2 => v as u16 as i16 as i32 as u32,
-                _ => v,
-            }
-        } else {
-            v
-        })
+        load_impl(self, bus, va, size, signed)
     }
 
     /// Translated store. `size` in bytes. Unaligned/page-crossing stores go byte-wise.
+    ///
+    /// Thin forwarder to [`store_impl`] — see that function's doc for why this split exists
+    /// (Phase 2 JIT call-out reuse, `docs/jit-scalar-design.md`).
     fn store(&mut self, bus: &mut dyn Bus, va: u32, size: u8, val: u32) -> Result<(), Trap> {
-        if Self::misaligned(va, size) || Self::crosses_page(va, size) {
-            for i in 0..size as u32 {
-                let pa = self.xlate(bus, va.wrapping_add(i), Access::Write)?;
-                bus.store(pa, 1, (val >> (8 * i)) & 0xff).map_err(Trap::Mem)?;
-            }
-            Ok(())
-        } else {
-            let pa = self.xlate(bus, va, Access::Write)?;
-            bus.store(pa, size, val).map_err(Trap::Mem)
-        }
+        store_impl(self, bus, va, size, val)
     }
 
     /// KMSAN Stage 1 load-taint (`docs/kmsan.md`): gather the byte-taint mask for the SAME span a
@@ -1742,6 +1719,65 @@ impl Cpu {
         }
         let r = self.step(bus);
         self.finish_exit(r)
+    }
+}
+
+/// Translated load, extracted verbatim from [`Cpu::load`] (which now just forwards here) so the
+/// byte-granular soft-MMU access — permission checks, sv32 [`Cpu::xlate`], `dyn Bus` dispatch,
+/// RAW-upgrade — is defined exactly once and can *also* be called from `fs-jit`'s compiled
+/// Load call-out (`docs/jit-scalar-design.md`'s Phase 2), guaranteeing that path has provably
+/// zero drift from the interpreter. `size` in bytes; `signed` sign-extends sub-word loads.
+/// Unaligned and page-crossing accesses are serviced byte-wise (native unaligned support — the
+/// kernel's `check_unaligned_access_emulated` probe expects this to just work).
+pub(crate) fn load_impl(
+    cpu: &mut Cpu,
+    bus: &mut dyn Bus,
+    va: u32,
+    size: u8,
+    signed: bool,
+) -> Result<u32, Trap> {
+    let v = if Cpu::misaligned(va, size) || Cpu::crosses_page(va, size) {
+        let mut acc = 0u32;
+        for i in 0..size as u32 {
+            let pa = cpu.xlate(bus, va.wrapping_add(i), Access::Read)?;
+            let b = bus.load(pa, 1).map_err(Trap::Mem)?;
+            acc |= (b & 0xff) << (8 * i);
+        }
+        acc
+    } else {
+        let pa = cpu.xlate(bus, va, Access::Read)?;
+        bus.load(pa, size).map_err(Trap::Mem)?
+    };
+    Ok(if signed {
+        match size {
+            1 => v as u8 as i8 as i32 as u32,
+            2 => v as u16 as i16 as i32 as u32,
+            _ => v,
+        }
+    } else {
+        v
+    })
+}
+
+/// Translated store, extracted verbatim from [`Cpu::store`] (which now just forwards here) —
+/// see [`load_impl`]'s doc for why this split exists. `size` in bytes. Unaligned/page-crossing
+/// stores go byte-wise.
+pub(crate) fn store_impl(
+    cpu: &mut Cpu,
+    bus: &mut dyn Bus,
+    va: u32,
+    size: u8,
+    val: u32,
+) -> Result<(), Trap> {
+    if Cpu::misaligned(va, size) || Cpu::crosses_page(va, size) {
+        for i in 0..size as u32 {
+            let pa = cpu.xlate(bus, va.wrapping_add(i), Access::Write)?;
+            bus.store(pa, 1, (val >> (8 * i)) & 0xff).map_err(Trap::Mem)?;
+        }
+        Ok(())
+    } else {
+        let pa = cpu.xlate(bus, va, Access::Write)?;
+        bus.store(pa, size, val).map_err(Trap::Mem)
     }
 }
 
