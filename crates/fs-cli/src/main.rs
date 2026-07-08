@@ -80,11 +80,20 @@ fn run_case(
     Stop::Budget
 }
 
-/// One fuzz input: a syscall number and its 7 register arguments (a0..a6).
+const MAX_CALLS: usize = 8;
+
+/// One syscall: number + 6 register arguments (a0..a5).
 #[derive(Clone)]
-struct Input {
+struct Call {
     nr: u32,
-    args: [u32; 7],
+    args: [u32; 6],
+}
+
+/// A fuzz input is a *sequence* of syscalls (syzkaller-style program), so dependencies like
+/// open->ioctl->close are reachable (decision #20/#48).
+#[derive(Clone)]
+struct Prog {
+    calls: Vec<Call>,
 }
 
 /// Generate a plausible argument from a pool: fds, sentinels, the guest scratch buffer (so
@@ -111,28 +120,67 @@ fn pick_nr(rng: &mut Rng, deny: &[u32]) -> u32 {
     }
 }
 
-fn gen_input(rng: &mut Rng, scratch: u32, deny: &[u32]) -> Input {
-    let mut args = [0u32; 7];
+fn gen_call(rng: &mut Rng, scratch: u32, deny: &[u32]) -> Call {
+    let mut args = [0u32; 6];
     for a in &mut args {
         *a = gen_arg(rng, scratch);
     }
-    Input { nr: pick_nr(rng, deny), args }
+    Call { nr: pick_nr(rng, deny), args }
 }
 
-fn mutate_input(rng: &mut Rng, base: &Input, scratch: u32, deny: &[u32]) -> Input {
-    let mut inp = base.clone();
-    if rng.next().is_multiple_of(4) {
-        inp.nr = pick_nr(rng, deny);
+fn gen_program(rng: &mut Rng, scratch: u32, deny: &[u32]) -> Prog {
+    let n = 1 + rng.next() as usize % MAX_CALLS;
+    Prog { calls: (0..n).map(|_| gen_call(rng, scratch, deny)).collect() }
+}
+
+fn mutate_program(rng: &mut Rng, base: &Prog, scratch: u32, deny: &[u32]) -> Prog {
+    let mut p = base.clone();
+    match rng.next() % 5 {
+        0 if p.calls.len() < MAX_CALLS => {
+            let idx = rng.next() as usize % (p.calls.len() + 1);
+            p.calls.insert(idx, gen_call(rng, scratch, deny));
+        }
+        1 if p.calls.len() > 1 => {
+            let idx = rng.next() as usize % p.calls.len();
+            p.calls.remove(idx);
+        }
+        2 => {
+            let idx = rng.next() as usize % p.calls.len();
+            p.calls[idx].nr = pick_nr(rng, deny);
+        }
+        _ => {
+            let idx = rng.next() as usize % p.calls.len();
+            let a = rng.next() as usize % 6;
+            p.calls[idx].args[a] = match rng.next() % 3 {
+                1 => p.calls[idx].args[a] ^ (1 << (rng.next() % 32)),
+                _ => gen_arg(rng, scratch),
+            };
+        }
     }
-    for _ in 0..1 + rng.next() % 3 {
-        let idx = (rng.next() % 7) as usize;
-        inp.args[idx] = match rng.next() % 3 {
-            0 => gen_arg(rng, scratch),
-            1 => inp.args[idx] ^ (1 << (rng.next() % 32)),
-            _ => inp.args[idx].wrapping_add(rng.next() % 9).wrapping_sub(4),
-        };
+    if p.calls.is_empty() {
+        p.calls.push(gen_call(rng, scratch, deny));
     }
-    inp
+    p
+}
+
+/// Program signature for crash dedup: fold the syscall-number sequence.
+fn prog_sig(p: &Prog) -> u32 {
+    p.calls.iter().fold(0u32, |s, c| s.wrapping_mul(31).wrapping_add(c.nr))
+}
+
+/// Write a program into the guest's `prog` buffer via its precomputed physical word addresses:
+/// layout is `[count][nr, a0..a5]*`.
+fn write_program(m: &mut fs_platform::Machine, prog_pas: &[u32], p: &Prog) {
+    use fs_mmu::Bus;
+    let n = p.calls.len().min(MAX_CALLS);
+    let _ = m.store(prog_pas[0], 4, n as u32);
+    for (i, call) in p.calls.iter().take(MAX_CALLS).enumerate() {
+        let base = 1 + i * 7;
+        let _ = m.store(prog_pas[base], 4, call.nr);
+        for (j, &a) in call.args.iter().enumerate() {
+            let _ = m.store(prog_pas[base + 1 + j], 4, a);
+        }
+    }
 }
 
 /// Snapshot-based, coverage-guided syscall fuzzer: boot to the agent's snapshot hypercall, then
@@ -216,16 +264,30 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     println!();
     eprintln!("fuzz: snapshot captured at pc={:#010x} after {} insns", cpu.pc, cpu.insns_retired);
 
-    let scratch = cpu.regs[11]; // a1 at the snapshot hypercall = agent's scratch buffer
-    eprintln!("fuzz: guest scratch buffer @ {scratch:#010x}");
+    // The agent passed a1 = program buffer, a2 = scratch buffer (both user VAs). Translate the
+    // program buffer's words to physical once (the mapping is stable across resets) so we can
+    // write each program cheaply.
+    let prog_va = cpu.regs[11];
+    let scratch = cpu.regs[12];
+    let mut prog_pas = Vec::with_capacity(1 + MAX_CALLS * 7);
+    for k in 0..(1 + MAX_CALLS * 7) as u32 {
+        match cpu.xlate(&mut m, prog_va + k * 4, fs_mmu::Access::Write) {
+            Ok(pa) => prog_pas.push(pa),
+            Err(_) => {
+                eprintln!("fuzz: could not translate guest program buffer @ {prog_va:#x}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    eprintln!("fuzz: prog buffer @ {prog_va:#010x}  scratch @ {scratch:#010x}");
     let snap = Snapshot::capture(&cpu, &mut m);
     let base_uart = m.uart.out.len();
 
-    // --- coverage-guided fuzz loop ---
+    // --- coverage-guided fuzz loop over syscall *programs* ---
     let mut cov = Coverage::new();
     let mut rng = Rng(seed.max(1));
     let deny = [93u32, 94, 142]; // exit, exit_group, reboot
-    let mut corpus: Vec<Input> = Vec::new();
+    let mut corpus: Vec<Prog> = Vec::new();
     let mut crash_sigs = std::collections::HashSet::new();
     let mut crashes = 0u32;
     let mut done = 0u32;
@@ -235,19 +297,16 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
 
     for case in 0..cases {
         // Mostly mutate the corpus, sometimes generate fresh (decision #48).
-        let input = if !corpus.is_empty() && rng.next() % 100 < 85 {
+        let prog = if !corpus.is_empty() && rng.next() % 100 < 85 {
             let base = &corpus[(rng.next() as usize) % corpus.len()];
-            mutate_input(&mut rng, base, scratch, &deny)
+            mutate_program(&mut rng, base, scratch, &deny)
         } else {
-            gen_input(&mut rng, scratch, &deny)
+            gen_program(&mut rng, scratch, &deny)
         };
 
         snap.reset(&mut cpu, &mut m);
         let case_start = cpu.insns_retired;
-        cpu.regs[17] = input.nr;
-        for (r, &a) in input.args.iter().enumerate() {
-            cpu.regs[10 + r] = a;
-        }
+        write_program(&mut m, &prog_pas, &prog);
 
         let before = cov.num_edges();
         let deadline = cpu.insns_retired + case_insns;
@@ -258,12 +317,12 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
         }
         total_case_insns += cpu.insns_retired - case_start;
 
-        // Coverage feedback: an input that reached new edges joins the corpus.
+        // Coverage feedback: a program that reached new edges joins the corpus.
         if cov.num_edges() > before {
-            corpus.push(input.clone());
+            corpus.push(prog.clone());
         }
 
-        // Crash oracle (decision #19), deduped by syscall number.
+        // Crash oracle (decision #19), deduped by program signature.
         let out = &m.uart.out[base_uart.min(m.uart.out.len())..];
         if has_marker(out, b"Oops")
             || has_marker(out, b"Kernel panic")
@@ -271,11 +330,9 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
             || has_marker(out, b"BUG:")
         {
             crashes += 1;
-            if crash_sigs.insert(input.nr) {
-                eprintln!(
-                    "fuzz: [CRASH] new signature: case {case} nr={} args={:08x?}",
-                    input.nr, input.args
-                );
+            if crash_sigs.insert(prog_sig(&prog)) {
+                let nrs: Vec<u32> = prog.calls.iter().map(|c| c.nr).collect();
+                eprintln!("fuzz: [CRASH] new signature: case {case} program nrs={nrs:?}");
             }
         }
 

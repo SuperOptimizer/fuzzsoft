@@ -56,6 +56,12 @@ static char scratch[4096] __attribute__((aligned(64)));
 void _start(void) {
     print("\n=== fuzzsoft agent: userspace ready, snapshot syscall-sequence fuzzing ===\n");
 
+    /* Fault in the buffers (Linux demand-pages .bss) so the emulator can translate them at
+     * snapshot time and write programs into them. */
+    for (unsigned i = 0; i < sizeof(prog) / 4; i++) prog[i] = 0;
+    for (unsigned i = 0; i < sizeof(scratch); i += 4096) scratch[i] = 0;
+    scratch[sizeof(scratch) - 1] = 0;
+
     for (;;) {
         hypercall(HC_SNAPSHOT, (long)prog, (long)scratch);
         unsigned n = prog[0];
