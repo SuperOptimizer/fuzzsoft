@@ -1,0 +1,17 @@
+[package]
+name = "fs-diff"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fs-diff"
+path = "src/main.rs"
+
+[dependencies]
+fs-mmu = { path = "../fs-mmu" }
+fs-riscv = { path = "../fs-riscv" }
+fs-loader = { path = "../fs-loader" }
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -53,3 +53,19 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Rust
+/target
+
+# external sources / build artifacts
+/third_party
+/firmware
+
+# fuzzsoft: baseline/reference trees and build outputs (kept out of git)
+/linux
+/qemu
+/syzkaller
+/image
+/workdir
+/build
+/manager.cfg

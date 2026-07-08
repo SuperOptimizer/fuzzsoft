@@ -1,0 +1,11 @@
+[package]
+name = "fs-riscv"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+fs-mmu = { path = "../fs-mmu" }
+
+[lints.rust]
+unsafe_code = "forbid"

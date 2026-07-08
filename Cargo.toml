@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/fs-mmu",
+    "crates/fs-cov",
+    "crates/fs-riscv",
+    "crates/fs-loader",
+    "crates/fs-cli",
+    "crates/fs-diff",
+    "crates/fs-platform",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.0.0"
+license = "MIT"
+
+# Correctness-first (decision #45): safe Rust everywhere in M0. We drop to `unsafe`
+# only in profiled hot spots later, and never in the decoder/MMU without a fight.
+[profile.release]
+opt-level = 3
+lto = "thin"
