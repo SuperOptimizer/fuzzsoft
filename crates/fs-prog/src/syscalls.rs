@@ -227,6 +227,19 @@ pub const SO_SNDBUF: u32 = 7;
 // IPPROTO_TCP.
 pub const SOL_NETLINK: u32 = 270;
 pub const NETLINK_ADD_MEMBERSHIP: u32 = 1; // uapi/linux/netlink.h
+
+// ---- wave 11: fault injection (fail_nth) arming preamble ----
+// See docs/bug-finding.md's "FAULT INJECTION FIRST": `/proc/self/fail-nth`
+// (fs/proc/base.c's `proc_fail_nth_operations`, gated `#ifdef CONFIG_FAULT_INJECTION`) lets a
+// task arm `should_fail_ex()` (lib/fault-inject.c) to fail exactly its Nth matching allocation,
+// then self-disarm. A single-entry pool, not a free string — this is a fixed control-file path,
+// not fuzzed data.
+pub const FAIL_NTH_PATH: &[&str] = &["/proc/self/fail-nth"];
+// Countdown values to arm: small decimal-ASCII strings. fs/proc/base.c's `proc_fail_nth_write`
+// parses via `kstrtouint_from_user`, which is fine with the `StringConst`'s own trailing NUL —
+// it copies exactly `count` bytes, appends its own terminator right after, and `kstrtouint` stops
+// parsing at the first non-digit byte either way.
+pub const FAIL_NTH_COUNTS: &[&str] = &["0", "1", "2", "3", "5", "8", "16"];
 // nlmsg_type real values (uapi/linux/netlink.h generic + uapi/linux/rtnetlink.h RTM_* subset).
 pub const NLMSG_TYPE: &[u32] = &[
     1,  /* NLMSG_NOOP */
@@ -2546,6 +2559,48 @@ pub static SYSCALLS: &[SyscallDesc] = &[
                 vals: SEND_FLAGS,
                 bitmask: true,
             },
+        ],
+        produces: Produces::None,
+    },
+
+    // ============ wave 11: fault injection arming (fail_nth) ============
+    // See docs/bug-finding.md's "FAULT INJECTION FIRST": `genr::prepend_fail_inject` prepends
+    // these two calls as a program preamble so a chosen kernel allocation can be made to fail on
+    // demand, reaching cleanup/error paths ordinary argument fuzzing structurally never
+    // exercises. Requires `CONFIG_FAULT_INJECTION=y` (firmware/Image.failinj); on a kernel built
+    // without it `openat$fail_nth` simply returns -ENOENT (the path doesn't exist), harmlessly —
+    // no boot or behavior impact on the stock/slubdebug kernels.
+
+    // 91. openat$fail_nth(56): dirfd (ignored — path is absolute), path="/proc/self/fail-nth",
+    //     flags=O_WRONLY, mode=0 -> fd.
+    SyscallDesc {
+        name: "openat$fail_nth",
+        nr: 56,
+        args: &[
+            Res(FD),
+            Ptr {
+                dir: In,
+                inner: &StringConst(FAIL_NTH_PATH),
+                nullable: false,
+            },
+            Const(1 /* O_WRONLY */),
+            Const(0),
+        ],
+        produces: Produces::Ret(FD),
+    },
+    // 92. write$fail_nth(64): fd (the fail-nth fd, ideally openat$fail_nth's), buf=ascii decimal
+    //     countdown value, count=len(buf) -> ssize.
+    SyscallDesc {
+        name: "write$fail_nth",
+        nr: 64,
+        args: &[
+            Res(FD),
+            Ptr {
+                dir: In,
+                inner: &StringConst(FAIL_NTH_COUNTS),
+                nullable: false,
+            },
+            Len { of: 1 },
         ],
         produces: Produces::None,
     },

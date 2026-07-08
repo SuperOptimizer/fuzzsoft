@@ -27,7 +27,7 @@ pub mod types;
 pub use batch::{mutate_batch, mutate_data};
 pub use cmplog::mutate_cmplog;
 pub use dict::{DICTIONARY_GROUPS, dictionary_len, pick_dict_const};
-pub use genr::generate;
+pub use genr::{generate, prepend_fail_inject};
 pub use lower::{
     CALL_WORDS, ConcreteCall, DEFAULT_SCRATCH_CAP, FIXUP_WORDS, Fixup, FixupSrc, Lowered,
     MAX_FIXUPS, ScratchWriter, WIRE_WORDS, lower, lower_with_cap, to_wire,

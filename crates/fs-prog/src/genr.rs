@@ -385,6 +385,72 @@ pub(crate) fn pick_res(rng: &mut Rng, want: ResourceKind, pool: &[PoolEntry]) ->
     }
 }
 
+/// Prepend the fail_nth arming preamble — `openat$fail_nth` -> `write$fail_nth`, with the
+/// second call's fd arg *guaranteed* (not left to `pick_res`'s probabilistic seed-vs-produced
+/// choice) to thread from the first call's own `Produces::Ret(FD)` — onto `prog`. See
+/// `docs/bug-finding.md`'s "FAULT INJECTION FIRST": this is the 2-call preamble a `--fail-inject`
+/// generator bias prepends to a fraction of generated programs so the fuzzer can arm a specific
+/// kernel allocation to fail before running the rest of the program against it.
+///
+/// Every pre-existing `ResRef::Produced` reference in `prog` is shifted forward by 2 call slots
+/// (the preamble now occupies indices 0-1), and the combined program is truncated to `MAX_CALLS`
+/// from the tail if it would otherwise overflow. Truncating only the tail is always safe: a
+/// well-formed program's resource references only ever point strictly backward (see
+/// `Prog::is_well_formed`), so no surviving call can have referenced one of the dropped ones.
+pub fn prepend_fail_inject(rng: &mut Rng, prog: Prog) -> Prog {
+    let openat_desc = SYSCALLS
+        .iter()
+        .find(|d| d.name == "openat$fail_nth")
+        .expect("openat$fail_nth description must exist");
+    let write_desc = SYSCALLS
+        .iter()
+        .find(|d| d.name == "write$fail_nth")
+        .expect("write$fail_nth description must exist");
+
+    let openat_call = TypedCall {
+        desc: openat_desc,
+        args: generate_args(rng, openat_desc, &[]),
+    };
+
+    let mut write_args = generate_args(rng, write_desc, std::slice::from_ref(&openat_call));
+    write_args[0] = ArgValue::Res(ResRef::Produced {
+        call_idx: 0,
+        slot: 0,
+    });
+    let write_call = TypedCall {
+        desc: write_desc,
+        args: write_args,
+    };
+
+    let mut calls: Vec<TypedCall> = Vec::with_capacity(2 + prog.calls.len());
+    calls.push(openat_call);
+    calls.push(write_call);
+    for mut call in prog.calls {
+        for av in &mut call.args {
+            shift_produced_call_idx(av, 2);
+        }
+        calls.push(call);
+    }
+    calls.truncate(MAX_CALLS);
+    Prog { calls }
+}
+
+/// Recursively add `shift` to every `ResRef::Produced`'s `call_idx` found in `av` — walks into
+/// `Struct` fields and `Ptr` pointees since a future description could nest a `Res` arg inside
+/// either (none of today's `SYSCALLS` do, but this stays correct if one ever does).
+fn shift_produced_call_idx(av: &mut ArgValue, shift: u16) {
+    match av {
+        ArgValue::Res(ResRef::Produced { call_idx, .. }) => *call_idx += shift,
+        ArgValue::Struct(fields) => {
+            for f in fields.iter_mut() {
+                shift_produced_call_idx(f, shift);
+            }
+        }
+        ArgValue::Ptr(inner) => shift_produced_call_idx(inner, shift),
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,6 +541,67 @@ mod tests {
                 "seed {seed} produced ill-formed program"
             );
         }
+    }
+
+    /// `prepend_fail_inject` must produce a well-formed program whose first two calls are the
+    /// fail_nth preamble, with call 1's fd arg *guaranteed* to thread from call 0 (a `Reg` fixup,
+    /// not a seed literal), and the whole thing must still lower cleanly to the fixed wire size.
+    #[test]
+    fn prepend_fail_inject_builds_a_well_formed_armed_preamble_that_lowers_cleanly() {
+        for seed in [1u32, 2, 3, 42, 999] {
+            let mut rng = Rng::new(seed);
+            let base = generate(&mut rng);
+            let armed = prepend_fail_inject(&mut rng, base);
+
+            assert!(armed.calls.len() >= 2);
+            assert!(armed.calls.len() <= MAX_CALLS);
+            assert_eq!(armed.calls[0].desc.name, "openat$fail_nth");
+            assert_eq!(armed.calls[1].desc.name, "write$fail_nth");
+            assert!(armed.is_well_formed(), "seed {seed}: armed program ill-formed");
+            assert_eq!(
+                armed.calls[1].args[0],
+                ArgValue::Res(ResRef::Produced {
+                    call_idx: 0,
+                    slot: 0
+                }),
+                "seed {seed}: write$fail_nth's fd arg must thread from openat$fail_nth"
+            );
+
+            let lowered = crate::lower::lower(&armed, 0xA000_0000);
+            let has_expected_fixup = lowered.fixups.iter().any(|f| {
+                f.dst_call == 1
+                    && f.dst_arg == 0
+                    && matches!(f.src, crate::lower::FixupSrc::Reg(0))
+            });
+            assert!(
+                has_expected_fixup,
+                "seed {seed}: expected a Reg(0) fixup threading call 0's fd into call 1's fd arg"
+            );
+
+            let wire = crate::lower::to_wire(&lowered);
+            assert_eq!(wire.len(), crate::lower::WIRE_WORDS);
+        }
+    }
+
+    /// Prepending onto an already-`MAX_CALLS`-long base program must truncate the tail (never
+    /// panic, never drop the preamble itself) and stay well-formed.
+    #[test]
+    fn prepend_fail_inject_truncates_a_full_length_base_program() {
+        let mut rng = Rng::new(5);
+        let mut base = generate(&mut rng);
+        let mut tries = 0;
+        while base.calls.len() < MAX_CALLS && tries < 500 {
+            base = generate(&mut rng);
+            tries += 1;
+        }
+        assert_eq!(base.calls.len(), MAX_CALLS, "never sampled a full-length base program");
+
+        let armed = prepend_fail_inject(&mut rng, base);
+        assert_eq!(armed.calls.len(), MAX_CALLS);
+        assert_eq!(armed.calls[0].desc.name, "openat$fail_nth");
+        assert_eq!(armed.calls[1].desc.name, "write$fail_nth");
+        assert!(armed.is_well_formed());
+        let _ = crate::lower::lower(&armed, 0xA000_0000);
     }
 
     #[test]

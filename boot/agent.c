@@ -26,7 +26,12 @@
 #define HC_EID 0x0A550000
 #define HC_SNAPSHOT 0
 #define HC_DONE 1
+#define SYS_mount 40
 #define SYS_write 64
+#define SYS_openat 56
+#define SYS_close 57
+#define AT_FDCWD (-100)
+#define O_WRONLY 1
 
 #define MAX_CALLS 8
 #define MAX_FIXUPS 32
@@ -67,6 +72,41 @@ static void print(const char *s) {
     do_syscall(SYS_write, 1, (unsigned)(long)s, n, 0, 0, 0);
 }
 
+/* Fault-injection boot-safety preamble (docs/bug-finding.md's "FAULT INJECTION FIRST"): mount
+ * proc/sysfs/debugfs and flip the failslab/fail_page_alloc ignore-gfp-wait knobs so a later
+ * per-case openat$fail_nth/write$fail_nth arms real GFP_KERNEL allocations, not just the ones
+ * failslab.ignore_gfp_reclaim exempts by default (mm/failslab.c, mm/fail_page_alloc.c: both
+ * default `ignore_gfp_reclaim = true`, i.e. the common GFP_KERNEL case is silently exempt until
+ * this is flipped to 0 via debugfs). Baked into the golden image (pre-snapshot, so it costs
+ * nothing per case) and written EXACTLY ONCE, here, before the fuzz loop starts.
+ *
+ * All of this is best-effort and MUST NOT affect boot on any other kernel image: on stock/
+ * slubdebug kernels (no CONFIG_FAULT_INJECTION / no CONFIG_DEBUG_FS knobs under these paths) the
+ * mounts either succeed harmlessly (proc/sysfs are always present) or fail (debugfs mount is a
+ * no-op error if unsupported), and every open/write below silently no-ops on a missing path.
+ * Every return value is deliberately ignored. */
+static void try_mount(const char *dev, const char *dir, const char *type) {
+    do_syscall(SYS_mount, (unsigned)(long)dev, (unsigned)(long)dir, (unsigned)(long)type, 0, 0, 0);
+}
+
+static void write_knob_zero(const char *path) {
+    long fd = do_syscall(SYS_openat, (unsigned)AT_FDCWD, (unsigned)(long)path, O_WRONLY, 0, 0, 0);
+    if ((int)fd < 0) return;
+    do_syscall(SYS_write, (unsigned)fd, (unsigned)(long)"0", 1, 0, 0, 0);
+    do_syscall(SYS_close, (unsigned)fd, 0, 0, 0, 0, 0);
+}
+
+static void arm_fault_injection_knobs(void) {
+    try_mount("none", "/proc", "proc");
+    try_mount("none", "/sys", "sysfs");
+    try_mount("none", "/sys/kernel/debug", "debugfs");
+
+    write_knob_zero("/sys/kernel/debug/failslab/ignore-gfp-wait");
+    write_knob_zero("/sys/kernel/debug/fail_page_alloc/ignore-gfp-wait");
+    write_knob_zero("/sys/kernel/debug/fail_page_alloc/ignore-gfp-highmem");
+    write_knob_zero("/sys/kernel/debug/fail_page_alloc/min-order");
+}
+
 /* Program buffer (fs-prog wire form) and a scratch data buffer for pointer args. Both are handed
  * to the emulator, which writes the program/scratch here and passes `scratch` as a valid pointer
  * base. results[] holds each call's a0 so later calls can thread produced resources (fds). */
@@ -82,6 +122,9 @@ void _start(void) {
     for (unsigned i = 0; i < WIRE_WORDS; i++) prog[i] = 0;
     for (unsigned i = 0; i < SCRATCH_SIZE; i += 4096) scratch[i] = 0;
     scratch[SCRATCH_SIZE - 1] = 0;
+
+    /* Pre-snapshot, one-time, error-tolerant: see arm_fault_injection_knobs()'s doc comment. */
+    arm_fault_injection_knobs();
 
     for (;;) {
         hypercall(HC_SNAPSHOT, (long)prog, (long)scratch);

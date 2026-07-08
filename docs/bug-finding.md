@@ -84,3 +84,33 @@ answers it.) Does the epoll overflow crash cleanly with VMAP_STACK off, or need 
 `fail_nth`'s single shared countdown precise enough in an 8-call program, or do most armed cases fail
 uninterestingly early? **Is phase-3 (bpf/io_uring) worth multi-week effort vs RV32/arch-specific
 surfaces syzkaller structurally can't reach?** — the highest-leverage strategic question, unresolved.
+
+## Shipped: fault-injection axis (build + agent + descriptions)
+
+The fault-injection mechanism above is built and boot-validated; only the fs-cli `--fail-inject`
+generator wiring is left (a deliberate follow-up for the lead, so fs-cli stays owned by one agent).
+
+- **Kernels** (`scripts/build-failinj-kernel.sh`, clean-worktree + `O=` pattern):
+  `firmware/Image.failinj` = `FAULT_INJECTION + FAILSLAB + FAIL_PAGE_ALLOC + FAULT_INJECTION_DEBUG_FS
+  + SLUB_DEBUG_ON` (verified stuck; `FAULT_INJECTION_USERCOPY` left OFF).
+  `firmware/Image.failinj.buggy` = same config + `scripts/failinj-bug.patch` = a hand-planted
+  double-free in `memfd_create()` gated on an *allocation-failure* branch (`p=kmalloc; if(p){
+  q=kmalloc; if(!q){ kfree(p); kfree(p); } }`) — dead code unless fault injection fails the 2nd
+  kmalloc, so it validates the whole arm→inject→crash→`kernel_crash_sig` chain (SLUB "Object already
+  free" report) without polluting the clean baseline.
+- **Agent** (`boot/agent.c`, pre-snapshot / baked into the golden image, all errors ignored):
+  mounts proc/sysfs/debugfs, writes `0` to `failslab/ignore-gfp-wait`,
+  `fail_page_alloc/{ignore-gfp-wait,ignore-gfp-highmem,min-order}` — flipping the load-bearing
+  `ignore_gfp_reclaim` default so `GFP_KERNEL` allocations actually fail. Harmless on kernels
+  without these paths (mounts/opens no-op). `boot/initramfs.spec` gains the mountpoint dirs.
+  Boot-validated: `Image.failinj` (2.12B insns) AND a stock-config kernel with this same agent
+  (1.74B insns) both reach the snapshot hypercall — no boot regression, no boot-insn bump needed.
+- **Descriptions** (`crates/fs-prog`): `openat$fail_nth` (opens `/proc/self/fail-nth` `O_WRONLY`)
+  and `write$fail_nth` (writes a small ASCII countdown), plus `prepend_fail_inject(rng, prog)` which
+  prepends the fd-threaded 2-call arming preamble (truncating the tail to `MAX_CALLS`). Wire
+  constants/public API otherwise unchanged.
+- **Left for the lead:** an fs-cli `--fail-inject[=PCT]` flag that calls
+  `fs_prog::prepend_fail_inject` on a fraction of generated programs (per-worker rng, composes with
+  `--jobs`), then validate `fuzz --fail-inject --kernel firmware/Image.failinj.buggy` fires
+  `[KERNEL CRASH]` while the same run on `firmware/Image.failinj` (and any run *without*
+  `--fail-inject`) stays clean.

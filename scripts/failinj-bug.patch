@@ -1,0 +1,38 @@
+diff --git a/mm/memfd.c b/mm/memfd.c
+--- a/mm/memfd.c
++++ b/mm/memfd.c
+@@ -510,6 +510,34 @@
+ 	unsigned int fd_flags;
+ 	int error;
+
++	/* FUZZSOFT PLANTED BUG (fault-injection variant) — NOT FOR PRODUCTION
++	 * Deliberate double-free, reachable ONLY when a kernel allocation fails. This validates the
++	 * fault-injection chain end-to-end (docs/bug-finding.md's "FAULT INJECTION FIRST"): arm
++	 * /proc/self/fail-nth against this kmalloc via fs-prog's openat$fail_nth/write$fail_nth
++	 * preamble (genr::prepend_fail_inject) -> the second kmalloc below fails -> fuzzsoft_p gets
++	 * freed twice -> SLUB_DEBUG's on-free consistency check reports the corruption -> the existing
++	 * kernel_crash_sig() console scan reports [KERNEL CRASH]. On an ordinary (both-allocations-
++	 * succeed) run, this is a no-op: each pointer is freed exactly once. Reachable only via
++	 * memfd_create(), which the fuzzer's own boot path never calls, so it does not affect
++	 * boot-to-snapshot. Do not upstream, do not merge into a real kernel build.
++	 */
++	{
++		char *fuzzsoft_p = kmalloc(32, GFP_KERNEL);
++		if (fuzzsoft_p) {
++			char *fuzzsoft_q = kmalloc(32, GFP_KERNEL);
++			if (!fuzzsoft_q) {
++				/* Allocation-FAILURE-only branch: double-free fuzzsoft_p. Dead code unless
++				 * fault injection is armed against this second kmalloc's fail-nth countdown. */
++				kfree(fuzzsoft_p);
++				kfree(fuzzsoft_p); /* DOUBLE FREE — only reachable on allocation failure above */
++			} else {
++				kfree(fuzzsoft_q);
++				kfree(fuzzsoft_p);
++			}
++		}
++	}
++	/* END FUZZSOFT PLANTED BUG */
++
+ 	error = sanitize_flags(&flags);
+ 	if (error < 0)
+ 		return error;
