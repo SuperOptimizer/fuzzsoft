@@ -18,14 +18,27 @@
 //!   masked-off lanes entirely, so a future k-mask-predicated AVX-512 step drops in over the same
 //!   field.
 //!
+//! On top of that scalar core, [`VecCpu::step`] now also carries a **converged-lane SIMD fast
+//! path** (`try_simd_alu_step`): when every active lane shares the same `pc` and independently
+//! fetches the identical instruction word from its own `Mmu`, the ALU-class instructions (OP-IMM
+//! / OP: add/sub/and/or/xor/sll/srl/sra/slt/sltu — the ones with a clean packed form,
+//! architecture.md §2) are decoded once and executed across all `LANES` lanes with a single
+//! `std::simd::Simd<u32, LANES>` operation, instead of `LANES` scalar `step_lane` calls. Anything
+//! that does not fit that shape (divergent pc, divergent instruction words, memory ops, branches/
+//! jumps, DIV/REM/MULH*) falls straight through to the scalar-over-lanes `step_lane` path below —
+//! see `DESIGN.md` for exactly what's vectorized today and what remains scalar on the road to real
+//! AVX-512.
+//!
 //! See `DESIGN.md` in this crate for the full AVX-512 target (interleaved MMU, `vmovdqa32`
 //! same-address fast path vs `vpgatherdd`/`vpscatterdd`, masked scalarize-16 fallback for
 //! DIV/REM/MULH, and where `unsafe` will eventually live).
 
+#![feature(portable_simd)]
 #![forbid(unsafe_code)]
 
 use fs_mmu::{Bus, Fault, Mmu};
 use fs_riscv::{decode, decode_compressed, AluOp, AmoOp, BranchOp, Inst, LoadOp, MulOp, StoreOp};
+use std::simd::prelude::*;
 
 /// Lanes per SoA batch. One AVX-512 ZMM register holds 16 packed `u32`s (architecture.md §2) —
 /// this is the eventual hardware vector width the AVX-512 executor will target directly.
@@ -66,6 +79,12 @@ pub struct VecCpu {
     pub exit: [Option<LaneExit>; LANES],
     /// Per-lane LR/SC reservation (A-extension), independent per hart/lane.
     reservation: [Option<u32>; LANES],
+    /// Number of `step()` calls that took the converged-lane SIMD ALU fast path
+    /// (`try_simd_alu_step`), as opposed to falling through to the scalar-over-lanes loop. One
+    /// `step()` call retiring all `LANES` lanes' ALU instruction counts once here — this is a
+    /// diagnostic/benchmark counter, not part of the executor's correctness contract (see the
+    /// `converged_straight_line_alu_program_uses_the_simd_fast_path` test and `examples/bench.rs`).
+    pub simd_alu_steps: u64,
 }
 
 impl VecCpu {
@@ -80,6 +99,7 @@ impl VecCpu {
             insns_retired: [0; LANES],
             exit: [None; LANES],
             reservation: [None; LANES],
+            simd_alu_steps: 0,
         }
     }
 
@@ -127,17 +147,115 @@ impl VecCpu {
     /// Advance every active lane by exactly one instruction, each against its own `Mmu`
     /// (`buses[lane]` — see DESIGN.md for the future interleaved single-shared layout).
     ///
-    /// Scalar-over-lanes loop (decision #45, correctness-first): each lane independently
-    /// fetches/decodes/executes via `fs_riscv::decode`/`decode_compressed` and the M-extension
-    /// semantics copied below, but the SoA layout + active mask keep a future AVX-512 lockstep
-    /// step a mechanical drop-in.
+    /// Tries the converged-lane SIMD ALU fast path first ([`VecCpu::try_simd_alu_step`]); if that
+    /// declines (returns `false`, having mutated nothing), falls back to the scalar-over-lanes
+    /// loop (decision #45, correctness-first): each lane independently fetches/decodes/executes
+    /// via `fs_riscv::decode`/`decode_compressed` and the M-extension semantics copied below, but
+    /// the SoA layout + active mask keep a future AVX-512 lockstep step a mechanical drop-in.
     pub fn step(&mut self, buses: &mut [Mmu]) {
         assert_eq!(buses.len(), LANES, "fs-vec: exactly one Mmu per lane");
+        if self.try_simd_alu_step(buses) {
+            return;
+        }
         for (lane, bus) in buses.iter_mut().enumerate() {
             if self.active[lane] {
                 self.step_lane(lane, bus);
             }
         }
+    }
+
+    /// Converged-lane SIMD fast path (architecture.md §2, DESIGN.md "Lockstep fetch/decode").
+    ///
+    /// Preconditions, all checked before anything is mutated:
+    /// - every active lane shares the same `pc` ([`VecCpu::lanes_converged`]);
+    /// - every active lane's *own* `Mmu` fetches the exact same instruction word at that `pc`
+    ///   (true whenever lanes share a byte-identical code page, the common case this executor
+    ///   targets — see DESIGN.md §3 on the eventual shared interleaved memory);
+    /// - that instruction decodes to `Inst::OpImm`/`Inst::Op` with an `AluOp` (add/sub/and/or/xor/
+    ///   sll/srl/sra/slt/sltu) — the subset with a clean packed `Simd<u32, LANES>` form.
+    ///
+    /// If any precondition fails (divergent pc, a faulting or disagreeing lane, a non-ALU
+    /// instruction), this returns `false` having mutated no state — `step`'s existing
+    /// scalar-over-lanes loop then handles the instruction exactly as before. Re-fetching in that
+    /// fallback is free of side effects (`ifetch16` is a pure load), so speculatively fetching
+    /// here first is always safe to discard.
+    ///
+    /// On success, the single scalar `decode` call replaces `LANES` of them, and the ALU op
+    /// itself runs as one masked `Simd<u32, LANES>` operation ([`simd_alu`]) instead of `LANES`
+    /// scalar ones — this is the throughput win `examples/bench.rs` measures.
+    fn try_simd_alu_step(&mut self, buses: &mut [Mmu]) -> bool {
+        let active = self.active;
+        if !self.lanes_converged() {
+            return false;
+        }
+        let Some(first) = active.iter().position(|&a| a) else {
+            return false; // no active lanes at all
+        };
+        let pc = self.pc[first];
+
+        // Every active lane fetches from its OWN Mmu (independent per-lane memory, DESIGN.md
+        // §3); the fast path additionally requires all of them to agree on the fetched bytes.
+        let mut iword_ilen: Option<(u32, u32)> = None;
+        for (lane, bus) in buses.iter_mut().enumerate() {
+            if !active[lane] {
+                continue;
+            }
+            let lo = match bus.ifetch16(pc) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            let (word, ilen) = if lo & 0x3 != 0x3 {
+                (lo as u32, 2u32)
+            } else {
+                let hi = match bus.ifetch16(pc.wrapping_add(2)) {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+                ((lo as u32) | ((hi as u32) << 16), 4u32)
+            };
+            match iword_ilen {
+                None => iword_ilen = Some((word, ilen)),
+                Some((w, _)) if w == word => {}
+                _ => return false, // lanes disagree on the encoded instruction bytes
+            }
+        }
+        let Some((iword, ilen)) = iword_ilen else {
+            return false;
+        };
+
+        let inst = if ilen == 2 { decode_compressed(iword as u16) } else { decode(iword) };
+        let (op, rd, rs1, b): (AluOp, u8, u8, Simd<u32, LANES>) = match inst {
+            Inst::OpImm { op, rd, rs1, imm } => (op, rd, rs1, Simd::splat(imm as u32)),
+            Inst::Op { op, rd, rs1, rs2 } => {
+                (op, rd, rs1, Simd::from_array(self.regs[rs2 as usize]))
+            }
+            _ => return false, // memory / branch / jump / mul-div / system: scalar path handles it
+        };
+
+        let active_mask: Mask<i32, LANES> = Mask::from_array(active);
+        let a: Simd<u32, LANES> = Simd::from_array(self.regs[rs1 as usize]);
+        let result = simd_alu(op, a, b);
+
+        // x0 is hardwired zero (never written, mirroring `wr_reg`); every other destination lane
+        // keeps its previous value where the active mask is clear.
+        if rd != 0 {
+            let prev: Simd<u32, LANES> = Simd::from_array(self.regs[rd as usize]);
+            self.regs[rd as usize] = active_mask.select(result, prev).to_array();
+        }
+
+        // No branch/jump/load/store in this instruction class, so every active lane's `pc`
+        // advances by the same `ilen` — still a masked vector op, not a per-lane scalar add.
+        let pc_vec: Simd<u32, LANES> = Simd::from_array(self.pc);
+        self.pc = active_mask.select(pc_vec + Simd::splat(ilen), pc_vec).to_array();
+
+        for (lane, &was_active) in active.iter().enumerate() {
+            if was_active {
+                self.insns_retired[lane] += 1;
+            }
+        }
+        self.simd_alu_steps += 1;
+
+        true
     }
 
     fn halt(&mut self, lane: usize, exit: LaneExit) {
@@ -313,6 +431,40 @@ fn alu(op: AluOp, a: u32, b: u32) -> u32 {
         AluOp::Xor => a ^ b,
         AluOp::Srl => a.wrapping_shr(b & 31),
         AluOp::Sra => ((a as i32).wrapping_shr(b & 31)) as u32,
+        AluOp::Or => a | b,
+        AluOp::And => a & b,
+    }
+}
+
+/// The `Simd<u32, LANES>`-packed twin of [`alu`] above: identical op semantics (wrapping
+/// arithmetic, `& 31` shift-amount masking, signed vs. unsigned compares), all `LANES` lanes at
+/// once instead of one lane at a time. This is the SIMD fast path's payload
+/// (`VecCpu::try_simd_alu_step`); the `simd_alu_fast_path_matches_scalar_alu_exhaustively` test
+/// below is what actually enforces that this and `alu` never disagree.
+///
+/// `std::simd`'s wrapping-integer arithmetic matches the plain scalar `u32` semantics required
+/// here (add/sub wrap silently, no overflow trap), so this needs no `wrapping_*` equivalents of
+/// its own — only the shift amount needs the explicit `& 31` mask that hardware shifts impose.
+#[inline]
+fn simd_alu(op: AluOp, a: Simd<u32, LANES>, b: Simd<u32, LANES>) -> Simd<u32, LANES> {
+    let shamt = b & Simd::splat(31u32);
+    match op {
+        AluOp::Add => a + b,
+        AluOp::Sub => a - b,
+        AluOp::Sll => a << shamt,
+        AluOp::Slt => {
+            let ai: Simd<i32, LANES> = a.cast();
+            let bi: Simd<i32, LANES> = b.cast();
+            ai.simd_lt(bi).select(Simd::splat(1), Simd::splat(0))
+        }
+        AluOp::Sltu => a.simd_lt(b).select(Simd::splat(1), Simd::splat(0)),
+        AluOp::Xor => a ^ b,
+        AluOp::Srl => a >> shamt,
+        AluOp::Sra => {
+            let ai: Simd<i32, LANES> = a.cast();
+            let shamt_i: Simd<i32, LANES> = shamt.cast();
+            (ai >> shamt_i).cast()
+        }
         AluOp::Or => a | b,
         AluOp::And => a & b,
     }
@@ -519,5 +671,188 @@ mod tests {
         let distinct: std::collections::HashSet<u32> =
             (0..LANES).map(|lane| vcpu.regs[A0 as usize][lane]).collect();
         assert_eq!(distinct.len(), LANES, "every lane should have a distinct sum");
+    }
+
+    /// A tiny xorshift PRNG (no external `rand` dependency, decision #26-style hermeticism) used
+    /// to fuzz [`simd_alu`] against the scalar [`alu`] it must never disagree with.
+    struct XorShift64(u64);
+    impl XorShift64 {
+        fn next_u32(&mut self) -> u32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 as u32
+        }
+    }
+
+    /// [`simd_alu`] is the SIMD fast path's payload; this is what actually proves it never
+    /// disagrees with the scalar [`alu`] it mirrors, across every `AluOp` and a wide spread of
+    /// `a`/`b` values (including the shift-amount-masking and signed-compare edge cases).
+    #[test]
+    fn simd_alu_fast_path_matches_scalar_alu_exhaustively() {
+        let ops = [
+            AluOp::Add,
+            AluOp::Sub,
+            AluOp::Sll,
+            AluOp::Slt,
+            AluOp::Sltu,
+            AluOp::Xor,
+            AluOp::Srl,
+            AluOp::Sra,
+            AluOp::Or,
+            AluOp::And,
+        ];
+        let mut rng = XorShift64(0x243f_6a88_85a3_08d3);
+        for op in ops {
+            for _ in 0..2_000 {
+                let a_arr: [u32; LANES] = std::array::from_fn(|_| rng.next_u32());
+                let b_arr: [u32; LANES] = std::array::from_fn(|_| rng.next_u32());
+                let result = simd_alu(op, Simd::from_array(a_arr), Simd::from_array(b_arr)).to_array();
+                for lane in 0..LANES {
+                    assert_eq!(
+                        result[lane],
+                        alu(op, a_arr[lane], b_arr[lane]),
+                        "op {op:?} lane {lane} a={:#x} b={:#x}",
+                        a_arr[lane],
+                        b_arr[lane]
+                    );
+                }
+            }
+        }
+    }
+
+    // --- Minimal R-type/I-type encoders for the ALU ops `fs_riscv::asm` doesn't expose helpers
+    // for (its `i_type`/`r_type` are private). Mirrors `decode`'s funct3/funct7 tables exactly
+    // (fs-riscv/src/lib.rs) — used only to hand-assemble the SIMD-fast-path test program below.
+    fn i_type(op: u32, funct3: u32, rd: u8, rs1: u8, imm: i32) -> u32 {
+        ((imm as u32 & 0xfff) << 20) | ((rs1 as u32) << 15) | (funct3 << 12) | ((rd as u32) << 7) | op
+    }
+    fn r_type(op: u32, funct3: u32, funct7: u32, rd: u8, rs1: u8, rs2: u8) -> u32 {
+        (funct7 << 25)
+            | ((rs2 as u32) << 20)
+            | ((rs1 as u32) << 15)
+            | (funct3 << 12)
+            | ((rd as u32) << 7)
+            | op
+    }
+    fn andi(rd: u8, rs1: u8, imm: i32) -> u32 {
+        i_type(0x13, 7, rd, rs1, imm)
+    }
+    fn xori(rd: u8, rs1: u8, imm: i32) -> u32 {
+        i_type(0x13, 4, rd, rs1, imm)
+    }
+    fn slli(rd: u8, rs1: u8, shamt: u8) -> u32 {
+        r_type(0x13, 1, 0x00, rd, rs1, shamt)
+    }
+    fn srli(rd: u8, rs1: u8, shamt: u8) -> u32 {
+        r_type(0x13, 5, 0x00, rd, rs1, shamt)
+    }
+    fn and_(rd: u8, rs1: u8, rs2: u8) -> u32 {
+        r_type(0x33, 7, 0x00, rd, rs1, rs2)
+    }
+    fn or_(rd: u8, rs1: u8, rs2: u8) -> u32 {
+        r_type(0x33, 6, 0x00, rd, rs1, rs2)
+    }
+    fn xor_(rd: u8, rs1: u8, rs2: u8) -> u32 {
+        r_type(0x33, 4, 0x00, rd, rs1, rs2)
+    }
+    fn sll_(rd: u8, rs1: u8, rs2: u8) -> u32 {
+        r_type(0x33, 1, 0x00, rd, rs1, rs2)
+    }
+    fn srl_(rd: u8, rs1: u8, rs2: u8) -> u32 {
+        r_type(0x33, 5, 0x00, rd, rs1, rs2)
+    }
+    fn sra_(rd: u8, rs1: u8, rs2: u8) -> u32 {
+        r_type(0x33, 5, 0x20, rd, rs1, rs2)
+    }
+    fn slt_(rd: u8, rs1: u8, rs2: u8) -> u32 {
+        r_type(0x33, 2, 0x00, rd, rs1, rs2)
+    }
+    fn sltu_(rd: u8, rs1: u8, rs2: u8) -> u32 {
+        r_type(0x33, 3, 0x00, rd, rs1, rs2)
+    }
+
+    /// A converged, branch-free, all-ALU program: every lane stays at the same `pc` for the
+    /// program's entire run (no branches to diverge on), so `step` should take the SIMD fast path
+    /// for every one of its `OP-IMM`/`OP` instructions. `T2` (x7) is the per-lane seed.
+    fn straight_line_alu_program() -> Vec<u32> {
+        use asm::*;
+        const T2: u8 = 7;
+        vec![
+            addi(T0, T2, 5),    // t0 = seed + 5
+            addi(T1, T2, -3),   // t1 = seed - 3
+            and_(T0, T0, T1),   // t0 &= t1
+            or_(T0, T0, T2),    // t0 |= seed
+            xor_(T0, T0, T1),   // t0 ^= t1
+            slli(T0, T0, 2),    // t0 <<= 2
+            srli(T1, T1, 1),    // t1 >>= 1 (logical)
+            add(T0, T0, T1),    // t0 += t1
+            sub(T0, T0, T2),    // t0 -= seed
+            sll_(T0, T0, T2),   // t0 <<= (seed & 31)
+            srl_(T0, T0, T2),   // t0 >>= (seed & 31) (logical)
+            sra_(T0, T0, T2),   // t0 >>= (seed & 31) (arithmetic)
+            slt_(T1, T0, T2),   // t1 = (t0 < seed) signed
+            sltu_(T1, T0, T2),  // t1 = (t0 < seed) unsigned (overwrites the signed result above)
+            andi(T0, T0, 0xff), // t0 &= 0xff
+            xori(T0, T0, 0x2a), // t0 ^= 0x2a
+            add(A0, T0, T1),    // a0 = t0 + t1 (final result)
+            addi(A7, X0, 93),   // a7 = exit
+            ecall(),
+        ]
+    }
+
+    /// Requirement 3: a converged straight-line ALU program — no branches, so lanes never
+    /// diverge in `pc` — must take `VecCpu::try_simd_alu_step`'s SIMD fast path for every ALU
+    /// instruction, and still land on exactly the same per-lane results as an independent scalar
+    /// `fs_riscv::Cpu` run seeded with that lane's input.
+    #[test]
+    fn converged_straight_line_alu_program_uses_the_simd_fast_path() {
+        const T2: u8 = 7;
+        let prog = straight_line_alu_program();
+        let mut buses: Vec<Mmu> = (0..LANES).map(|_| make_mmu(&prog)).collect();
+        let mut vcpu = VecCpu::new(BASE);
+        let seeds: [u32; LANES] = std::array::from_fn(|lane| (lane as u32) * 7 + 1);
+        for (lane, &seed) in seeds.iter().enumerate() {
+            vcpu.set_reg(lane, T2, seed);
+        }
+
+        let alu_insn_count = (prog.len() - 1) as u64; // every instruction except the trailing ecall
+
+        let mut guard = 0;
+        while vcpu.any_active() {
+            vcpu.step(&mut buses);
+            guard += 1;
+            assert!(guard < 1_000, "straight-line ALU program did not converge");
+        }
+
+        // The whole run (bar the final ecall) must have gone through the SIMD fast path — lanes
+        // never diverge in pc here, so there is no reason to ever fall back to scalar-over-lanes.
+        assert_eq!(
+            vcpu.simd_alu_steps, alu_insn_count,
+            "every ALU instruction in a converged, branch-free program should hit the SIMD fast \
+             path exactly once"
+        );
+
+        for (lane, &seed) in seeds.iter().enumerate() {
+            let scalar = run_scalar(&prog, Some((T2, seed)));
+            assert_eq!(
+                vcpu.exit[lane],
+                Some(LaneExit::Ecall { a0: scalar.regs[A0 as usize] }),
+                "lane {lane}"
+            );
+            for reg in 0..32 {
+                assert_eq!(
+                    vcpu.regs[reg][lane], scalar.regs[reg],
+                    "lane {lane} register x{reg} vs its scalar oracle"
+                );
+            }
+        }
+
+        // Sanity check that per-lane inputs really drove the computation rather than being
+        // ignored (the `0xff` mask and shifts make some seeds collide, so this only checks that
+        // results are not all identical, not that every one of the 16 is distinct).
+        let distinct: std::collections::HashSet<u32> =
+            (0..LANES).map(|lane| vcpu.regs[A0 as usize][lane]).collect();
+        assert!(distinct.len() > 1, "lanes should not all compute the same result");
     }
 }

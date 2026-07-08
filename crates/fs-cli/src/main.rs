@@ -137,7 +137,70 @@ fn pick_nr(rng: &mut Rng, deny: &[u32]) -> u32 {
     }
 }
 
+/// A typed argument kind — the first slice of the syzlang-lite model (docs/syzlang.md).
+#[derive(Clone, Copy)]
+enum A {
+    Fd,
+    Flag(&'static [u32]),
+    Ptr,
+    Len,
+    Int,
+}
+
+/// Real rv32 (asm-generic) syscall descriptions: valid numbers + roughly-typed args, so we
+/// generate *valid* syscalls (fds, flags, scratch pointers, lengths) instead of random numbers.
+/// Resource threading (fd return capture) is future work per the design doc.
+static SYS: &[(u32, &[A])] = &[
+    (56, &[A::Fd, A::Ptr, A::Flag(&[0, 1, 2, 0o100, 0o2000, 0o4000]), A::Int]), // openat(dirfd,path,flags,mode)
+    (57, &[A::Fd]),                                    // close(fd)
+    (63, &[A::Fd, A::Ptr, A::Len]),                    // read(fd,buf,count)
+    (64, &[A::Fd, A::Ptr, A::Len]),                    // write(fd,buf,count)
+    (62, &[A::Fd, A::Int, A::Flag(&[0, 1, 2])]),       // lseek(fd,off,whence)
+    (29, &[A::Fd, A::Int, A::Ptr]),                    // ioctl(fd,cmd,arg)
+    (61, &[A::Fd, A::Ptr, A::Len]),                    // getdents64(fd,buf,count)
+    (23, &[A::Fd]),                                    // dup(fd)
+    (25, &[A::Fd, A::Flag(&[0, 1, 2, 3, 4, 6]), A::Int]), // fcntl(fd,cmd,arg)
+    (59, &[A::Ptr, A::Flag(&[0, 0o4000])]),            // pipe2(fds,flags)
+    (198, &[A::Flag(&[1, 2, 10, 16]), A::Flag(&[1, 2, 3]), A::Int]), // socket(dom,type,proto)
+    (17, &[A::Ptr, A::Len]),                           // getcwd(buf,size)
+    (48, &[A::Fd, A::Ptr, A::Flag(&[0, 1, 2, 4]), A::Int]), // faccessat(dirfd,path,mode,flags)
+    (167, &[A::Int, A::Int, A::Int, A::Int, A::Int]),  // prctl
+    (291, &[A::Fd, A::Ptr, A::Flag(&[0, 0x800]), A::Int, A::Ptr]), // statx(dirfd,path,flags,mask,buf)
+    (25, &[A::Fd, A::Int, A::Int]),                    // fcntl generic
+    (66, &[A::Fd, A::Ptr, A::Len]),                    // writev
+    (172, &[]),                                        // getpid
+];
+
+fn gen_typed_arg(rng: &mut Rng, scratch: u32, kind: A) -> u32 {
+    match kind {
+        A::Fd => [0u32, 1, 2, (-1i32) as u32, (-100i32) as u32][rng.next() as usize % 5],
+        A::Flag(vals) => {
+            // one value, or an OR of a random subset (bitmask-ish)
+            if rng.next().is_multiple_of(2) {
+                vals[rng.next() as usize % vals.len()]
+            } else {
+                vals.iter().filter(|_| rng.next().is_multiple_of(2)).fold(0, |a, &v| a | v)
+            }
+        }
+        A::Ptr => scratch.wrapping_add((rng.next() % 8) * 8),
+        A::Len => (rng.next() % 4097).min(4096),
+        A::Int => gen_arg(rng, scratch),
+    }
+}
+
 fn gen_call(rng: &mut Rng, scratch: u32, deny: &[u32]) -> Call {
+    // Mostly generate a typed, valid syscall; occasionally a fully-random one for exploration.
+    if !rng.next().is_multiple_of(5) {
+        let (nr, sig) = SYS[rng.next() as usize % SYS.len()];
+        let mut args = [0u32; 6];
+        for (i, a) in args.iter_mut().enumerate() {
+            *a = match sig.get(i) {
+                Some(&k) => gen_typed_arg(rng, scratch, k),
+                None => 0,
+            };
+        }
+        return Call { nr, args };
+    }
     let mut args = [0u32; 6];
     for a in &mut args {
         *a = gen_arg(rng, scratch);

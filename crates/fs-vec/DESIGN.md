@@ -1,24 +1,86 @@
 # fs-vec — design notes
 
 `fs-vec` is the M4 vectorization foundation (`docs/architecture.md` §2, §8; `docs/decisions.md`
-#3, #4, #23, #45). What's implemented *today* is a safe-Rust, scalar-over-lanes SoA executor: it
-gets the state layout and masking contract right so that dropping in real AVX-512 execution later
-is mechanical, not a rewrite. This document records the AVX-512 target the current code is
-shaped for, and exactly what changes when we get there.
+#3, #4, #23, #45). What's implemented *today* is a safe-Rust SoA executor with a real (if partial)
+SIMD fast path on top of a scalar-over-lanes fallback: it gets the state layout and masking
+contract right so that growing the SIMD path towards real AVX-512 later is mechanical, not a
+rewrite. This document records what's vectorized now, the AVX-512 target the code is shaped for,
+and exactly what changes when we get there.
 
 ## What exists now
 
 - `VecCpu::regs: [[u32; LANES]; 32]` — SoA register file, `regs[reg][lane]`.
 - `VecCpu::pc: [u32; LANES]`, `VecCpu::active: [bool; LANES]` — per-lane PC and active mask.
-- `VecCpu::step` loops `for lane in 0..LANES { if active[lane] { step_lane(lane, ...) } }`,
-  each lane against its own `fs_mmu::Mmu`.
+- `VecCpu::step` first tries `try_simd_alu_step` (below); if that declines, it falls back to
+  `for lane in 0..LANES { if active[lane] { step_lane(lane, ...) } }`, each lane against its own
+  `fs_mmu::Mmu`.
 - `alu`/`muldiv` are byte-for-byte copies of `fs_riscv`'s private functions (same edge cases:
   DIV/0 → `0xffff_ffff`, REM/0 → dividend, `INT_MIN / -1` → DIV=`0x8000_0000`/REM=`0`, MULH* via
-  i64/u64 widening).
-- `#![forbid(unsafe_code)]` everywhere in this crate.
+  i64/u64 widening). `simd_alu` is the `Simd<u32, LANES>`-packed twin of `alu`, fuzz-tested against
+  it (`simd_alu_fast_path_matches_scalar_alu_exhaustively`).
+- `#![forbid(unsafe_code)]` everywhere in this crate — including the new SIMD path:
+  `#![feature(portable_simd)]` + `std::simd` is 100% safe Rust (decision #23), so no `unsafe` was
+  needed to add it.
 
-This is intentionally *not yet vectorized* — it is the scaffolding decision #45 asks for
-("correctness-first ... targeted `unsafe` in profiled hot spots only when justified").
+This used to be *not yet vectorized at all* — the scaffolding decision #45 asked for
+("correctness-first ... targeted `unsafe` in profiled hot spots only when justified"). It now has
+one real vectorized path (converged-lane ALU) built on that scaffolding, still with zero `unsafe`.
+
+## What's SIMD today vs. still scalar
+
+**SIMD (`try_simd_alu_step`, `std::simd::Simd<u32, 16>`/`Mask<i32, 16>`):**
+- Precondition: every active lane shares the same `pc` (`VecCpu::lanes_converged`) *and*
+  independently fetches the identical instruction word from its own `Mmu` at that `pc` (checked,
+  not assumed — see "Why fetch is still per-lane" below).
+- Payload: `Inst::OpImm`/`Inst::Op` for the ten `AluOp`s with a clean packed form — add, sub, and,
+  or, xor, sll, srl, sra, slt, sltu (this covers both 32-bit and their C-extension forms, since
+  `decode_compressed` already canonicalizes e.g. `c.addi`/`c.and`/`c.srli` down to
+  `Inst::OpImm`/`Inst::Op`). Decoded once, executed as one masked `Simd<u32, 16>` op
+  (`simd_alu`), pc advanced for all active lanes as one masked vector add.
+- `VecCpu::simd_alu_steps` counts how many `step()` calls took this path — a diagnostic used by
+  the fast-path test and `examples/bench.rs`, not part of the correctness contract.
+
+**Still scalar (`step_lane`, unchanged):**
+- Any pc or instruction-word divergence (`try_simd_alu_step` returns `false` having mutated
+  nothing, so falling through and re-fetching is free of side effects — `ifetch16` is a pure load).
+- All memory ops (`Load`/`Store`/`LrW`/`ScW`/`AmoW`) — no shared/interleaved MMU yet (see below).
+- All control flow (`Branch`/`Jal`/`Jalr`) — even when lanes agree on the branch outcome today,
+  computing "did every lane agree" and then packing the pc update is future work, not yet done.
+- `Mul`/muldiv (MUL/MULH*/DIV/DIVU/REM/REMU) — no packed form exists for these regardless of
+  convergence (architecture.md §2); always scalarized, exactly as designed originally.
+- `Ecall`/`Ebreak`/`Fence`/CSR-privileged/`Illegal` — one-off control instructions, not worth a
+  vector form.
+
+**Why fetch is still per-lane (the biggest remaining gap):** `try_simd_alu_step` calls
+`bus.ifetch16` once per *active lane* (not once for the whole group), because each lane still owns
+an independent `fs_mmu::Mmu` (requirement 3's original "simplest correct model", never revisited).
+It only saves the *decode* (run once, not `LANES` times) and the *ALU op itself* (one packed op,
+not `LANES` scalar ones) — not the fetch. Since fetch is a significant fraction of per-instruction
+cost, this caps the realistic speedup well below `LANES`x until the interleaved shared-memory
+design in "3. Memory" below lands and a converged group can fetch once for the whole group instead
+of once per lane.
+
+## Benchmark (`examples/bench.rs`)
+
+`cargo run --release --example bench -p fs-vec` runs the same RV32IM counting loop (fixed trip
+count → lanes stay pc-converged throughout; ~83% of dynamic instructions are ALU) on two engines
+that share the exact same decode/execute code paths:
+- `VecCpu::step` (SIMD fast path engages for every converged ALU instruction), vs.
+- `LANES` independent `fs_riscv::Cpu`s stepped one instruction at a time (what `VecCpu::step` did
+  before this fast path existed).
+
+Measured on this machine (release build, `std::time::Instant`, 16 lanes × 2000 loop iterations ×
+40 repeats = 15,363,200 lane-instructions on both sides — verified equal before computing a rate):
+
+```
+SIMD fast path:    15,363,200 lane-instructions in ~113–163ms  ≈ 95M–136M lane-instr/sec
+scalar-over-lanes: 15,363,200 lane-instructions in ~233–336ms  ≈ 46M– 66M lane-instr/sec
+speedup:           ~1.9x–2.1x across repeated runs
+```
+
+A ~2x, not ~16x, speedup is expected and consistent with "why fetch is still per-lane" above: the
+fetch — still done `LANES` times regardless of the fast path — is not eliminated yet, so this
+measures the win from eliminating `LANES`-fold redundant decode + scalarized ALU execution alone.
 
 ## The AVX-512 target (architecture.md §2)
 
@@ -105,11 +167,42 @@ scalar-`step_lane` *is* what the "scalar-execute divergent tails" path calls —
 away when AVX-512 lands, it becomes the minority-lane and DIV/REM/MULH* fallback path invoked
 from inside an otherwise-vectorized `step`.
 
+## Remaining gap to true AVX-512
+
+The converged-lane ALU fast path proves the shape works (decode once, execute once as a packed
+op, mask-predicate the writeback) but is still a long way from the architecture.md §2 target:
+
+1. **Interleaved shared MMU** (biggest gap, see "Why fetch is still per-lane" above). Each lane
+   still owns an independent `fs_mmu::Mmu`, so fetch — and every load/store — is `LANES` separate
+   calls regardless of convergence. The AVX-512 target's interleaved memory (§3 below) turns a
+   converged group's fetch into one shared read instead of 16 identical ones.
+2. **Gather/scatter for divergent memory** (§3 below). Not attempted at all yet — `Load`/`Store`/
+   `LrW`/`ScW`/`AmoW` always fall through to scalar `step_lane`, converged or not.
+3. **k-mask-predicated branches/jumps**. `Branch`/`Jal`/`Jalr` always scalarize today even when
+   every lane agrees on the outcome; packing "did every lane branch the same way" + a masked pc
+   update is straightforward follow-on work using the same `Mask<i32, LANES>` machinery
+   `try_simd_alu_step` already has.
+4. **Masked scalarize-16 for MULH*/DIV/REM**. Still exactly the `muldiv` scalar loop, as designed
+   from the start (§5 below) — there is no packed form to move to regardless of convergence, only
+   the *extraction*/*repacking* glue changes when this becomes real AVX-512 (`vpextrd`/`vpinsrd`
+   instead of Rust array indexing).
+5. **Real AVX-512 registers/intrinsics**. `std::simd::Simd<u32, 16>` is portable — it does not
+   guarantee it compiles to a single `zmm` register + AVX-512 instructions on this host; it may
+   lower to multiple narrower vector ops depending on target features enabled at compile time.
+   Confirming/forcing actual `zmm` codegen (`RUSTFLAGS="-C target-feature=+avx512f"` or explicit
+   intrinsics) is unverified — see "Where `unsafe`/intrinsics will go" below.
+
 ## Where `unsafe`/intrinsics will go
 
-This crate is `#![forbid(unsafe_code)]` today — there is no SIMD yet, only the SoA shape. When
-the AVX-512 executor is built (decision #23 allows either `std::simd`/portable_simd on nightly or
-raw `core::arch::x86_64` AVX-512 intrinsics):
+This crate is `#![forbid(unsafe_code)]` — the converged-lane ALU fast path added above is built
+entirely on safe `std::simd`/portable_simd (decision #23 explicitly allows this over raw
+intrinsics, and it needed zero `unsafe`). When the full AVX-512 executor is built out (the
+interleaved MMU, divergent-address gather/scatter, k-mask-predicated branches), decision #23 still
+allows either staying on `std::simd`/portable_simd on nightly (which does have safe
+`Simd::gather_or`/`Simd::scatter` helpers, but they index into a plain Rust slice by offset, not a
+fault-checked guest address through the permission/RAW-tracking `Mmu` this crate needs), or
+dropping to raw `core::arch::x86_64` AVX-512 intrinsics for the actual `vpgatherdd`/`vpscatterdd`
+hardware instructions once the interleaved memory layout exists to gather/scatter against:
 
 - A new module (e.g. `fs_vec::avx512`, likely a separate crate or `#[cfg(target_feature =
   "avx512f")]`-gated module) will hold the only `unsafe` blocks in the vectorized path: the
