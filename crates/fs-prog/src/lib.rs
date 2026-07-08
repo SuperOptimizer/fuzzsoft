@@ -4,12 +4,15 @@
 //! typed vocabulary for syscall arguments (`ArgType`), a resource model with fd/sock subtyping
 //! (`ResourceKind`), a starter table of real rv32 syscall descriptions (`SYSCALLS`), a program
 //! IR that threads resources between calls (`Prog`/`TypedCall`/`ArgValue`/`ResRef`), a
-//! deterministic generator/mutator (`generate`/`mutate`), and a lowering pass that compiles a
-//! typed program down to the concrete wire form fuzzsoft's guest agent understands (`lower`,
-//! `to_wire`).
+//! deterministic generator/mutator (`generate`/`mutate`), a lowering pass that compiles a typed
+//! program down to the concrete wire form fuzzsoft's guest agent understands (`lower`,
+//! `to_wire`), and a SIMD-shaped batch mutator (`mutate_batch`/`mutate_data`, see `batch`) that
+//! holds a program's control-flow skeleton fixed while diversifying only leaf data — so a batch
+//! of sibling programs stays control-flow convergent across the vectorized emulator's lanes.
 //!
 //! See `DESIGN.md` in this crate for the exact guest-agent wire protocol.
 
+pub mod batch;
 pub mod genr;
 pub mod lower;
 pub mod mutate;
@@ -19,6 +22,7 @@ pub mod rng;
 pub mod syscalls;
 pub mod types;
 
+pub use batch::{mutate_batch, mutate_data};
 pub use genr::generate;
 pub use lower::{
     CALL_WORDS, ConcreteCall, DEFAULT_SCRATCH_CAP, FIXUP_WORDS, Fixup, FixupSrc, Lowered,
