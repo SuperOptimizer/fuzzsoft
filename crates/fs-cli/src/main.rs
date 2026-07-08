@@ -9,6 +9,7 @@
 //! with no external toolchain (decision #26).
 
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use fs_cov::Coverage;
 use fs_loader::Program;
@@ -190,11 +191,49 @@ fn kernel_crash_sig(out: &[u8]) -> Option<u32> {
 // agent (`boot/agent.c`) interprets — call slots plus a resource-fixup table plus a scratch image.
 // See `crates/fs-prog/DESIGN.md` for the exact wire contract.
 
+// ---------------------------------------------------------------------------------------------
+// `GuestBus`: the per-case driver capability shared by `Machine` and `CowMachine` — CLINT
+// timer-sync + UART readback layered on top of `fs_mmu::Bus`. Lets program injection, the per-case
+// step loop, crash minimization, and seed replay all run generically over either backing store, so
+// the parallel (`--jobs`) path can drive `CowMachine` (shared-golden copy-on-write RAM,
+// `docs/cow-shared-ram.md`) through the exact same code the serial path drives `Machine` through.
+// `--sanitize` needs direct access to `Machine.ram: Mmu` for the sanitizer's poison/alloc
+// primitives, so it stays on the concrete `Machine`/`run_case` path, untouched by this trait.
+// ---------------------------------------------------------------------------------------------
+trait GuestBus: fs_mmu::Bus {
+    fn clint_mtime_set(&mut self, t: u64);
+    fn sync_timer(&self, cpu: &mut fs_riscv::Cpu);
+    fn uart_out(&self) -> &[u8];
+}
+
+impl GuestBus for fs_platform::Machine {
+    fn clint_mtime_set(&mut self, t: u64) {
+        self.clint.mtime = t;
+    }
+    fn sync_timer(&self, cpu: &mut fs_riscv::Cpu) {
+        fs_platform::sync_timer(cpu, self);
+    }
+    fn uart_out(&self) -> &[u8] {
+        &self.uart.out
+    }
+}
+
+impl GuestBus for fs_platform::CowMachine {
+    fn clint_mtime_set(&mut self, t: u64) {
+        self.clint.mtime = t;
+    }
+    fn sync_timer(&self, cpu: &mut fs_riscv::Cpu) {
+        fs_platform::sync_timer_cow(cpu, self);
+    }
+    fn uart_out(&self) -> &[u8] {
+        &self.uart.out
+    }
+}
+
 /// Write a slice of `u32` words into guest physical memory via its precomputed per-word physical
 /// addresses (`pas[k]` is the physical address of the k-th word). Extra `pas` beyond `words` are
 /// left untouched; the guest ignores slots past the counts it reads.
-fn write_words(m: &mut fs_platform::Machine, pas: &[u32], words: &[u32]) {
-    use fs_mmu::Bus;
+fn write_words<B: fs_mmu::Bus>(m: &mut B, pas: &[u32], words: &[u32]) {
     for (&pa, &w) in pas.iter().zip(words) {
         let _ = m.store(pa, 4, w);
     }
@@ -204,8 +243,7 @@ fn write_words(m: &mut fs_platform::Machine, pas: &[u32], words: &[u32]) {
 /// scratch region's precomputed per-word physical addresses. The image is zero-padded up to the
 /// number of scratch words actually translated; anything past that is beyond the guest buffer and
 /// dropped (the pointers `lower()` handed out never exceed the region cap).
-fn write_scratch_bytes(m: &mut fs_platform::Machine, pas: &[u32], bytes: &[u8]) {
-    use fs_mmu::Bus;
+fn write_scratch_bytes<B: fs_mmu::Bus>(m: &mut B, pas: &[u32], bytes: &[u8]) {
     for (i, &pa) in pas.iter().enumerate() {
         let off = i * 4;
         let mut word = [0u8; 4];
@@ -218,14 +256,45 @@ fn write_scratch_bytes(m: &mut fs_platform::Machine, pas: &[u32], bytes: &[u8]) 
     }
 }
 
-/// Reset to the snapshot, inject one program, run it to completion/deadline, and report the crash
-/// signature (faulting kernel PC) with the console text if it faulted. The single primitive both
-/// the fuzz loops and the crash minimizer use to execute a candidate program.
-#[allow(clippy::too_many_arguments)]
-fn inject_and_run(
+/// Generic per-case step loop over any `GuestBus` — the `CowMachine`-capable twin of `run_case`,
+/// used by the parallel `--jobs` path (and by crash minimization / seed replay, which are generic
+/// over `GuestBus` too). No sanitizer-hook support: `--sanitize` stays on `run_case`/`Machine`.
+fn run_case_bus<B: GuestBus>(
     cpu: &mut fs_riscv::Cpu,
-    m: &mut fs_platform::Machine,
-    snap: &fs_platform::Snapshot,
+    m: &mut B,
+    cov: &mut fs_cov::CovBitmap,
+    deadline: u64,
+) -> fs_platform::Stop {
+    use fs_platform::Stop;
+    use fs_riscv::SysExit;
+    while cpu.insns_retired < deadline {
+        m.clint_mtime_set(cpu.virtual_time());
+        m.sync_timer(cpu);
+        let prev = cpu.pc;
+        match cpu.step_system(m) {
+            SysExit::Continue => {
+                let cur = cpu.pc;
+                if cur != prev.wrapping_add(4) && cur != prev.wrapping_add(2) {
+                    cov.record_edge(prev, cur);
+                }
+            }
+            SysExit::Halt(c) => return Stop::Halt(c),
+            SysExit::Hypercall(c) => return Stop::Hypercall(c),
+        }
+    }
+    Stop::Budget
+}
+
+/// Reset (via the caller-supplied `reset` closure — `Snapshot::reset` for `Machine`, `reset_cow`
+/// for `CowMachine`), inject one program, run it to completion/deadline, and report the crash
+/// signature (faulting kernel PC) with the console text if it faulted. The single primitive both
+/// the fuzz loops and the crash minimizer use to execute a candidate program, generic over
+/// `GuestBus` so it drives the serial `Machine` path and the parallel `CowMachine` path identically.
+#[allow(clippy::too_many_arguments)]
+fn inject_and_run<B: GuestBus>(
+    cpu: &mut fs_riscv::Cpu,
+    m: &mut B,
+    mut reset: impl FnMut(&mut fs_riscv::Cpu, &mut B),
     prog: &fs_prog::Prog,
     scratch_va: u32,
     prog_pas: &[u32],
@@ -235,15 +304,16 @@ fn inject_and_run(
     run_map: &mut fs_cov::CovBitmap,
 ) -> (fs_platform::Stop, u64, Option<(u32, String)>) {
     let lowered = fs_prog::lower(prog, scratch_va);
-    snap.reset(cpu, m);
+    reset(cpu, m);
     let start = cpu.insns_retired;
     write_words(m, prog_pas, &fs_prog::to_wire(&lowered));
     write_scratch_bytes(m, scratch_pas, &lowered.scratch);
     run_map.clear();
     let deadline = cpu.insns_retired + case_insns;
-    let stop = run_case(cpu, m, run_map, deadline, None);
+    let stop = run_case_bus(cpu, m, run_map, deadline);
     let used = cpu.insns_retired - start;
-    let out = &m.uart.out[base_uart.min(m.uart.out.len())..];
+    let uart = m.uart_out();
+    let out = &uart[base_uart.min(uart.len())..];
     let crash = kernel_crash_sig(out).map(|sig| (sig, String::from_utf8_lossy(out).into_owned()));
     (stop, used, crash)
 }
@@ -279,10 +349,10 @@ fn subset_prog(prog: &fs_prog::Prog, keep: &[usize]) -> fs_prog::Prog {
 /// kernel crash signature. O(n²) re-runs, n ≤ MAX_CALLS = 8, so ≤ ~28 executions — cheap. Returns
 /// the minimized program plus the console text of its final reproducing run.
 #[allow(clippy::too_many_arguments)]
-fn minimize_program(
+fn minimize_program<B: GuestBus>(
     cpu: &mut fs_riscv::Cpu,
-    m: &mut fs_platform::Machine,
-    snap: &fs_platform::Snapshot,
+    m: &mut B,
+    mut reset: impl FnMut(&mut fs_riscv::Cpu, &mut B),
     prog: &fs_prog::Prog,
     target_sig: u32,
     scratch_va: u32,
@@ -302,7 +372,7 @@ fn minimize_program(
             cand.remove(pos);
             let sub = subset_prog(prog, &cand);
             let (_, _, crash) = inject_and_run(
-                cpu, m, snap, &sub, scratch_va, prog_pas, scratch_pas, case_insns, base_uart,
+                cpu, m, &mut reset, &sub, scratch_va, prog_pas, scratch_pas, case_insns, base_uart,
                 &mut run_map,
             );
             if let Some((sig, out)) = crash
@@ -393,10 +463,10 @@ fn emit_c_reproducer(prog: &fs_prog::Prog) -> String {
 /// (`crash_<sig>.txt`, syscall names + the oops console) and a compilable C reproducer
 /// (`crash_<sig>.c`). Best-effort — reports what it wrote to stderr.
 #[allow(clippy::too_many_arguments)]
-fn handle_new_crash(
+fn handle_new_crash<B: GuestBus>(
     cpu: &mut fs_riscv::Cpu,
-    m: &mut fs_platform::Machine,
-    snap: &fs_platform::Snapshot,
+    m: &mut B,
+    reset: impl FnMut(&mut fs_riscv::Cpu, &mut B),
     prog: &fs_prog::Prog,
     sig: u32,
     scratch_va: u32,
@@ -407,7 +477,7 @@ fn handle_new_crash(
 ) {
     let before = prog.calls.len();
     let (minimal, console) = minimize_program(
-        cpu, m, snap, prog, sig, scratch_va, prog_pas, scratch_pas, case_insns, base_uart,
+        cpu, m, reset, prog, sig, scratch_va, prog_pas, scratch_pas, case_insns, base_uart,
     );
     let names: Vec<&str> = minimal.calls.iter().map(|c| c.desc.name).collect();
     eprintln!(
@@ -604,10 +674,10 @@ fn save_corpus(dir: &str, corpus: &[fs_prog::Prog]) -> usize {
 /// virgin map and the coverage-minimized corpus (only programs that lit new buckets are kept — the
 /// same admission rule the main loop uses). Runs on one guest; each seed resets the snapshot.
 #[allow(clippy::too_many_arguments)]
-fn replay_seeds(
+fn replay_seeds<B: GuestBus>(
     cpu: &mut fs_riscv::Cpu,
-    m: &mut fs_platform::Machine,
-    snap: &fs_platform::Snapshot,
+    m: &mut B,
+    mut reset: impl FnMut(&mut fs_riscv::Cpu, &mut B),
     seeds: &[fs_prog::Prog],
     scratch_va: u32,
     prog_pas: &[u32],
@@ -620,7 +690,8 @@ fn replay_seeds(
     let mut corpus = Vec::new();
     for p in seeds {
         let (_, _, _) = inject_and_run(
-            cpu, m, snap, p, scratch_va, prog_pas, scratch_pas, case_insns, base_uart, &mut run_map,
+            cpu, m, &mut reset, p, scratch_va, prog_pas, scratch_pas, case_insns, base_uart,
+            &mut run_map,
         );
         if virgin.has_new_bits(&run_map) {
             corpus.push(p.clone());
@@ -768,8 +839,77 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
         prog_pas.len(),
         scratch_pas.len()
     );
-    let snap = Snapshot::capture(&cpu, &mut m);
     let base_uart = m.uart.out.len();
+
+    // --- multi-core path: N worker threads sharing ONE golden RAM image (`Arc<Golden>`) behind
+    // per-thread copy-on-write overlays (`CowMachine`), instead of N independent ~256 MB `Machine`
+    // clones (`docs/cow-shared-ram.md`, PR1-4, already on `main`). Handled first (and returns)
+    // because it must NOT build a `Snapshot` (another full golden RAM copy the parallel path has
+    // no use for) — it captures its own `Golden` straight from `m.ram` instead.
+    if jobs > 1 {
+        if sanitize {
+            eprintln!("fuzz: --jobs > 1 is incompatible with --sanitize (PC-hook path is serial)");
+            return ExitCode::FAILURE;
+        }
+        // Captured right here — after boot AND after the prog/scratch address translation above
+        // (which can set PTE A/D bits) — the exact instant `Snapshot::capture` would otherwise
+        // capture for the serial path below. `m` is dropped immediately after: `Golden` holds its
+        // own copy of the mem/perm planes, so the original `Machine`'s ~256 MB is no longer needed.
+        let golden = Arc::new(fs_mmu::Golden::from_mmu(&m.ram));
+        let golden_cpu = cpu.clone();
+        let golden_clint = m.clint.clone();
+        let golden_ram_base = m.ram.base();
+        let golden_ram_size = m.ram.size() as u32;
+        drop(m);
+
+        // Seed the corpus from a persisted --corpus-dir, replayed on one throwaway `CowMachine`
+        // over the same golden image (cheap: shares the `Arc`, only the seeds' dirtied pages
+        // allocate overlay storage) using the exact same reset primitive the workers use below.
+        let (seed_virgin, seed_corpus) = if let Some(dir) = &corpus_dir {
+            let seeds = load_corpus(dir);
+            if seeds.is_empty() {
+                eprintln!("fuzz: corpus-dir {dir} — no seeds loaded (fresh start)");
+                (VirginMap::new(), Vec::new())
+            } else {
+                let mut seed_cpu = golden_cpu.clone();
+                let mut seed_m = fs_platform::CowMachine::from_golden(
+                    Arc::clone(&golden),
+                    golden_ram_base,
+                    golden_ram_size,
+                );
+                let (v, c) = replay_seeds(
+                    &mut seed_cpu,
+                    &mut seed_m,
+                    |cpu, m| reset_cow(cpu, m, &golden_cpu, &golden_clint, base_uart),
+                    &seeds,
+                    scratch,
+                    &prog_pas,
+                    &scratch_pas,
+                    case_insns,
+                    base_uart,
+                );
+                eprintln!(
+                    "fuzz: corpus-dir {dir} — loaded {} seeds, {} kept after coverage replay ({} buckets)",
+                    seeds.len(),
+                    c.len(),
+                    v.covered_buckets()
+                );
+                (v, c)
+            }
+        } else {
+            (VirginMap::new(), Vec::new())
+        };
+
+        return run_parallel(
+            golden, golden_cpu, golden_clint, golden_ram_base, golden_ram_size, scratch, prog_pas,
+            scratch_pas, base_uart, case_insns, cases, seed, jobs, corpus_dir, seed_virgin,
+            seed_corpus,
+        );
+    }
+
+    // --- serial path (also `--sanitize`'s only path — it needs `Machine.ram: Mmu` directly for
+    // the sanitizer's poison/alloc primitives): a single `Machine` + golden `Snapshot`. ---
+    let snap = Snapshot::capture(&cpu, &mut m);
 
     // Optional emulator-level kernel-allocator sanitizer hooks (validation-only for now).
     let mut san_ctx = if sanitize {
@@ -818,8 +958,8 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
             (VirginMap::new(), Vec::new())
         } else {
             let (v, c) = replay_seeds(
-                &mut cpu, &mut m, &snap, &seeds, scratch, &prog_pas, &scratch_pas, case_insns,
-                base_uart,
+                &mut cpu, &mut m, |cpu, m| snap.reset(cpu, m), &seeds, scratch, &prog_pas,
+                &scratch_pas, case_insns, base_uart,
             );
             eprintln!(
                 "fuzz: corpus-dir {dir} — loaded {} seeds, {} kept after coverage replay ({} buckets)",
@@ -832,18 +972,6 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     } else {
         (VirginMap::new(), Vec::new())
     };
-
-    // --- multi-core path: N worker threads, one guest Machine per thread, shared coverage+corpus.
-    if jobs > 1 {
-        if sanitize {
-            eprintln!("fuzz: --jobs > 1 is incompatible with --sanitize (PC-hook path is serial)");
-            return ExitCode::FAILURE;
-        }
-        return run_parallel(
-            cpu, m, snap, scratch, prog_pas, scratch_pas, base_uart, case_insns, cases, seed, jobs,
-            corpus_dir, seed_virgin, seed_corpus,
-        );
-    }
 
     // --- coverage-guided fuzz loop over syscall *programs* ---
     let mut virgin = seed_virgin; // accumulated coverage (feedback), warm-started from the corpus
@@ -908,8 +1036,8 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
                 eprintln!("{}", String::from_utf8_lossy(out));
                 // Minimize + emit a C reproducer (resets the snapshot internally; safe mid-loop).
                 handle_new_crash(
-                    &mut cpu, &mut m, &snap, &prog, sig, scratch, &prog_pas, &scratch_pas,
-                    case_insns, base_uart,
+                    &mut cpu, &mut m, |cpu, m| snap.reset(cpu, m), &prog, sig, scratch, &prog_pas,
+                    &scratch_pas, case_insns, base_uart,
                 );
             }
         }
@@ -968,16 +1096,42 @@ struct Shared {
     finished: u64, // cases fully folded in (for progress reporting)
 }
 
-/// Multi-core coverage-guided fuzzing: boot/snapshot happened once on the caller's thread; here we
-/// clone that post-snapshot machine into `jobs` worker threads. Each thread owns its guest state
-/// and runs independent cases, claiming case indices from one atomic counter and sharing one
-/// [`Shared`] (coverage map + corpus + crash set). This is "fuzz many kernels at once" at *core*
-/// granularity — orthogonal to fs-vec's SIMD-lane vectorization (which packs many guests per core).
+/// Reset a per-worker `CowMachine` case to the golden post-boot state — the `CowMachine` analogue
+/// of `Snapshot::reset`, kept behavior-identical by construction: restore the hart to the golden
+/// clone, drop this lane's RAM overlays back to golden (`CowRam::reset` — O(dirty) directory
+/// entries dropped, zero byte copy-back, since golden is never mutated — cheaper even than
+/// `Mmu::reset_dirty`'s O(dirty) copy-back), restore the CLINT to its golden clone, and truncate
+/// UART output back to the pre-case length. Used for every per-case reset in the parallel path:
+/// worker cases, corpus-dir seed replay, and crash minimization re-runs alike.
+fn reset_cow(
+    cpu: &mut fs_riscv::Cpu,
+    m: &mut fs_platform::CowMachine,
+    golden_cpu: &fs_riscv::Cpu,
+    golden_clint: &fs_platform::Clint,
+    base_uart: usize,
+) {
+    *cpu = golden_cpu.clone();
+    m.ram.reset();
+    m.clint = golden_clint.clone();
+    m.uart.out.truncate(base_uart);
+}
+
+/// Multi-core coverage-guided fuzzing: boot/snapshot happened once on the caller's thread, which
+/// captured one immutable `Arc<Golden>` RAM image (`docs/cow-shared-ram.md`). Here `jobs` worker
+/// threads each build their OWN `CowMachine` — a small per-thread page directory + overlay pages —
+/// over that SAME shared golden image (the memory dedup: one ~256 MB golden image process-wide
+/// instead of one independent ~256 MB `Machine` clone per thread). Each thread owns its hart +
+/// `CowMachine` and runs independent cases, claiming case indices from one atomic counter and
+/// sharing one [`Shared`] (coverage map + corpus + crash set). This is "fuzz many kernels at once"
+/// at *core* granularity — orthogonal to fs-vec's SIMD-lane vectorization (which packs many guests
+/// per core).
 #[allow(clippy::too_many_arguments)]
 fn run_parallel(
-    cpu: fs_riscv::Cpu,
-    m: fs_platform::Machine,
-    snap: fs_platform::Snapshot,
+    golden: Arc<fs_mmu::Golden>,
+    golden_cpu: fs_riscv::Cpu,
+    golden_clint: fs_platform::Clint,
+    ram_base: u32,
+    ram_size: u32,
     scratch_va: u32,
     prog_pas: Vec<u32>,
     scratch_pas: Vec<u32>,
@@ -1006,19 +1160,24 @@ fn run_parallel(
     let counter = AtomicU64::new(0);
     let cases = cases as u64;
     let t0 = std::time::Instant::now();
-    eprintln!("fuzz: parallel mode — {jobs} worker threads, {cases} cases total");
+    eprintln!(
+        "fuzz: parallel mode — {jobs} worker threads, {cases} cases total (shared golden RAM, CoW overlays)"
+    );
 
     std::thread::scope(|s| {
         for tid in 0..jobs {
-            // Each worker gets its own guest state (cloned once from the golden snapshot) and a
-            // distinct RNG stream. `snap`/`prog_pas`/`scratch_pas`/`shared`/`counter`/`t0` are
-            // shared immutably by reference (thread::scope lets us borrow the stack).
-            let mut cpu_t = cpu.clone();
-            let mut m_t = m.clone();
+            // Each worker builds its own CowMachine sharing `golden` (the memory dedup — one
+            // golden RAM image behind every thread's small directory + overlay pages) and clones
+            // the golden hart; a distinct RNG stream per thread. `golden_cpu`/`golden_clint`/
+            // `prog_pas`/`scratch_pas`/`shared`/`counter`/`t0` are shared immutably by reference
+            // (thread::scope lets us borrow the stack).
+            let mut cpu_t = golden_cpu.clone();
+            let mut m_t = fs_platform::CowMachine::from_golden(Arc::clone(&golden), ram_base, ram_size);
             let seed_t = seed.wrapping_add(tid.wrapping_mul(0x9E37_79B9)).max(1);
             let shared = &shared;
             let counter = &counter;
-            let snap = &snap;
+            let golden_cpu = &golden_cpu;
+            let golden_clint = &golden_clint;
             let prog_pas = &prog_pas;
             let scratch_pas = &scratch_pas;
             let t0 = &t0;
@@ -1047,16 +1206,17 @@ fn run_parallel(
                     };
                     let lowered = fs_prog::lower(&prog, scratch_va);
 
-                    snap.reset(&mut cpu_t, &mut m_t);
+                    reset_cow(&mut cpu_t, &mut m_t, golden_cpu, golden_clint, base_uart);
                     let case_start = cpu_t.insns_retired;
                     write_words(&mut m_t, prog_pas, &fs_prog::to_wire(&lowered));
                     write_scratch_bytes(&mut m_t, scratch_pas, &lowered.scratch);
 
                     run_map.clear();
                     let deadline = cpu_t.insns_retired + case_insns;
-                    let stop = run_case(&mut cpu_t, &mut m_t, &mut run_map, deadline, None);
+                    let stop = run_case_bus(&mut cpu_t, &mut m_t, &mut run_map, deadline);
                     let used = cpu_t.insns_retired - case_start;
-                    let out = &m_t.uart.out[base_uart.min(m_t.uart.out.len())..];
+                    let uart = m_t.uart_out();
+                    let out = &uart[base_uart.min(uart.len())..];
                     let crash = kernel_crash_sig(out);
                     let crash_console =
                         crash.map(|sig| (sig, String::from_utf8_lossy(out).into_owned()));
@@ -1099,11 +1259,20 @@ fn run_parallel(
                     drop(sh);
 
                     // Minimize + write the reproducer outside the lock (it re-runs the guest ~n²
-                    // times on this thread's own state; other threads keep fuzzing meanwhile).
+                    // times on this thread's own state, dropping overlays between candidates via
+                    // `reset_cow`; other threads keep fuzzing meanwhile).
                     if let Some(sig) = new_crash {
                         handle_new_crash(
-                            &mut cpu_t, &mut m_t, snap, &prog, sig, scratch_va, prog_pas,
-                            scratch_pas, case_insns, base_uart,
+                            &mut cpu_t,
+                            &mut m_t,
+                            |cpu, m| reset_cow(cpu, m, golden_cpu, golden_clint, base_uart),
+                            &prog,
+                            sig,
+                            scratch_va,
+                            prog_pas,
+                            scratch_pas,
+                            case_insns,
+                            base_uart,
                         );
                     }
                 }
@@ -1598,6 +1767,94 @@ mod tests {
         assert!(deserialize_prog("NOPE 1 CALL foo 0").is_none());
         assert!(deserialize_prog("FSCORPUS1 1 CALL not_a_real_syscall 0").is_none());
         assert!(deserialize_prog("FSCORPUS1 99 CALL").is_none());
+    }
+
+    /// The fs-cli retrofit's correctness gate: the parallel (`--jobs`) path's new plumbing —
+    /// `GuestBus`, the generic `run_case_bus` step loop, and `reset_cow` (the `CowMachine` analogue
+    /// of `Snapshot::reset`) — must drive a `CowMachine` case to results byte-identical to
+    /// `run_case`/`Snapshot::reset` driving the same case over a `Machine`. `CowMachine` is already
+    /// proven byte-exact to `Machine` at the `Bus` level for arbitrary access streams
+    /// (`fs-platform`'s own `tests/cow_machine.rs`, PR2 of `docs/cow-shared-ram.md`, untouched by
+    /// this change); THIS test proves fs-cli's driver plumbing on top of that preserves the
+    /// equivalence — same coverage bitmap, same final registers/PC/insns_retired, same UART output,
+    /// same RAM contents — and does so across TWO resets in a row, so the reset step itself (not
+    /// just a fresh backing store) is proven behavior-identical, not merely first-run-identical.
+    #[test]
+    fn cow_machine_case_matches_machine_case() {
+        use fs_mmu::{Bus, PERM_EXEC, PERM_READ, PERM_WRITE};
+
+        let base = 0x8000_0000u32;
+        let size = 0x0001_0000u32; // 64 KiB — plenty for a tiny hand-assembled program.
+        let data_addr = base + 0x1000; // 4 KiB-aligned so a bare `lui` loads it whole.
+        let tohost = base + 0x2000;
+        const T2: u8 = 7; // x7 — not one of the named ABI aliases, used as a scratch pointer reg.
+        const T3: u8 = 28;
+        const T4: u8 = 29;
+
+        // A tiny deterministic "case": a 3-iteration counted store loop (so `run_case_bus` records
+        // at least one non-fall-through coverage edge — the backward branch), then an HTIF halt.
+        let mut code = Vec::new();
+        for w in [
+            asm::addi(fs_riscv::T0, fs_riscv::X0, 0), // t0 = 0 (counter)
+            asm::addi(fs_riscv::T1, fs_riscv::X0, 3), // t1 = 3 (bound)
+            asm::lui(T2, data_addr),                  // t2 = data_addr
+            asm::sw(T2, fs_riscv::T0, 0),              // loop: [t2] = t0
+            asm::addi(fs_riscv::T0, fs_riscv::T0, 1),  // t0 += 1
+            asm::bne(fs_riscv::T0, fs_riscv::T1, -8),  // back to the sw while t0 != 3
+            asm::lui(T3, tohost),
+            asm::addi(T4, fs_riscv::X0, 1),
+            asm::sw(T3, T4, 0), // HTIF halt (a write to `tohost` stops the hart)
+        ] {
+            code.extend_from_slice(&w.to_le_bytes());
+        }
+
+        // --- `Machine` + `Snapshot`: the serial path's backing store. ---
+        let mut m = fs_platform::Machine::new(base, size);
+        m.ram.protect(base, size, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+        m.ram.map(base, &code, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+        let mut cpu_m = fs_riscv::Cpu::new(base);
+        cpu_m.htif_tohost = Some(tohost);
+        let snap = fs_platform::Snapshot::capture(&cpu_m, &mut m);
+        let base_uart = m.uart.out.len();
+
+        // --- `CowMachine` over a `Golden` captured from that SAME state: the parallel path's
+        // backing store, built exactly as `cmd_fuzz`'s `--jobs > 1` branch builds it. ---
+        let golden = Arc::new(fs_mmu::Golden::from_mmu(&m.ram));
+        let golden_cpu = cpu_m.clone();
+        let golden_clint = m.clint.clone();
+        let mut cm = fs_platform::CowMachine::from_golden(Arc::clone(&golden), base, size);
+        let mut cpu_c = golden_cpu.clone();
+
+        // Run the identical case twice on each backing store — the second iteration's reset
+        // (`snap.reset` vs `reset_cow`) must land both machines back on identical golden state.
+        for iter in 0..2 {
+            snap.reset(&mut cpu_m, &mut m);
+            let mut cov_m = fs_cov::CovBitmap::new();
+            let deadline_m = cpu_m.insns_retired + 1000;
+            let stop_m = run_case_bus(&mut cpu_m, &mut m, &mut cov_m, deadline_m);
+
+            reset_cow(&mut cpu_c, &mut cm, &golden_cpu, &golden_clint, base_uart);
+            let mut cov_c = fs_cov::CovBitmap::new();
+            let deadline_c = cpu_c.insns_retired + 1000;
+            let stop_c = run_case_bus(&mut cpu_c, &mut cm, &mut cov_c, deadline_c);
+
+            assert_eq!(stop_m, stop_c, "iter {iter}: Stop mismatch");
+            assert_eq!(cpu_m.regs, cpu_c.regs, "iter {iter}: register mismatch");
+            assert_eq!(cpu_m.pc, cpu_c.pc, "iter {iter}: pc mismatch");
+            assert_eq!(
+                cpu_m.insns_retired, cpu_c.insns_retired,
+                "iter {iter}: insns_retired mismatch"
+            );
+            assert_eq!(cov_m.as_slice(), cov_c.as_slice(), "iter {iter}: coverage bitmap mismatch");
+            assert_eq!(m.uart.out, cm.uart.out, "iter {iter}: uart mismatch");
+            assert_eq!(
+                m.load(data_addr, 4).unwrap(),
+                cm.load(data_addr, 4).unwrap(),
+                "iter {iter}: final RAM content mismatch"
+            );
+            // The loop actually ran (sanity: this isn't vacuously comparing two no-ops).
+            assert_eq!(m.load(data_addr, 4).unwrap(), 2, "iter {iter}: loop didn't run as expected");
+        }
     }
 }
 
