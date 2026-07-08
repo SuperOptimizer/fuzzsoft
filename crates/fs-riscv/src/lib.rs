@@ -549,6 +549,72 @@ impl std::fmt::Display for Trap {
     }
 }
 
+/// Number of direct-mapped software-TLB slots. 256 entries cover a 1 MiB VA working set — ample
+/// for a kernel/syscall burst — at ~4 KiB per `Cpu` (cheap to clone on snapshot reset).
+const TLB_SIZE: usize = 256;
+
+/// One cached sv32 translation: a 4 KiB page's VA→PA plus its leaf permission bits.
+#[derive(Clone, Copy)]
+struct TlbEntry {
+    /// Virtual page number (`va >> 12`). `u32::MAX` (an impossible 20-bit VPN) marks an empty slot.
+    vpn: u32,
+    /// Physical page number (`pa >> 12`) for this page.
+    ppn: u32,
+    r: bool,
+    w: bool,
+    x: bool,
+    u: bool,
+    /// PTE dirty bit already set, so a write hit needn't re-walk just to set D.
+    d_set: bool,
+}
+
+impl TlbEntry {
+    const EMPTY: TlbEntry = TlbEntry {
+        vpn: u32::MAX,
+        ppn: 0,
+        r: false,
+        w: false,
+        x: false,
+        u: false,
+        d_set: false,
+    };
+}
+
+/// Software TLB: a direct-mapped VA→PA translation cache over the sv32 walk. A hit skips the two
+/// PTE memory reads (and the A/D writeback) the walk performs — the dominant per-access cost once
+/// paging is on. Flushed wholesale on `SFENCE.VMA` and on any write to `satp` (address-space
+/// switch) — the only points the guest is architecturally required to fence after editing page
+/// tables, so a stale entry can never be architecturally observed. Permission/privilege (U / SUM /
+/// MXR) and the dirty bit are re-checked per access against the cached raw PTE bits, so privilege
+/// transitions and read→write upgrades need no flush.
+#[derive(Clone)]
+struct Tlb {
+    entries: [TlbEntry; TLB_SIZE],
+}
+
+impl Tlb {
+    fn new() -> Self {
+        Tlb { entries: [TlbEntry::EMPTY; TLB_SIZE] }
+    }
+    #[inline]
+    fn flush(&mut self) {
+        self.entries = [TlbEntry::EMPTY; TLB_SIZE];
+    }
+    #[inline]
+    fn slot(vpn: u32) -> usize {
+        (vpn as usize) & (TLB_SIZE - 1)
+    }
+    #[inline]
+    fn get(&self, vpn: u32) -> Option<TlbEntry> {
+        let e = self.entries[Self::slot(vpn)];
+        (e.vpn == vpn).then_some(e)
+    }
+    #[inline]
+    fn insert(&mut self, e: TlbEntry) {
+        self.entries[Self::slot(e.vpn)] = e;
+    }
+}
+
 /// The scalar RV32IM core state.
 #[derive(Clone)]
 pub struct Cpu {
@@ -566,6 +632,8 @@ pub struct Cpu {
     /// If set, an `ecall` with `a7 == eid` is intercepted by the harness (a fuzzing hypercall)
     /// instead of being delivered to the guest kernel.
     pub hypercall_eid: Option<u32>,
+    /// Software TLB over the sv32 walk (flushed on SFENCE.VMA / satp write).
+    tlb: Tlb,
 }
 
 impl Cpu {
@@ -579,6 +647,7 @@ impl Cpu {
             privilege: Priv::M,
             csr: Csr::default(),
             hypercall_eid: None,
+            tlb: Tlb::new(),
         }
     }
 
@@ -621,6 +690,30 @@ impl Cpu {
         };
         let sum = self.csr.mstatus & sys::MSTATUS_SUM != 0;
         let mxr = self.csr.mstatus & sys::MSTATUS_MXR != 0;
+
+        // TLB consult: a hit reproduces the walk's leaf permission/privilege check against the
+        // cached raw PTE bits and returns the translation without touching the page tables. A write
+        // to a page whose dirty bit isn't known-set falls through to the walk (which sets D).
+        let page_vpn = va >> 12;
+        if let Some(e) = self.tlb.get(page_vpn) {
+            let perm_ok = match access {
+                Access::Exec => e.x,
+                Access::Read => e.r || (mxr && e.x),
+                Access::Write => e.w,
+            };
+            let priv_ok = match p {
+                Priv::U => e.u,
+                Priv::S => !(e.u && (access == Access::Exec || !sum)),
+                _ => true,
+            };
+            if !(perm_ok && priv_ok) {
+                return Err(fault(access));
+            }
+            if !(access == Access::Write && !e.d_set) {
+                return Ok((e.ppn << 12) | (va & 0xfff));
+            }
+            // else: write to a not-yet-dirty page — fall through to the walk to set D and refill.
+        }
 
         let vpn = [(va >> 12) & 0x3ff, (va >> 22) & 0x3ff];
         let mut a = (self.csr.satp & 0x3f_ffff) << 12; // root page-table PA
@@ -670,6 +763,17 @@ impl Cpu {
                 } else {
                     (((pte >> 10) & 0x3f_ffff) << 12) | (va & 0xfff)
                 };
+                // Refill the TLB with this leaf's translation + permission bits. `d_set` reflects
+                // whether the PTE's D bit is set now (originally, or just set by the write above).
+                self.tlb.insert(TlbEntry {
+                    vpn: page_vpn,
+                    ppn: pa >> 12,
+                    r: r == 1,
+                    w: w == 1,
+                    x: x == 1,
+                    u: u == 1,
+                    d_set: need_d || (pte >> 7) & 1 == 1,
+                });
                 return Ok(pa);
             }
             // Non-leaf: descend.
@@ -895,6 +999,11 @@ impl Cpu {
                     self.csr
                         .write(csr, new, self.privilege)
                         .map_err(|_| Trap::Illegal { pc, raw: iword })?;
+                    // A satp write switches the address space — every cached translation is now
+                    // for the wrong page tables. Flush (we key the TLB on VPN only, no ASID).
+                    if csr == sys::SATP {
+                        self.tlb.flush();
+                    }
                 }
                 self.wr_reg(rd, old);
             }
@@ -935,7 +1044,7 @@ impl Cpu {
                 next = self.csr.sepc;
             }
             Inst::Wfi => {} // no-op hint in a deterministic core
-            Inst::SfenceVma => {} // no software TLB yet
+            Inst::SfenceVma => self.tlb.flush(), // conservative: flush the whole software TLB
             Inst::Illegal(raw) => return Err(Trap::Illegal { pc, raw }),
         }
 
