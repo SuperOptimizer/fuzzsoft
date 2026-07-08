@@ -19,11 +19,13 @@
 //!   field.
 //!
 //! On top of that scalar core, [`VecCpu::step`] now also carries a **converged-lane SIMD fast
-//! path** (`try_simd_fast_step`, dispatching to `try_simd_alu` / `try_simd_branch` / `try_simd_jal`
-//! / `try_simd_jalr` / `try_simd_load` / `try_simd_store` / `try_simd_gather_load` /
-//! `try_simd_gather_store`): when every active lane shares the same `pc`, the whole group fetches
-//! its instruction **once** from the shared [`VecMmu`] (`VecMmu::ifetch16_same` — no more per-lane
-//! fetch, see `vec_mmu.rs`) and decodes it once. ALU-class instructions (OP-IMM / OP:
+//! path** (`try_simd_fast_step`, dispatching to `try_simd_lui` / `try_simd_auipc` / `try_simd_alu`
+//! / `try_simd_branch` / `try_simd_jal` / `try_simd_jalr` / `try_simd_load` / `try_simd_store` /
+//! `try_simd_gather_load` / `try_simd_gather_store` / `try_simd_mul`): when every active lane
+//! shares the same `pc`, the whole group fetches its instruction **once** from the shared
+//! [`VecMmu`] (`VecMmu::ifetch16_same` — no more per-lane fetch, see `vec_mmu.rs`) and decodes it
+//! once. `Lui`/`Auipc` are masked splats (an immediate, or `pc + imm` — `pc` is itself converged —
+//! written to every active lane's `rd`). ALU-class instructions (OP-IMM / OP:
 //! add/sub/and/or/xor/sll/srl/sra/slt/sltu — the ones with a clean packed form, architecture.md
 //! §2) execute across all `LANES` lanes with a single `std::simd::Simd<u32, LANES>` operation.
 //! `Branch`/`Jal`/`Jalr` are likewise fully packed: every lane computes its *own* branch
@@ -34,13 +36,17 @@
 //! common case) go through `VecMmu`'s same-address fast path in one more shared access; when
 //! addresses diverge instead, the shared fetch/decode/address-computation is still kept and only
 //! the actual memory access degrades to `VecMmu::load_gather`/`store_scatter` (`LANES` per-lane
-//! checked accesses, the safe-Rust stand-in for `vpgatherdd`/`vpscatterdd`). Only MUL/DIV/REM,
-//! atomics (`LrW`/`ScW`/`AmoW`), and one-off control instructions (`Ecall`/`Ebreak`/`Fence`/CSR)
-//! fall straight through to the scalar-over-lanes `step_lane` path below (as does anything at all
-//! when lanes' `pc` itself has diverged), now itself rewired onto the same shared `VecMmu`
-//! (`load_lane`/`store_lane`/`ifetch16_lane`) instead of a private per-lane `fs_mmu::Mmu` — see
-//! `DESIGN.md` for exactly what's vectorized today and what remains scalar on the road to real
-//! AVX-512.
+//! checked accesses, the safe-Rust stand-in for `vpgatherdd`/`vpscatterdd`). `Mul` (MUL/MULH*/
+//! DIV*/REM*) has no clean packed form (architecture.md §5), so it is masked-scalarized instead:
+//! the shared fetch/decode is still one shared access, but each active lane's result is computed
+//! individually via the scalar [`muldiv`] into a `[u32; LANES]` and scattered back with the active
+//! mask — the group stays converged (one shared fetch/decode/pc-advance) even though the multiply
+//! itself is not vectorized. Only atomics (`LrW`/`ScW`/`AmoW`) and one-off control instructions
+//! (`Ecall`/`Ebreak`/`Fence`/CSR) fall straight through to the scalar-over-lanes `step_lane` path
+//! below (as does anything at all when lanes' `pc` itself has diverged), now itself rewired onto
+//! the same shared `VecMmu` (`load_lane`/`store_lane`/`ifetch16_lane`) instead of a private
+//! per-lane `fs_mmu::Mmu` — see `DESIGN.md` for exactly what's vectorized today and what remains
+//! scalar on the road to real AVX-512.
 //!
 //! See `DESIGN.md` in this crate for the full AVX-512 target (interleaved MMU — now implemented
 //! in safe Rust in [`vec_mmu`] — `vmovdqa32` same-address fast path vs `vpgatherdd`/`vpscatterdd`,
@@ -135,6 +141,14 @@ pub struct VecCpu {
     /// eventually replace. A diagnostic/benchmark counter alongside `simd_mem_steps`, not part of
     /// the correctness contract.
     pub simd_gather_steps: u64,
+    /// Number of `step()` calls that took the converged-lane, masked-scalarize MUL/DIV/REM fast
+    /// path (`try_simd_mul`): the group still shares one fetch/decode and one vector `pc`-advance,
+    /// but MUL/MULH*/DIV*/REM* have no clean packed form (architecture.md §5), so each active
+    /// lane's result is computed individually via the scalar [`muldiv`] and scattered back with
+    /// the active mask — unlike `simd_gather_steps`, it's the arithmetic itself being scalarized,
+    /// not a memory access degrading to per-lane. A diagnostic/benchmark counter, not part of the
+    /// correctness contract.
+    pub simd_muldiv_steps: u64,
 }
 
 impl VecCpu {
@@ -153,6 +167,7 @@ impl VecCpu {
             simd_mem_steps: 0,
             simd_branch_steps: 0,
             simd_gather_steps: 0,
+            simd_muldiv_steps: 0,
         }
     }
 
@@ -227,6 +242,9 @@ impl VecCpu {
     ///   has diverged decline here and fall back to `step_lane`'s per-lane fetch).
     ///
     /// Given a single decode, dispatches to the payload that matches the instruction class:
+    /// - `Inst::Lui` -> [`VecCpu::try_simd_lui`]; `Inst::Auipc` -> [`VecCpu::try_simd_auipc`] —
+    ///   both trivial masked splats (an immediate, or `pc + imm`, written to every active lane's
+    ///   `rd`), always fully packed.
     /// - `Inst::OpImm`/`Inst::Op` -> [`VecCpu::try_simd_alu`] (packed ALU, `Simd<u32, LANES>`).
     /// - `Inst::Branch` -> [`VecCpu::try_simd_branch`]; `Inst::Jal`/`Inst::Jalr` ->
     ///   [`VecCpu::try_simd_jal`]/[`VecCpu::try_simd_jalr`] — every active lane computes its own
@@ -240,8 +258,11 @@ impl VecCpu {
     ///   through to [`VecCpu::try_simd_gather_load`]/[`VecCpu::try_simd_gather_store`] instead of
     ///   declining outright — the shared fetch/decode/address-computation is kept even though the
     ///   underlying access is still `LANES` independent per-lane ones.
-    /// - anything else (MUL/DIV/REM, atomics, system) -> `false`, `step`'s scalar-over-lanes loop
-    ///   handles it exactly as before.
+    /// - `Inst::Mul` (MUL/MULH*/DIV*/REM*) -> [`VecCpu::try_simd_mul`]: no clean packed form
+    ///   exists, so this masked-scalarizes — the shared fetch/decode/pc-advance is kept, only the
+    ///   multiply/divide itself runs one lane at a time via the scalar [`muldiv`].
+    /// - anything else (atomics, system) -> `false`, `step`'s scalar-over-lanes loop handles it
+    ///   exactly as before.
     ///
     /// Re-fetching in the fallback is free of side effects (fetch/load are pure reads until a
     /// same-address store commits), so speculatively decoding here first is always safe to
@@ -262,13 +283,16 @@ impl VecCpu {
         let inst = if ilen == 2 { decode_compressed(iword as u16) } else { decode(iword) };
 
         match inst {
+            Inst::Lui { .. } => self.try_simd_lui(inst, ilen, active),
+            Inst::Auipc { .. } => self.try_simd_auipc(inst, ilen, active),
             Inst::OpImm { .. } | Inst::Op { .. } => self.try_simd_alu(inst, ilen, active),
             Inst::Branch { .. } => self.try_simd_branch(inst, ilen, active),
             Inst::Jal { .. } => self.try_simd_jal(inst, ilen, active),
             Inst::Jalr { .. } => self.try_simd_jalr(inst, ilen, active),
             Inst::Load { .. } => self.try_simd_load(inst, ilen, active, mmu),
             Inst::Store { .. } => self.try_simd_store(inst, ilen, active, mmu),
-            _ => false, // mul-div / atomics / system: scalar path handles it
+            Inst::Mul { .. } => self.try_simd_mul(inst, ilen, active),
+            _ => false, // atomics / system: scalar path handles it
         }
     }
 
@@ -287,6 +311,49 @@ impl VecCpu {
                 self.insns_retired[lane] += 1;
             }
         }
+    }
+
+    /// Packed `lui` payload: `inst` must be `Inst::Lui` (checked by the caller). `imm` is the one
+    /// shared decoded instruction's immediate, so this is a trivial masked splat — write `imm` to
+    /// every active lane's `rd`, no per-lane computation at all. Never declines once dispatched
+    /// here.
+    fn try_simd_lui(&mut self, inst: Inst, ilen: u32, active: [bool; LANES]) -> bool {
+        let Inst::Lui { rd, imm } = inst else {
+            return false;
+        };
+        let active_mask: Mask<i32, LANES> = Mask::from_array(active);
+
+        if rd != 0 {
+            let prev: Simd<u32, LANES> = Simd::from_array(self.regs[rd as usize]);
+            self.regs[rd as usize] = active_mask.select(Simd::splat(imm), prev).to_array();
+        }
+        self.advance_pc_converged(active_mask, ilen);
+        self.retire_active(active);
+        self.simd_alu_steps += 1;
+        true
+    }
+
+    /// Packed `auipc` payload: `inst` must be `Inst::Auipc` (checked by the caller). `pc + imm` is
+    /// identical across every active lane (both `pc` and `imm` are converged — `imm` comes from
+    /// the one shared decoded instruction), so like `lui` above this is a masked splat-style
+    /// computation, just derived from `pc` instead of hardcoded — one shared vector add instead of
+    /// `LANES` per-lane ones. Never declines once dispatched here.
+    fn try_simd_auipc(&mut self, inst: Inst, ilen: u32, active: [bool; LANES]) -> bool {
+        let Inst::Auipc { rd, imm } = inst else {
+            return false;
+        };
+        let active_mask: Mask<i32, LANES> = Mask::from_array(active);
+        let pc_vec: Simd<u32, LANES> = Simd::from_array(self.pc);
+        let result = pc_vec + Simd::splat(imm);
+
+        if rd != 0 {
+            let prev: Simd<u32, LANES> = Simd::from_array(self.regs[rd as usize]);
+            self.regs[rd as usize] = active_mask.select(result, prev).to_array();
+        }
+        self.advance_pc_converged(active_mask, ilen);
+        self.retire_active(active);
+        self.simd_alu_steps += 1;
+        true
     }
 
     /// Packed ALU payload: `inst` must be `Inst::OpImm`/`Inst::Op` (checked by the caller,
@@ -622,6 +689,43 @@ impl VecCpu {
         self.advance_pc_converged(succeeded_mask, ilen);
         self.retire_active(succeeded);
         self.simd_gather_steps += 1;
+        true
+    }
+
+    /// Masked-scalarize MUL/DIV/REM payload: `inst` must be `Inst::Mul` (checked by the caller).
+    /// MUL/MULH*/DIV*/REM* (architecture.md §5) have no clean packed SIMD form — unlike every
+    /// other payload above, this one does NOT vectorize its actual computation. What it DOES keep
+    /// converged is everything around the computation: the shared fetch/decode already done by
+    /// the caller, and one vector `pc`-advance/retire here, exactly like the packed payloads. Each
+    /// active lane's result is computed individually via the scalar [`muldiv`] — the exact same
+    /// function `step_lane`'s `Inst::Mul` arm calls, so this is byte-identical to the scalar path
+    /// by construction, not merely by testing — into a `[u32; LANES]` buffer, then scattered back
+    /// to `rd` with the active mask in one masked vector select, the same shape
+    /// `try_simd_gather_load` already uses for its per-lane-computed values. The point is to stop a
+    /// single MUL from dropping an otherwise-converged group all the way to `step_lane`'s per-lane
+    /// re-fetch for that step; never declines once dispatched here.
+    fn try_simd_mul(&mut self, inst: Inst, ilen: u32, active: [bool; LANES]) -> bool {
+        let Inst::Mul { op, rd, rs1, rs2 } = inst else {
+            return false;
+        };
+        let active_mask: Mask<i32, LANES> = Mask::from_array(active);
+        let a = self.regs[rs1 as usize];
+        let b = self.regs[rs2 as usize];
+
+        let mut result = [0u32; LANES];
+        for lane in 0..LANES {
+            if active[lane] {
+                result[lane] = muldiv(op, a[lane], b[lane]);
+            }
+        }
+
+        if rd != 0 {
+            let prev: Simd<u32, LANES> = Simd::from_array(self.regs[rd as usize]);
+            self.regs[rd as usize] = active_mask.select(Simd::from_array(result), prev).to_array();
+        }
+        self.advance_pc_converged(active_mask, ilen);
+        self.retire_active(active);
+        self.simd_muldiv_steps += 1;
         true
     }
 
@@ -1299,6 +1403,239 @@ mod tests {
     }
     fn sltu_(rd: u8, rs1: u8, rs2: u8) -> u32 {
         r_type(0x33, 3, 0x00, rd, rs1, rs2)
+    }
+
+    /// U-type `auipc` encoder — `fs_riscv::asm` only exposes `lui` (opcode `0x37`); `auipc` is the
+    /// same U-type shape at opcode `0x17` (see `decode`'s opcode table, `fs-riscv/src/lib.rs`).
+    fn auipc(rd: u8, imm: u32) -> u32 {
+        (imm & 0xffff_f000) | ((rd as u32) << 7) | 0x17
+    }
+
+    // M-extension R-type encoders (opcode 0x33, funct7 0x01) — `fs_riscv::asm` only exposes `mul`
+    // (funct3 0); the rest mirror `decode`'s MulOp funct3 table (fs-riscv/src/lib.rs) exactly.
+    fn mulh(rd: u8, rs1: u8, rs2: u8) -> u32 {
+        r_type(0x33, 1, 0x01, rd, rs1, rs2)
+    }
+    fn mulhsu(rd: u8, rs1: u8, rs2: u8) -> u32 {
+        r_type(0x33, 2, 0x01, rd, rs1, rs2)
+    }
+    fn mulhu(rd: u8, rs1: u8, rs2: u8) -> u32 {
+        r_type(0x33, 3, 0x01, rd, rs1, rs2)
+    }
+    fn div_(rd: u8, rs1: u8, rs2: u8) -> u32 {
+        r_type(0x33, 4, 0x01, rd, rs1, rs2)
+    }
+    fn divu_(rd: u8, rs1: u8, rs2: u8) -> u32 {
+        r_type(0x33, 5, 0x01, rd, rs1, rs2)
+    }
+    fn rem_(rd: u8, rs1: u8, rs2: u8) -> u32 {
+        r_type(0x33, 6, 0x01, rd, rs1, rs2)
+    }
+    fn remu_(rd: u8, rs1: u8, rs2: u8) -> u32 {
+        r_type(0x33, 7, 0x01, rd, rs1, rs2)
+    }
+
+    /// One M-extension encoder's signature — named so the `(encoder, name)` tables below
+    /// (`simd_mul_family_fast_path_matches_step_lane_exactly` and its edge-case twin) don't trip
+    /// clippy's `type_complexity` lint.
+    type MulEncoder = fn(u8, u8, u8) -> u32;
+
+    /// Runs ONE `step()` through `VecCpu`'s converged SIMD fast path (`fast`), and the exact same
+    /// single step through the scalar `step_lane` fallback, lane by lane (`reference`), starting
+    /// both from identical per-lane register state (`regs[reg][lane]`, x0 ignored). Asserts every
+    /// lane's `pc` and all 32 registers match exactly, then returns both CPUs so the caller can
+    /// make additional assertions (e.g. on which `simd_*_steps` counter advanced).
+    ///
+    /// This is the strongest correctness check available for a new converged fast-path payload: it
+    /// does not lean on the scalar `fs_riscv::Cpu` oracle's own step matching `step_lane` (that is
+    /// already established by the `identical_lanes_match_each_other_and_the_scalar_golden_model`
+    /// family above) — it proves the NEW fast path and the EXISTING scalar `step_lane` fallback
+    /// never disagree, lane for lane, register for register, one instruction at a time.
+    ///
+    /// Takes the two `VecMmu`s by reference rather than building them itself: every instruction
+    /// class tested this way (`lui`/`auipc`/the MUL family) only ever reads/writes registers, never
+    /// memory, so the SAME pair of `VecMmu`s (holding the one fixed test program) can be reused
+    /// across many random-register draws — callers doing property-test-style loops build the mmus
+    /// once outside the loop instead of paying `VecMmu::new`'s setup cost every draw.
+    fn assert_fast_path_step_matches_step_lane(
+        mmu_fast: &mut VecMmu,
+        mmu_ref: &mut VecMmu,
+        regs: [[u32; LANES]; 32],
+    ) -> (VecCpu, VecCpu) {
+        let mut fast = VecCpu::new(BASE);
+        let mut reference = VecCpu::new(BASE);
+        for (reg, reg_row) in regs.iter().enumerate().skip(1) {
+            for (lane, &v) in reg_row.iter().enumerate() {
+                fast.set_reg(lane, reg as u8, v);
+                reference.set_reg(lane, reg as u8, v);
+            }
+        }
+
+        assert!(fast.try_simd_fast_step(mmu_fast), "expected the converged SIMD fast path to engage");
+        for lane in 0..LANES {
+            reference.step_lane(lane, mmu_ref);
+        }
+
+        for lane in 0..LANES {
+            assert_eq!(fast.pc[lane], reference.pc[lane], "lane {lane} pc");
+            for reg in 0..32 {
+                assert_eq!(
+                    fast.regs[reg][lane], reference.regs[reg][lane],
+                    "lane {lane} register x{reg}"
+                );
+            }
+        }
+        (fast, reference)
+    }
+
+    /// [`VecCpu::try_simd_lui`] must be byte-identical to `step_lane`'s `Inst::Lui` arm across
+    /// random per-lane starting register state (LUI itself reads no register, but the destination
+    /// register's PREVIOUS value must not leak through when the active mask is set, and other
+    /// registers must be left completely alone).
+    #[test]
+    fn simd_lui_fast_path_matches_step_lane_exactly() {
+        use asm::*;
+        const RD: u8 = 5; // t0
+        let prog = vec![lui(RD, 0xdead_b000)];
+        let mut mmu_fast = make_mmu(&prog);
+        let mut mmu_ref = make_mmu(&prog);
+        let mut rng = XorShift64(0x1234_5678_9abc_def0);
+        for _ in 0..200 {
+            let regs: [[u32; LANES]; 32] =
+                std::array::from_fn(|_| std::array::from_fn(|_| rng.next_u32()));
+            let (fast, _reference) =
+                assert_fast_path_step_matches_step_lane(&mut mmu_fast, &mut mmu_ref, regs);
+            assert_eq!(
+                fast.simd_alu_steps, 1,
+                "lui should take the (ALU-counter-sharing) SIMD fast path, not fall back"
+            );
+            for lane in 0..LANES {
+                assert_eq!(fast.regs[RD as usize][lane], 0xdead_b000, "lane {lane}");
+            }
+        }
+    }
+
+    /// [`VecCpu::try_simd_auipc`] must be byte-identical to `step_lane`'s `Inst::Auipc` arm: the
+    /// result depends on `pc`, which is converged (identical across every lane) by construction,
+    /// but this still proves the vector `pc`-read/add/mask-select sequence matches the scalar
+    /// `pc.wrapping_add(imm)` exactly, across random per-lane starting register state.
+    #[test]
+    fn simd_auipc_fast_path_matches_step_lane_exactly() {
+        const RD: u8 = 6; // t1
+        let prog = vec![auipc(RD, 0x0000_3000)];
+        let mut mmu_fast = make_mmu(&prog);
+        let mut mmu_ref = make_mmu(&prog);
+        let mut rng = XorShift64(0x2468_ace0_1357_9bdf);
+        for _ in 0..200 {
+            let regs: [[u32; LANES]; 32] =
+                std::array::from_fn(|_| std::array::from_fn(|_| rng.next_u32()));
+            let (fast, _reference) =
+                assert_fast_path_step_matches_step_lane(&mut mmu_fast, &mut mmu_ref, regs);
+            assert_eq!(
+                fast.simd_alu_steps, 1,
+                "auipc should take the (ALU-counter-sharing) SIMD fast path, not fall back"
+            );
+            for lane in 0..LANES {
+                assert_eq!(fast.regs[RD as usize][lane], BASE.wrapping_add(0x0000_3000), "lane {lane}");
+            }
+        }
+    }
+
+    /// [`VecCpu::try_simd_mul`] (the masked-scalarize MUL/DIV/REM payload) must be byte-identical
+    /// to `step_lane`'s `Inst::Mul` arm — which calls the exact same scalar `muldiv` helper, so
+    /// this mainly proves the surrounding vector plumbing (mask-select scatter to `rd`, shared
+    /// `pc`-advance/retire) never corrupts a lane — across every `MulOp` and a wide spread of
+    /// random, per-lane-divergent `rs1`/`rs2` values.
+    #[test]
+    fn simd_mul_family_fast_path_matches_step_lane_exactly() {
+        use asm::mul;
+        const RD: u8 = 5; // t0
+        const RS1: u8 = 6; // t1
+        const RS2: u8 = 7; // t2
+        let ops: [(MulEncoder, &str); 8] = [
+            (mul, "mul"),
+            (mulh, "mulh"),
+            (mulhsu, "mulhsu"),
+            (mulhu, "mulhu"),
+            (div_, "div"),
+            (divu_, "divu"),
+            (rem_, "rem"),
+            (remu_, "remu"),
+        ];
+        let mut rng = XorShift64(0xabcd_ef01_2345_6789);
+        for (encoder, name) in ops {
+            let prog = vec![encoder(RD, RS1, RS2)];
+            let mut mmu_fast = make_mmu(&prog);
+            let mut mmu_ref = make_mmu(&prog);
+            for _ in 0..500 {
+                let mut regs = [[0u32; LANES]; 32];
+                regs[RS1 as usize] = std::array::from_fn(|_| rng.next_u32());
+                regs[RS2 as usize] = std::array::from_fn(|_| rng.next_u32());
+                let (fast, _reference) =
+                    assert_fast_path_step_matches_step_lane(&mut mmu_fast, &mut mmu_ref, regs);
+                assert_eq!(
+                    fast.simd_muldiv_steps, 1,
+                    "{name} should take the masked-scalarize MUL fast path, not fall back"
+                );
+            }
+        }
+    }
+
+    /// The M-extension's documented edge cases (architecture.md §5, mirrored in `muldiv`'s own
+    /// doc comment) laid out one per lane so a single converged step exercises all of them at once:
+    /// lane 0 divides by zero (DIV -> `0xffff_ffff`, REM -> the dividend unchanged), lane 1 hits
+    /// the signed `INT_MIN / -1` overflow (DIV -> `0x8000_0000`, REM -> `0`), and the remaining
+    /// lanes carry ordinary values so the fast path also has "normal" lanes to get right in the
+    /// same masked scatter. Checked both against `step_lane` exactly (via the shared harness) and
+    /// against the literal documented values, so a bug that shifted both the fast path AND
+    /// `step_lane` identically the same wrong way would still be caught.
+    #[test]
+    fn simd_mul_family_edge_cases_match_step_lane_exactly() {
+        const RD: u8 = 5; // t0
+        const RS1: u8 = 6; // t1
+        const RS2: u8 = 7; // t2
+        let mut rs1 = [0u32; LANES];
+        let mut rs2 = [0u32; LANES];
+        rs1[0] = 42;
+        rs2[0] = 0; // divide-by-zero lane
+        rs1[1] = 0x8000_0000;
+        rs2[1] = 0xffff_ffff; // INT_MIN / -1 overflow lane
+        for lane in 2..LANES {
+            rs1[lane] = (lane as u32) * 1000 + 7;
+            rs2[lane] = (lane as u32) * 3 + 2;
+        }
+
+        let cases: [(MulEncoder, &str); 4] =
+            [(div_, "div"), (divu_, "divu"), (rem_, "rem"), (remu_, "remu")];
+        for (encoder, name) in cases {
+            let prog = vec![encoder(RD, RS1, RS2)];
+            let mut mmu_fast = make_mmu(&prog);
+            let mut mmu_ref = make_mmu(&prog);
+            let mut regs = [[0u32; LANES]; 32];
+            regs[RS1 as usize] = rs1;
+            regs[RS2 as usize] = rs2;
+            let (fast, _reference) =
+                assert_fast_path_step_matches_step_lane(&mut mmu_fast, &mut mmu_ref, regs);
+            assert_eq!(fast.simd_muldiv_steps, 1, "{name}");
+
+            match name {
+                "div" => {
+                    assert_eq!(fast.regs[RD as usize][0], 0xffff_ffff, "div by zero");
+                    assert_eq!(fast.regs[RD as usize][1], 0x8000_0000, "INT_MIN/-1 overflow");
+                }
+                "divu" => {
+                    assert_eq!(fast.regs[RD as usize][0], 0xffff_ffff, "divu by zero");
+                }
+                "rem" => {
+                    assert_eq!(fast.regs[RD as usize][0], 42, "rem by zero returns the dividend");
+                    assert_eq!(fast.regs[RD as usize][1], 0, "INT_MIN%-1 overflow -> 0");
+                }
+                "remu" => {
+                    assert_eq!(fast.regs[RD as usize][0], 42, "remu by zero returns the dividend");
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 
     /// A converged, branch-free, all-ALU program: every lane stays at the same `pc` for the

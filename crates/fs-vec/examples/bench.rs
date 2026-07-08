@@ -30,7 +30,15 @@
 //! unit-tested, just looped instead of unrolled once; it exercises the fetch + ALU fast paths
 //! only (no memory ops in its loop body). `counting_mem_loop_program` is the same shape but routes
 //! the accumulator through ONE shared guest address every iteration instead, exercising `VecMmu`'s
-//! same-address `load_same`/`store_same` fast path too.
+//! same-address `load_same`/`store_same` fast path too. `counting_mul_loop_program` folds in one
+//! `mul` per iteration on top of the plain ALU mix, exercising `try_simd_mul`'s masked-scalarize
+//! fast path (`src/lib.rs`'s module docs): before that payload existed, `Inst::Mul` fell straight
+//! through `try_simd_fast_step` (returning `false`), so the ONE step per iteration that decoded the
+//! `mul` dropped the *entire converged group* to `step_lane`'s per-lane fallback for that step
+//! alone — every other instruction in the same loop body still took its own fast path. `bench_one`
+//! reports each scenario's fast-path *fraction* (the share of `step()` calls that took ANY SIMD
+//! payload rather than falling all the way to scalar-over-lanes) precisely to make that "one
+//! instruction, one step, not the whole loop" accounting visible for this scenario.
 
 use fs_mmu::{Mmu, PERM_EXEC, PERM_READ, PERM_WRITE};
 use fs_riscv::{asm, Exit, A0, A7, T0, T1, X0};
@@ -160,6 +168,51 @@ fn counting_mem_loop_program() -> Vec<u32> {
     ]
 }
 
+/// Same shape as `counting_alu_loop_program`, but with one `mul` folded into the loop body — the
+/// scenario `try_simd_mul`'s masked-scalarize fast path (src/lib.rs) exists for: MUL/DIV/REM have
+/// no clean packed SIMD form, so before that payload existed, `try_simd_fast_step` declined
+/// outright on `Inst::Mul` and the WHOLE converged group fell to `step_lane`'s per-lane fallback
+/// for that one step (re-fetching per lane and losing the shared decode) — even though every other
+/// instruction in the same loop body stayed converged and packed. This is exactly the
+/// "reduce scalar fallback" case the fast path targets: MUL is common in real code (address math,
+/// hashing), so a loop that touches it even once per iteration used to give back a chunk of the
+/// throughput win the surrounding ALU instructions otherwise get.
+///
+/// Indices (each instruction is 4 bytes):
+/// ```text
+///  0  addi T0, X0, 0        i = 0
+///  1  addi T1, X0, ITERS    limit
+///  2  bge  T0, T1, +32      if i >= limit -> 10 (done)
+///  3  addi T3, T3, 5
+///  4  mul  T3, T3, T4       t3 *= seed   (the one non-packed-ALU instruction per iteration)
+///  5  add  T3, T3, T4
+///  6  sub  T3, T3, T4
+///  7  andi T3, T3, 0x7fff
+///  8  addi T0, T0, 1        i++
+///  9  jal  X0, -28          -> 2
+/// 10 add  A0, T3, X0        done: a0 = t3
+/// 11 addi A7, X0, 93        a7 = exit
+/// 12 ecall
+/// ```
+fn counting_mul_loop_program() -> Vec<u32> {
+    use asm::*;
+    vec![
+        addi(T0, X0, 0),
+        addi(T1, X0, ITERS),
+        bge(T0, T1, 32),
+        addi(T3, T3, 5),
+        mul(T3, T3, T4),
+        add(T3, T3, T4),
+        sub(T3, T3, T4),
+        andi(T3, T3, 0x7fff),
+        addi(T0, T0, 1),
+        jal(X0, -28),
+        add(A0, T3, X0),
+        addi(A7, X0, 93),
+        ecall(),
+    ]
+}
+
 /// A divergent-address ("gather/scatter") memory loop: same trip count and shape as
 /// `counting_mem_loop_program`, but `t5` is seeded to a DISTINCT address per lane (`gather_addr`,
 /// set once before the run, never recomputed by the program itself) instead of one shared address
@@ -235,13 +288,25 @@ fn seed(lane: usize) -> u32 {
     (lane as u32) * 7 + 1
 }
 
+/// One `run_simd` call's counters: lane-instructions retired, each `simd_*_steps` counter, and the
+/// total number of `step()` calls made (`group_steps`) — the denominator for the fast-path
+/// fraction `bench_one` reports (what share of `step()` calls took ANY SIMD payload rather than
+/// falling all the way to `step_lane`'s scalar-over-lanes loop).
+struct SimdRunStats {
+    insns: u64,
+    alu_steps: u64,
+    branch_steps: u64,
+    mem_steps: u64,
+    gather_steps: u64,
+    muldiv_steps: u64,
+    group_steps: u64,
+}
+
 /// Runs `prog` on `VecCpu`, which takes the SIMD fast path for every converged ALU/branch/jump/
-/// memory instruction. `t5_seed(lane)`, if given, presets each lane's `T5` before the run (used
+/// memory/MUL instruction. `t5_seed(lane)`, if given, presets each lane's `T5` before the run (used
 /// only by `counting_gather_loop_program`, which relies on a preset per-lane address rather than
-/// computing one in-program). Returns `(total lane-instructions retired, SIMD ALU fast-path
-/// step() calls, SIMD branch/jump fast-path step() calls, SIMD same-address memory fast-path
-/// step() calls, SIMD gather/scatter memory fast-path step() calls)`.
-fn run_simd(prog: &[u32], t5_seed: Option<fn(usize) -> u32>) -> (u64, u64, u64, u64, u64) {
+/// computing one in-program).
+fn run_simd(prog: &[u32], t5_seed: Option<fn(usize) -> u32>) -> SimdRunStats {
     let mut mmu = make_vec_mmu(prog);
     let mut vcpu = VecCpu::new(BASE);
     for lane in 0..LANES {
@@ -250,16 +315,20 @@ fn run_simd(prog: &[u32], t5_seed: Option<fn(usize) -> u32>) -> (u64, u64, u64, 
             vcpu.set_reg(lane, T5, f(lane));
         }
     }
+    let mut group_steps = 0u64;
     while vcpu.any_active() {
         vcpu.step(&mut mmu);
+        group_steps += 1;
     }
-    (
-        vcpu.insns_retired.iter().sum(),
-        vcpu.simd_alu_steps,
-        vcpu.simd_branch_steps,
-        vcpu.simd_mem_steps,
-        vcpu.simd_gather_steps,
-    )
+    SimdRunStats {
+        insns: vcpu.insns_retired.iter().sum(),
+        alu_steps: vcpu.simd_alu_steps,
+        branch_steps: vcpu.simd_branch_steps,
+        mem_steps: vcpu.simd_mem_steps,
+        gather_steps: vcpu.simd_gather_steps,
+        muldiv_steps: vcpu.simd_muldiv_steps,
+        group_steps,
+    }
 }
 
 /// Runs `prog` on `LANES` independent scalar `fs_riscv::Cpu`s, one instruction at a time — the
@@ -292,13 +361,17 @@ fn bench_one(name: &str, prog: &[u32], t5_seed: Option<fn(usize) -> u32>) {
     let mut simd_branch_steps = 0u64;
     let mut simd_mem_steps = 0u64;
     let mut simd_gather_steps = 0u64;
+    let mut simd_muldiv_steps = 0u64;
+    let mut simd_group_steps = 0u64;
     for _ in 0..OUTER_REPEATS {
-        let (insns, alu_steps, branch_steps, mem_steps, gather_steps) = run_simd(prog, t5_seed);
-        simd_total_insns += insns;
-        simd_alu_steps += alu_steps;
-        simd_branch_steps += branch_steps;
-        simd_mem_steps += mem_steps;
-        simd_gather_steps += gather_steps;
+        let stats = run_simd(prog, t5_seed);
+        simd_total_insns += stats.insns;
+        simd_alu_steps += stats.alu_steps;
+        simd_branch_steps += stats.branch_steps;
+        simd_mem_steps += stats.mem_steps;
+        simd_gather_steps += stats.gather_steps;
+        simd_muldiv_steps += stats.muldiv_steps;
+        simd_group_steps += stats.group_steps;
     }
     let simd_elapsed = simd_start.elapsed();
 
@@ -317,13 +390,21 @@ fn bench_one(name: &str, prog: &[u32], t5_seed: Option<fn(usize) -> u32>) {
 
     let simd_rate = simd_total_insns as f64 / simd_elapsed.as_secs_f64();
     let scalar_rate = scalar_total_insns as f64 / scalar_elapsed.as_secs_f64();
+    let fast_path_steps =
+        simd_alu_steps + simd_branch_steps + simd_mem_steps + simd_gather_steps + simd_muldiv_steps;
+    let fast_path_fraction = fast_path_steps as f64 / simd_group_steps as f64;
 
     println!("{name} ({LANES} lanes x {ITERS} loop iterations x {OUTER_REPEATS} repeats)");
     println!(
         "  SIMD fast path:    {simd_total_insns} lane-instructions in {simd_elapsed:?}  =  \
          {simd_rate:.0} lane-instr/sec  ({simd_alu_steps} ALU-path + {simd_branch_steps} \
          branch/jump-path + {simd_mem_steps} same-address-mem-path + {simd_gather_steps} \
-         gather/scatter-mem-path step() calls)"
+         gather/scatter-mem-path + {simd_muldiv_steps} masked-scalarize-MUL-path step() calls)"
+    );
+    println!(
+        "  fast-path share:   {fast_path_steps}/{simd_group_steps} step() calls took a SIMD \
+         payload  =  {:.2}% (rest fell to the scalar-over-lanes step_lane loop)",
+        fast_path_fraction * 100.0
     );
     println!(
         "  scalar-over-lanes: {scalar_total_insns} lane-instructions in {scalar_elapsed:?}  =  \
@@ -347,5 +428,10 @@ fn main() {
         "fs-vec throughput micro-benchmark: divergent-address (gather/scatter) memory loop",
         &counting_gather_loop_program(),
         Some(gather_addr),
+    );
+    bench_one(
+        "fs-vec throughput micro-benchmark: MUL-in-loop (masked-scalarize fast path)",
+        &counting_mul_loop_program(),
+        None,
     );
 }
