@@ -49,16 +49,39 @@ impl Rng {
     }
 }
 
+/// Emulator-level sanitizer context: PC-hooks on the kernel allocator + observed-allocation stats.
+/// First step is validation-only (prove the hooks fire on the real kernel); redzone poisoning is
+/// gated behind the SLUB false-positive analysis (docs/kernel-san.md, pending).
+struct SanCtx {
+    hooks: fs_san::PcHooks,
+    allocs: u64,
+    frees: u64,
+    bytes: u64,
+}
+
 /// Run one fuzz case, recording non-fall-through control-flow edges into an AFL-style bitmap.
+/// When `san` is set, drives the kernel-allocator PC-hooks each retired instruction.
 fn run_case(
     cpu: &mut fs_riscv::Cpu,
     m: &mut fs_platform::Machine,
     cov: &mut fs_cov::CovBitmap,
     deadline: u64,
+    mut san: Option<&mut SanCtx>,
 ) -> fs_platform::Stop {
     use fs_platform::Stop;
     use fs_riscv::SysExit;
     while cpu.insns_retired < deadline {
+        if let Some(ctx) = san.as_deref_mut()
+            && let Some(ev) = ctx.hooks.on_pc(cpu.pc, &cpu.regs)
+        {
+            match ev {
+                fs_san::HookEvent::Alloc { size, .. } => {
+                    ctx.allocs += 1;
+                    ctx.bytes += size as u64;
+                }
+                fs_san::HookEvent::Free { .. } => ctx.frees += 1,
+            }
+        }
         m.clint.mtime = cpu.virtual_time();
         fs_platform::sync_timer(cpu, m);
         let prev = cpu.pc;
@@ -273,6 +296,7 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     let mut case_insns = 2_000_000u64;
     let mut cases = 2000u32;
     let mut seed = 1u32;
+    let mut sanitize = false;
     let ram_base = 0x8000_0000u32;
     let kernel_addr = 0x8040_0000u32;
 
@@ -281,6 +305,11 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
         let key = args[i].as_str();
         let val = |i: usize| args.get(i + 1).cloned().unwrap_or_default();
         match key {
+            "--sanitize" => {
+                sanitize = true;
+                i += 1;
+                continue;
+            }
             "--firmware" => firmware = Box::leak(val(i).into_boxed_str()),
             "--dtb" => dtb = Box::leak(val(i).into_boxed_str()),
             "--kernel" => kernel = Box::leak(val(i).into_boxed_str()),
@@ -358,6 +387,25 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     let snap = Snapshot::capture(&cpu, &mut m);
     let base_uart = m.uart.out.len();
 
+    // Optional emulator-level kernel-allocator sanitizer hooks (validation-only for now).
+    let mut san_ctx = if sanitize {
+        match std::fs::read_to_string("build/linux-src/System.map") {
+            Ok(text) => {
+                let syms = fs_san::parse_system_map(&text);
+                let mut hooks = fs_san::PcHooks::new();
+                fs_san::register_kernel_allocator_hooks(&mut hooks, &syms);
+                eprintln!("fuzz: sanitizer ON — kernel allocator hooks registered ({} symbols parsed)", syms.len());
+                Some(SanCtx { hooks, allocs: 0, frees: 0, bytes: 0 })
+            }
+            Err(e) => {
+                eprintln!("fuzz: --sanitize requested but build/linux-src/System.map unreadable: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // --- coverage-guided fuzz loop over syscall *programs* ---
     let mut virgin = VirginMap::new(); // accumulated coverage (feedback)
     let mut run_map = CovBitmap::new(); // per-case edge bitmap
@@ -394,7 +442,7 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
 
         run_map.clear();
         let deadline = cpu.insns_retired + case_insns;
-        match run_case(&mut cpu, &mut m, &mut run_map, deadline) {
+        match run_case(&mut cpu, &mut m, &mut run_map, deadline, san_ctx.as_mut()) {
             Stop::Hypercall(HC_DONE) => done += 1,
             Stop::Budget => budget_hit += 1,
             _ => {}
@@ -439,6 +487,12 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     println!("  coverage      : {} bitmap buckets", virgin.covered_buckets());
     println!("  corpus        : {} programs", corpus.len());
     println!("  kernel crashes: {crashes}  ({} unique kernel PCs)", crash_sigs.len());
+    if let Some(ctx) = &san_ctx {
+        println!(
+            "  kernel allocs : {} kmalloc ({} bytes), {} kfree  [hooks fired — sanitizer path validated]",
+            ctx.allocs, ctx.bytes, ctx.frees
+        );
+    }
     println!(
         "  guest speed   : {mips:.0} MIPS ({} insns/case avg)",
         total_case_insns / cases.max(1) as u64

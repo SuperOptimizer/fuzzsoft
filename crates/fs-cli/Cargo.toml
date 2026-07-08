@@ -14,6 +14,7 @@ fs-riscv = { path = "../fs-riscv" }
 fs-cov = { path = "../fs-cov" }
 fs-loader = { path = "../fs-loader" }
 fs-platform = { path = "../fs-platform" }
+fs-san = { path = "../fs-san" }
 
 [lints.rust]
 unsafe_code = "forbid"
