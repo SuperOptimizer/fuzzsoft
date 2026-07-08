@@ -100,6 +100,43 @@ fn run_case(
     Stop::Budget
 }
 
+/// Run one fuzz case via the Stage 0 JIT block cache (`fs-jit`, `docs/jit.md`) instead of
+/// per-instruction interpretation — the `--jit` analogue of `run_case`. Drives the *identical*
+/// per-instruction loop `run_case` does (CLINT sync + coverage-edge recording before/after every
+/// single instruction, for bit-exact parity with the interpreter — see `fs_jit::BlockCache`'s
+/// module docs for why `run_block` is one instruction/interrupt-take per call rather than an
+/// opaque multi-instruction loop): only the fetch+decode step is served from the cache when
+/// possible. No sanitizer-hook support (`--jit` and `--sanitize` are mutually exclusive for now).
+fn run_case_jit(
+    cpu: &mut fs_riscv::Cpu,
+    m: &mut fs_platform::Machine,
+    cache: &mut fs_jit::BlockCache,
+    cov: &mut fs_cov::CovBitmap,
+    deadline: u64,
+) -> fs_platform::Stop {
+    use fs_platform::Stop;
+    use fs_riscv::SysExit;
+    while cpu.insns_retired < deadline {
+        m.clint.mtime = cpu.virtual_time();
+        fs_platform::sync_timer(cpu, m);
+        let prev = cpu.pc;
+        // Plain `Machine`/`Mmu` has no copy-on-write concept, so every page is "golden" (decision:
+        // `docs/jit.md`'s Stage 0 golden-tier check is a no-op here; it matters once this is wired
+        // into the `CowMachine`/`--jobs` path).
+        match cache.run_block(cpu, m, &mut |_| true) {
+            SysExit::Continue => {
+                let cur = cpu.pc;
+                if cur != prev.wrapping_add(4) && cur != prev.wrapping_add(2) {
+                    cov.record_edge(prev, cur);
+                }
+            }
+            SysExit::Halt(c) => return Stop::Halt(c),
+            SysExit::Hypercall(c) => return Stop::Hypercall(c),
+        }
+    }
+    Stop::Budget
+}
+
 /// The faulting kernel PC from an oops register dump ("epc : c00185e0"), for crash dedup.
 fn parse_epc(s: &str) -> Option<u32> {
     let i = s.find("epc : ")?;
@@ -720,6 +757,7 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     let mut sanitize = false;
     let mut san_poison = false;
     let mut cmplog = false;
+    let mut jit = false;
     let ram_base = 0x8000_0000u32;
     let kernel_addr = 0x8040_0000u32;
 
@@ -750,6 +788,16 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
             // whether to thread it through the parallel `CowMachine` workers too.
             "--cmplog" => {
                 cmplog = true;
+                i += 1;
+                continue;
+            }
+            // Stage 0 JIT (`docs/jit.md`): drive the serial per-case loop through `fs-jit`'s
+            // PA-keyed threaded-code block cache instead of `Cpu::step_system`'s per-instruction
+            // fetch+decode. Opt-in and off by default (like `--cmplog`): when absent, nothing
+            // about the interpreter path changes. Serial-only for this first cut, same as
+            // `--cmplog` — see the `--jobs > 1` incompatibility check below.
+            "--jit" => {
+                jit = true;
                 i += 1;
                 continue;
             }
@@ -867,6 +915,10 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
             eprintln!("fuzz: --jobs > 1 is incompatible with --cmplog in this first cut (serial-only)");
             return ExitCode::FAILURE;
         }
+        if jit {
+            eprintln!("fuzz: --jobs > 1 is incompatible with --jit in this first cut (serial-only)");
+            return ExitCode::FAILURE;
+        }
         // Captured right here — after boot AND after the prog/scratch address translation above
         // (which can set PTE A/D bits) — the exact instant `Snapshot::capture` would otherwise
         // capture for the serial path below. `m` is dropped immediately after: `Golden` holds its
@@ -923,9 +975,15 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
         );
     }
 
+    if jit && sanitize {
+        eprintln!("fuzz: --jit is incompatible with --sanitize (the PC-hook runner is interpreter-only for now)");
+        return ExitCode::FAILURE;
+    }
+
     // --- serial path (also `--sanitize`'s only path — it needs `Machine.ram: Mmu` directly for
     // the sanitizer's poison/alloc primitives): a single `Machine` + golden `Snapshot`. ---
     let snap = Snapshot::capture(&cpu, &mut m);
+    let mut jit_cache = jit.then(fs_jit::BlockCache::new);
 
     // Optional emulator-level kernel-allocator sanitizer hooks (validation-only for now).
     let mut san_ctx = if sanitize {
@@ -1061,7 +1119,11 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
 
         run_map.clear();
         let deadline = cpu.insns_retired + case_insns;
-        match run_case(&mut cpu, &mut m, &mut run_map, deadline, san_ctx.as_mut()) {
+        let stop = match jit_cache.as_mut() {
+            Some(cache) => run_case_jit(&mut cpu, &mut m, cache, &mut run_map, deadline),
+            None => run_case(&mut cpu, &mut m, &mut run_map, deadline, san_ctx.as_mut()),
+        };
+        match stop {
             Stop::Hypercall(HC_DONE) => done += 1,
             Stop::Budget => budget_hit += 1,
             _ => {}
@@ -1123,6 +1185,12 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
         println!(
             "  cmplog        : {cmplog_traces} traces, {cmplog_hits} produced a value-substitution mutation"
         );
+    }
+    if let Some(cache) = &jit_cache {
+        let (hits, misses) = (cache.hits(), cache.misses());
+        let total = hits + misses;
+        let hit_pct = if total > 0 { hits as f64 / total as f64 * 100.0 } else { 0.0 };
+        println!("  jit cache     : {hits} hits, {misses} compiles ({hit_pct:.1}% hit rate)  [Stage 0, docs/jit.md]");
     }
     println!(
         "  guest speed   : {mips:.0} MIPS ({} insns/case avg)",
@@ -1793,6 +1861,92 @@ mod tests {
         for call in &prog.calls {
             assert!(c.contains(&format!("{}", call.desc.nr)));
         }
+    }
+
+    /// Stage 0 JIT differential test (`docs/jit.md`, the GO/NO-GO gate's correctness half):
+    /// `run_case_jit` (the `fs-jit` block-cache-driven runner) must produce results byte-identical
+    /// to `run_case` (the plain interpreter) over the exact same case — same `Stop`, same final
+    /// registers/pc/insns_retired, same coverage bitmap, same UART output, same RAM contents —
+    /// across TWO resets in a row (so golden-tier cache reuse across a `Snapshot::reset` — Stage 0
+    /// has no invalidation, only relying on golden bytes never changing — is proven, not just a
+    /// single fresh run). Mirrors `cow_machine_case_matches_machine_case`'s structure.
+    #[test]
+    fn jit_case_matches_interpreter_case() {
+        use fs_mmu::{Bus, PERM_EXEC, PERM_READ, PERM_WRITE};
+
+        let base = 0x8000_0000u32;
+        let size = 0x0001_0000u32;
+        let data_addr = base + 0x1000;
+        let tohost = base + 0x2000;
+        const T2: u8 = 7;
+        const T3: u8 = 28;
+        const T4: u8 = 29;
+
+        // Same tiny counted store-loop-then-HTIF-halt case as the CowMachine differential test,
+        // so it exercises a real backward branch (a non-fall-through coverage edge) plus a couple
+        // of cache misses followed by hits on the loop's later iterations.
+        let mut code = Vec::new();
+        for w in [
+            asm::addi(fs_riscv::T0, fs_riscv::X0, 0),
+            asm::addi(fs_riscv::T1, fs_riscv::X0, 3),
+            asm::lui(T2, data_addr),
+            asm::sw(T2, fs_riscv::T0, 0),
+            asm::addi(fs_riscv::T0, fs_riscv::T0, 1),
+            asm::bne(fs_riscv::T0, fs_riscv::T1, -8),
+            asm::lui(T3, tohost),
+            asm::addi(T4, fs_riscv::X0, 1),
+            asm::sw(T3, T4, 0), // HTIF halt
+        ] {
+            code.extend_from_slice(&w.to_le_bytes());
+        }
+
+        let mut m_i = fs_platform::Machine::new(base, size);
+        m_i.ram.protect(base, size, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+        m_i.ram.map(base, &code, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+        let mut cpu_i = fs_riscv::Cpu::new(base);
+        cpu_i.htif_tohost = Some(tohost);
+        let snap_i = fs_platform::Snapshot::capture(&cpu_i, &mut m_i);
+
+        let mut m_j = fs_platform::Machine::new(base, size);
+        m_j.ram.protect(base, size, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+        m_j.ram.map(base, &code, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+        let mut cpu_j = fs_riscv::Cpu::new(base);
+        cpu_j.htif_tohost = Some(tohost);
+        let snap_j = fs_platform::Snapshot::capture(&cpu_j, &mut m_j);
+        let mut cache = fs_jit::BlockCache::new();
+
+        for iter in 0..2 {
+            snap_i.reset(&mut cpu_i, &mut m_i);
+            let mut cov_i = fs_cov::CovBitmap::new();
+            let deadline_i = cpu_i.insns_retired + 1000;
+            let stop_i = run_case(&mut cpu_i, &mut m_i, &mut cov_i, deadline_i, None);
+
+            snap_j.reset(&mut cpu_j, &mut m_j);
+            let mut cov_j = fs_cov::CovBitmap::new();
+            let deadline_j = cpu_j.insns_retired + 1000;
+            let stop_j = run_case_jit(&mut cpu_j, &mut m_j, &mut cache, &mut cov_j, deadline_j);
+
+            assert_eq!(stop_i, stop_j, "iter {iter}: Stop mismatch");
+            assert_eq!(cpu_i.regs, cpu_j.regs, "iter {iter}: register mismatch");
+            assert_eq!(cpu_i.pc, cpu_j.pc, "iter {iter}: pc mismatch");
+            assert_eq!(
+                cpu_i.insns_retired, cpu_j.insns_retired,
+                "iter {iter}: insns_retired mismatch"
+            );
+            assert_eq!(cov_i.as_slice(), cov_j.as_slice(), "iter {iter}: coverage bitmap mismatch");
+            assert_eq!(m_i.uart.out, m_j.uart.out, "iter {iter}: uart mismatch");
+            assert_eq!(
+                m_i.load(data_addr, 4).unwrap(),
+                m_j.load(data_addr, 4).unwrap(),
+                "iter {iter}: final RAM content mismatch"
+            );
+            assert_eq!(m_i.load(data_addr, 4).unwrap(), 2, "iter {iter}: loop didn't run as expected");
+        }
+
+        // The cache actually served hits (both across the loop's backedges within a run, and
+        // across the two resets — Stage 0's golden-tier reuse surviving `Snapshot::reset`), not
+        // just misses every time.
+        assert!(cache.hits() > 0, "expected cache hits across loop iterations / resets");
     }
 
     /// Corpus serialization round-trips: for many generated programs, serialize → deserialize

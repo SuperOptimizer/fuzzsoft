@@ -990,6 +990,30 @@ impl Cpu {
             let w = (lo as u32) | ((hi as u32) << 16);
             (decode(w), 4u32, w)
         };
+        self.exec_one(bus, inst, pc, ilen, iword)
+    }
+
+    /// Execute one already-decoded instruction — the pure execute stage of [`Cpu::step`], factored
+    /// out so a block cache (`fs-jit`) can replay a previously fetched+decoded instruction without
+    /// repeating the fetch (translate + permission-checked `Bus::ifetch16`) or the decode. `pc` is
+    /// this instruction's address (used for pc-relative `Auipc`/`Jal`/`Branch` targets, and as the
+    /// `next`-pc for `Ecall`/`Ebreak`, which do not advance `pc`); it must be the CURRENT virtual
+    /// address the instruction is being executed at (not necessarily the address it was originally
+    /// decoded from — the decoded [`Inst`] IL carries no absolute address, only offsets read
+    /// straight from the instruction encoding, so replaying it at a different but byte-identical VA
+    /// — e.g. shared kernel `.text` reached via a different `satp` — computes the correct target).
+    /// `ilen` is the encoded length (2 for RVC, 4 otherwise), used for the sequential fall-through
+    /// pc. `iword` is the raw encoding, consulted only by the Csr/Mret/Sret illegal-instruction
+    /// paths (never RVC-encoded, so always the full 32-bit word there). Advances `self.pc`/
+    /// `self.insns_retired` exactly as `step` did — this is a pure refactor, zero behavior change.
+    pub fn exec_one(
+        &mut self,
+        bus: &mut dyn Bus,
+        inst: Inst,
+        pc: u32,
+        ilen: u32,
+        iword: u32,
+    ) -> Result<Exit, Trap> {
         let mut next = pc.wrapping_add(ilen);
         let mut exit = Exit::Continue;
 
@@ -1298,15 +1322,29 @@ impl Cpu {
         }
     }
 
-    /// One full-system step: refresh timers, take any pending interrupt, else execute one
-    /// instruction and vector any resulting trap. Returns `Halt` on an HTIF `tohost` exit.
-    pub fn step_system(&mut self, bus: &mut dyn Bus) -> SysExit {
+    /// Refresh timers and, if an interrupt is now pending and enabled, take it (redirecting `pc`
+    /// to the trap vector). Returns `true` if a trap was taken. Factored out of `step_system`'s
+    /// opening so a cached-block runner (`fs-jit`) can reproduce the exact same per-instruction
+    /// interrupt-polling semantics between two cached (fetch/decode-free) instructions, without
+    /// pulling in the fetch+decode `step` does. Pure refactor — `step_system` calling this first is
+    /// byte-identical to its previous inlined check.
+    pub fn poll_interrupt(&mut self) -> bool {
         self.update_timers();
         if let Some(code) = self.pending_interrupt() {
             self.take_trap(code, 0, true);
-            return SysExit::Continue;
+            true
+        } else {
+            false
         }
-        match self.step(bus) {
+    }
+
+    /// Turn a [`Cpu::step`]/[`Cpu::exec_one`] result into a [`SysExit`]: vector any trap, and
+    /// intercept a registered fuzzing hypercall before it would be delivered to the guest kernel.
+    /// This is exactly the match `step_system` used to run inline after calling `step`, factored
+    /// out so `fs-jit` can apply the identical post-execution handling after calling `exec_one`
+    /// directly (no behavior change — same arms, same order).
+    pub fn finish_exit(&mut self, r: Result<Exit, Trap>) -> SysExit {
+        match r {
             Ok(Exit::Continue) => SysExit::Continue,
             Ok(Exit::Halt(c)) => SysExit::Halt(c),
             Ok(Exit::Ecall) => {
@@ -1342,6 +1380,16 @@ impl Cpu {
                 SysExit::Continue
             }
         }
+    }
+
+    /// One full-system step: refresh timers, take any pending interrupt, else execute one
+    /// instruction and vector any resulting trap. Returns `Halt` on an HTIF `tohost` exit.
+    pub fn step_system(&mut self, bus: &mut dyn Bus) -> SysExit {
+        if self.poll_interrupt() {
+            return SysExit::Continue;
+        }
+        let r = self.step(bus);
+        self.finish_exit(r)
     }
 }
 

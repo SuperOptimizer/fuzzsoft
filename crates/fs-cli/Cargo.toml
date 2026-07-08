@@ -16,6 +16,7 @@ fs-loader = { path = "../fs-loader" }
 fs-platform = { path = "../fs-platform" }
 fs-san = { path = "../fs-san" }
 fs-prog = { path = "../fs-prog" }
+fs-jit = { path = "../fs-jit" }
 
 [lints.rust]
 unsafe_code = "forbid"

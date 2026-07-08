@@ -1,0 +1,17 @@
+[package]
+name = "fs-jit"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+# Stage 0 of docs/jit.md: a PA-keyed, direct-mapped, golden-tier threaded-code (decoded-`Inst`)
+# cache. Zero unsafe — the whole point of Stage 0 is to measure whether removing re-decode + the
+# interior instruction-fetch permission recheck is worth anything BEFORE the much larger Stage 1
+# native-codegen investment (which is the one place unsafe will eventually be introduced, isolated
+# like `fs-hostmem`).
+[dependencies]
+fs-mmu = { path = "../fs-mmu" }
+fs-riscv = { path = "../fs-riscv" }
+
+[lints.rust]
+unsafe_code = "forbid"

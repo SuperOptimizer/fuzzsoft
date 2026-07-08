@@ -12,6 +12,7 @@ members = [
     "crates/fs-san",
     "crates/fs-prog",
     "crates/fs-hostmem",
+    "crates/fs-jit",
 ]
 
 [workspace.package]
