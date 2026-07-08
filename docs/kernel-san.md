@@ -523,3 +523,153 @@ kernel heap corruption reachable through a fuzzer-emitted syscall, `kernel_crash
 kernel tried, well within the first few hundred cases. This closes the loop the `Image.slubdebug`
 smoke test (0 crashes on a clean kernel) left open: the oracle isn't just quiet on clean kernels, it
 is loud on planted ones.
+
+---
+
+## KASAN / KFENCE investigation (2026-07-08): neither is available on rv32 — built DEBUG_PAGEALLOC instead
+
+`Image.slubdebug` (above) only catches heap corruption **at `kfree()` time** (SLUB's own
+redzone/poison self-check). It does **not** catch an out-of-bounds **read**, and it does not catch
+a use-after-free the instant it happens — only when the object is eventually freed and SLUB
+happens to check it. KASAN and KFENCE are the real answer to that gap (shadow-memory / guard-page
+techniques that fault on the actual bad access), so this investigation tried to build one of them
+for the rv32 target, in the order the design called for: KASAN first, KFENCE as fallback.
+
+### Result: both are architecturally unavailable on 32-bit RISC-V in this kernel tree
+
+This isn't a missed config flag — it's a hard Kconfig gate, confirmed by reading `arch/riscv/Kconfig`
+in the kernel worktree (`build/linux-kasan-src`, same commit as every other worktree, `0e35b9b6ec0f`,
+kernel 7.2.0-rc2) and then **empirically proving it** by trying to enable each option:
+
+```
+arch/riscv/Kconfig:136:  select HAVE_ARCH_KASAN        if MMU && 64BIT
+arch/riscv/Kconfig:137:  select HAVE_ARCH_KASAN_VMALLOC if MMU && 64BIT
+arch/riscv/Kconfig:138:  select HAVE_ARCH_KFENCE       if MMU && 64BIT
+```
+
+`lib/Kconfig.kasan`'s `menuconfig KASAN` depends on `HAVE_ARCH_KASAN` (generic mode) or
+`HAVE_ARCH_KASAN_SW_TAGS` (arm64-only) or `HAVE_ARCH_KASAN_HW_TAGS` (arm64 MTE-only) — none of
+which rv32 can ever select. `lib/Kconfig.kfence`'s `menuconfig KFENCE` depends on
+`HAVE_ARCH_KFENCE` alone — same story. This build runs `CONFIG_ARCH_RV32I=y` with `CONFIG_64BIT`
+unset, so both gates are permanently closed.
+
+Proof, reproduced against a fresh `O=` config seeded from the stock `.config`
+(`build/linux-kasan/.config`):
+
+```
+$ scripts/config --file .config -e KASAN -e KASAN_GENERIC -e KASAN_INLINE
+$ make O=build/linux-kasan ARCH=riscv LLVM=1 olddefconfig
+$ grep -E '^CONFIG_KASAN|^CONFIG_HAVE_ARCH_KASAN' .config
+(no output — the symbol isn't even present as "# CONFIG_KASAN is not set";
+ olddefconfig silently drops a selection whose `depends on` can never be true)
+
+$ scripts/config --file .config -e KFENCE
+$ make O=build/linux-kasan ARCH=riscv LLVM=1 olddefconfig
+$ grep -E '^CONFIG_KFENCE|^CONFIG_HAVE_ARCH_KFENCE' .config
+(no output — same result)
+```
+
+Both attempts leave zero trace of the symbol in the resulting `.config` — Kconfig doesn't even
+offer a disabled prompt, because the `depends on` chain is unsatisfiable on this arch/bitness
+combination. There is no rv32 arch support for KASAN or KFENCE anywhere in this kernel source tree
+to fall back onto; implementing it would mean writing `arch_kfence_init_pool()`/shadow-memory
+offset math for Sv32 page tables from scratch — arch bring-up work, not a config change, and well
+outside the scope of this build task.
+
+### What was built instead: `firmware/Image.dpalloc`
+
+The strongest oracle that **is** actually available on rv32 with no arch bring-up:
+`CONFIG_DEBUG_PAGEALLOC` + `CONFIG_PAGE_POISONING`, on top of the same `CONFIG_SLUB_DEBUG_ON` used
+by `Image.slubdebug`. `arch/riscv/Kconfig` selects `ARCH_SUPPORTS_DEBUG_PAGEALLOC if MMU` — no
+`64BIT` restriction — so this one is real on rv32.
+
+- **`CONFIG_DEBUG_PAGEALLOC`**: unmaps a page from the kernel's linear map immediately when
+  `free_pages()` returns it to the buddy allocator. Any subsequent access — read *or* write —
+  to that page is a genuine CPU page fault (`Unable to handle kernel paging request at virtual
+  address ...`, `arch/riscv/mm/fault.c`), not a check that only runs at some later free. This is
+  the "immediate UAF" property KASAN/KFENCE have, just at page granularity.
+- **`CONFIG_PAGE_POISONING`**: fills freed pages with a poison pattern and verifies it on the next
+  `alloc_pages()`, catching corruption even in the (rare) case a stale mapping elsewhere still
+  allowed a write that `DEBUG_PAGEALLOC`'s unmap didn't intercept.
+- **`CONFIG_SLUB_DEBUG_ON`** stays on for the free-time slab redzone/poison checks `Image.slubdebug`
+  already provides.
+
+Config verified stuck (`build/linux-kasan/.config`):
+
+```
+CONFIG_ARCH_SUPPORTS_DEBUG_PAGEALLOC=y
+CONFIG_DEBUG_PAGEALLOC=y
+CONFIG_SLUB_DEBUG=y
+CONFIG_SLUB_DEBUG_ON=y
+CONFIG_PAGE_POISONING=y
+CONFIG_INITRAMFS_SOURCE="/home/forrest/fuzzsoft/boot/initramfs.spec"
+```
+(`CONFIG_KASAN` / `CONFIG_KFENCE` are absent, as established above.)
+
+Built via a fourth clean worktree `build/linux-kasan-src` + `O=build/linux-kasan`, same recipe
+pattern as `Image.slubdebug`/`Image.buggy`. Outputs: **`firmware/Image.dpalloc`** (26,930,176
+bytes — same size class as the other custom builds) and **`firmware/System.map.dpalloc`**
+(4,161,596 bytes). Reproduce with `scripts/build-kasan-kernel.sh` (kept that filename since it's
+the prescribed build-script name for this investigation; the script itself tries KASAN, then
+KFENCE, then falls back to this, and picks its own output suffix — `kasan`/`kfence`/`dpalloc` —
+based on what actually stuck, so it stays correct if a future kernel version ever adds rv32
+KASAN/KFENCE support).
+
+### Honest limitation: this is a real but *narrower* oracle than KASAN/KFENCE would have been
+
+`DEBUG_PAGEALLOC`/`PAGE_POISONING` operate at **page granularity**. They catch immediate UAF/OOB
+on whole pages once those pages are returned to the buddy allocator — `vmalloc` frees, order>0
+allocations, a fully-emptied SLUB slab page reclaimed back to the page allocator. They do **not**
+give KASAN/KFENCE's byte-level, every-object redzone coverage: SLUB packs multiple small kmalloc
+objects per page, and the page stays mapped (and un-poisoned) as long as *any* object on it is
+still live. So a typical small-object kmalloc overflow/UAF — like the `Image.buggy` planted bug
+above (`kmalloc(32)`, 1-byte overflow) — would **not** be caught by this oracle; it still needs
+`Image.slubdebug`'s free-time redzone check for that class of bug. `Image.dpalloc` mainly adds
+value for large/`order>0`/`vmalloc`-backed allocations and use-after-free of pages returned to the
+buddy allocator. It is the strongest *available* oracle on this target, not a full KASAN/KFENCE
+substitute — that substitute does not exist for rv32 in this kernel tree.
+
+### Smoke test
+
+```
+./target/release/fuzzsoft fuzz --cases 100 --seed 1 --kernel firmware/Image.dpalloc
+```
+
+Reached `snapshot captured` at the **default** `--boot-insns` budget (3,000,000,000) — actual boot
+took 2,114,096,390 insns, no bump needed (unlike the KASAN/KFENCE slow-boot warning this
+investigation was scoped to expect — `DEBUG_PAGEALLOC`/`PAGE_POISONING` are much cheaper than full
+shadow-memory instrumentation). Guest boot reached `Run /init` around the ~206s guest-time mark
+(comparable to `Image.slubdebug`'s ~207s). Completed all 100 cases at ~133 execs/sec (~33 guest
+MIPS), 6082 coverage buckets, 38-program corpus, **0 kernel crashes** (expected — clean kernel,
+100 random seed-1 programs; the point is the oracle is armed, not that it fires here).
+
+### Report-string prefix for the fuzzer's crash oracle — no new matcher needed
+
+Unlike a real KASAN/KFENCE build (which would need a new `"KFENCE:"` substring matcher in
+`kernel_crash_sig`, `crates/fs-cli/src/main.rs:167-186` — that function currently matches
+`"KASAN:"` and the SLUB debug strings but not `"KFENCE"`), `DEBUG_PAGEALLOC`'s fault is a plain
+kernel Oops. `kernel_crash_sig` **already** matches it with zero code changes needed:
+
+```
+s.contains("Unable to handle kernel")   // arch/riscv/mm/fault.c: "Unable to handle kernel %s at virtual address ..."
+```
+
+i.e. the exact banner prefix is:
+
+```
+Unable to handle kernel paging request at virtual address <addr>
+```
+
+followed by the usual RISC-V Oops dump (`epc :`, register file, call trace), which
+`kernel_crash_sig`'s existing `hard_fault` branch already dedupes by `epc`. So `Image.dpalloc` is
+usable against the fuzzer today with no oracle-side changes — the caveat above (page-granularity
+only) is the real cost, not any missing plumbing.
+
+**If rv32 KASAN/KFENCE support is ever added upstream** and `scripts/build-kasan-kernel.sh` is
+re-run, it would publish `firmware/Image.kasan`/`firmware/Image.kfence` instead and the *new*
+matcher work would be: KASAN's report banner is `"BUG: KASAN: <bug-type> in <function>"` (already
+covered by the existing `s.contains("KASAN:")` check); KFENCE's is `"BUG: KFENCE: <bug-type> in
+<function>"` (per `mm/kfence/report.c`'s `kfence_report_error()` format string) — that one **is
+not yet matched** (`kernel_crash_sig` checks `"KASAN:"` but not `"KFENCE"`), so add
+`|| s.contains("KFENCE:")` to the `hard_fault` condition at that point, but not before rv32 KFENCE
+actually exists to test it against.
