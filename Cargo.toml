@@ -8,6 +8,8 @@ members = [
     "crates/fs-cli",
     "crates/fs-diff",
     "crates/fs-platform",
+    "crates/fs-vec",
+    "crates/fs-san",
 ]
 
 [workspace.package]

@@ -214,6 +214,44 @@ impl Mmu {
         Ok(())
     }
 
+    /// Poison a region: clear every permission bit (READ/WRITE/EXEC/RAW/ACC) so *any* access to
+    /// these bytes faults with `FaultKind::Permission`, even though the address remains inside
+    /// the mapped window (distinguishing "used to be valid, now forbidden" from `Unmapped`).
+    ///
+    /// This is the primitive a sanitizer layer builds on: redzones around an allocation and
+    /// quarantined (freed) memory are both just poisoned bytes. Equivalent to
+    /// `self.protect(addr, len, 0)`, named separately because the *intent* (deny-all guard) is
+    /// distinct from `protect`'s general "stamp arbitrary perm" use.
+    pub fn poison(&mut self, addr: u32, len: u32) -> Result<(), Fault> {
+        self.protect(addr, len, 0)
+    }
+
+    /// True if `[addr, addr+len)` lies entirely inside the mapped guest window, without
+    /// touching contents or permissions. Lets callers (e.g. a redzone allocator) probe bounds
+    /// before deciding how much of a guard region actually fits, instead of relying on a
+    /// `protect`/`poison` call failing partway through.
+    pub fn in_bounds(&self, addr: u32, len: u32) -> bool {
+        if len == 0 {
+            return addr >= self.base && addr <= self.end();
+        }
+        let Some(start) = self.offset(addr) else {
+            return false;
+        };
+        let Some(last_addr) = addr.checked_add(len - 1) else {
+            return false;
+        };
+        match self.offset(last_addr) {
+            Some(last) => last >= start,
+            None => false,
+        }
+    }
+
+    /// Read-only permission byte at `addr` (e.g. for a sanitizer to inspect current state
+    /// without performing a checked access). `None` if `addr` is outside the mapped window.
+    pub fn perm_at(&self, addr: u32) -> Option<u8> {
+        self.offset(addr).map(|off| self.perms[off])
+    }
+
     /// Checked read: every byte must carry PERM_READ.
     pub fn read(&self, addr: u32, buf: &mut [u8]) -> Result<(), Fault> {
         let len = buf.len() as u32;
@@ -375,6 +413,45 @@ mod tests {
     fn unmapped_and_unaligned() {
         let m = Mmu::new(0x8000_0000, 0x1000);
         assert_eq!(m.read_u8(0x1234).unwrap_err().kind, FaultKind::Unmapped);
-        assert_eq!(m.read_u32(0x8000_0001).unwrap_err().kind, FaultKind::Unaligned);
+        assert_eq!(
+            m.read_u32(0x8000_0001).unwrap_err().kind,
+            FaultKind::Unaligned
+        );
+    }
+
+    #[test]
+    fn poison_faults_read_and_write_but_stays_mapped() {
+        let mut m = Mmu::new(0x8000_0000, 0x1000);
+        m.protect(0x8000_0000, 8, PERM_READ | PERM_WRITE).unwrap();
+        m.write_u8(0x8000_0000, 0x41).unwrap();
+        m.poison(0x8000_0000, 8).unwrap();
+        // Address is still inside the mapped window (Permission, not Unmapped).
+        assert_eq!(
+            m.read_u8(0x8000_0000).unwrap_err().kind,
+            FaultKind::Permission
+        );
+        assert_eq!(
+            m.write_u8(0x8000_0000, 0x42).unwrap_err().kind,
+            FaultKind::Permission
+        );
+        assert_eq!(m.perm_at(0x8000_0000), Some(0));
+    }
+
+    #[test]
+    fn in_bounds_checks_window_membership() {
+        let m = Mmu::new(0x8000_0000, 0x1000);
+        assert!(m.in_bounds(0x8000_0000, 0x1000));
+        assert!(!m.in_bounds(0x8000_0000, 0x1001));
+        assert!(!m.in_bounds(0x7fff_fffc, 8)); // starts before base
+        assert!(!m.in_bounds(0xffff_fff8, 16)); // overflows u32 on addr+len-1
+        assert!(m.in_bounds(0x8000_1000, 0)); // empty range at the exclusive end is fine
+        assert!(!m.in_bounds(0x8000_1000, 1)); // one past the end is not
+    }
+
+    #[test]
+    fn perm_at_reports_none_outside_window() {
+        let m = Mmu::new(0x8000_0000, 0x1000);
+        assert_eq!(m.perm_at(0x1234), None);
+        assert_eq!(m.perm_at(0x8000_0000), Some(0));
     }
 }

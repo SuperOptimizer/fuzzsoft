@@ -1,0 +1,12 @@
+[package]
+name = "fs-vec"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+fs-mmu = { path = "../fs-mmu" }
+fs-riscv = { path = "../fs-riscv" }
+
+[lints.rust]
+unsafe_code = "forbid"

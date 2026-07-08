@@ -51,3 +51,18 @@ version = "0.0.0"
 dependencies = [
  "fs-mmu",
 ]
+
+[[package]]
+name = "fs-san"
+version = "0.0.0"
+dependencies = [
+ "fs-mmu",
+]
+
+[[package]]
+name = "fs-vec"
+version = "0.0.0"
+dependencies = [
+ "fs-mmu",
+ "fs-riscv",
+]
