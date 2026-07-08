@@ -1,0 +1,12 @@
+[package]
+name = "fs-covmap"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fs-covmap"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"

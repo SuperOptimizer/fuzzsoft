@@ -21,6 +21,10 @@ name = "fs-cov"
 version = "0.0.0"
 
 [[package]]
+name = "fs-covmap"
+version = "0.0.0"
+
+[[package]]
 name = "fs-diff"
 version = "0.0.0"
 dependencies = [
