@@ -77,6 +77,7 @@ Status legend: **LOCKED** (user-confirmed) · **DEFAULT** (adopted from research
 | 48 | Generate vs mutate | **Mostly mutate corpus, periodically generate fresh** programs from descriptions for diversity. | LOCKED | M3 |
 | 49 | Fault injection | **Yes, M3 fast-follow**: systematic failure injection (fail_nth-style) to reach kernel error/cleanup paths, added just after the base loop works. | LOCKED | M3 |
 | 50 | CI | **Deferred** — add hosted CI once the workspace stabilizes; local checks in the meantime. | LOCKED (deferred) | later |
+| 51 | Kernel-heap oracle (near-term) | **Ship a second `slub_debug` kernel variant** (`firmware/Image.slubdebug`, built with `CONFIG_SLUB_DEBUG_ON=y` via `scripts/build-slubdebug-kernel.sh`): the *allocator* red-zones/poisons every slab object and oopses on corruption, which the existing `kernel_crash_sig` console oracle already catches — **zero emulator poisoning**. Chosen because emulator-side redzone poisoning false-positived ~40% on stock SLUB (adjacent live objects). Stock `firmware/Image` stays the default for throughput; run heap campaigns with `--kernel firmware/Image.slubdebug` (no `--sanitize`). Tradeoff: slower boot/runtime, but true positives. In-emulator KFENCE remains the future uninstrumented path. | LOCKED | M3 |
 
 ## Minor defaults adopted (no need to decide; change anytime)
 - Guest RAM: **128 MiB/lane** to start (fits rv32 kernel+initramfs; revisit vs host budget at M4/M5).

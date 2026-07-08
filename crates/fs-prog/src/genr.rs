@@ -143,12 +143,32 @@ fn gen_len(rng: &mut Rng, spec: LenSpec) -> u32 {
     }
 }
 
-fn mask_to_bits(v: u64, bits: u8) -> u64 {
+pub(crate) fn mask_to_bits(v: u64, bits: u8) -> u64 {
     if bits >= 64 {
         v
     } else {
         v & ((1u64 << bits) - 1)
     }
+}
+
+/// Curated "interesting" scalar values a mutator can swap into an `Int`/`Flags`/`Len` slot —
+/// syzkaller's classic 0/1/-1/boundary/page-size set, masked to the field's actual bit width.
+/// Shared with `mutate::mutate_interesting_int`.
+pub(crate) const INTERESTING_INTS: &[i64] = &[
+    0,
+    1,
+    2,
+    -1,
+    4096,             // PAGE_SIZE
+    -4096,
+    i32::MAX as i64,  // INT_MAX
+    i32::MIN as i64,  // INT_MIN
+    u16::MAX as i64,
+];
+
+pub(crate) fn pick_interesting_int(rng: &mut Rng, bits: u8) -> u64 {
+    let v = *rng.pick(INTERESTING_INTS);
+    mask_to_bits(v as u64, bits)
 }
 
 /// Biased scalar generation: {0, 1, 2, -1, boundary, small, full-random}, matching the flavor
@@ -194,13 +214,21 @@ fn gen_flags(rng: &mut Rng, vals: &[u32], bitmask: bool) -> u32 {
 }
 
 /// 70% pick an existing compatible producer earlier in the program-under-construction (if
-/// any), else fall back to a seed literal.
+/// any), else fall back to a seed literal. Among compatible producers, 60% of the time prefer
+/// the *most recently* produced one (`pool` is built in call order, so that's `compatible`'s
+/// last entry) rather than picking uniformly — this is what actually makes multi-call chains
+/// like `openat->read->close` or `socket->setsockopt->bind` form densely instead of scattering
+/// references thinly across every producer seen so far in a long program.
 pub(crate) fn pick_res(rng: &mut Rng, want: ResourceKind, pool: &[PoolEntry]) -> ResRef {
     if rng.chance(70) {
         let compatible: Vec<&PoolEntry> =
             pool.iter().filter(|e| kind_compat(want, e.kind)).collect();
         if !compatible.is_empty() {
-            let e = **rng.pick(&compatible);
+            let e = if compatible.len() > 1 && rng.chance(60) {
+                *compatible[compatible.len() - 1]
+            } else {
+                **rng.pick(&compatible)
+            };
             return ResRef::Produced {
                 call_idx: e.call_idx,
                 slot: e.slot,

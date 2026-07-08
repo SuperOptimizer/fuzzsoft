@@ -312,3 +312,69 @@ Conclusion: as predicted, poisoning guard bytes around a stock-SLUB allocation s
 ### Viable paths to real kernel-heap detection (future work)
 1. **slub_debug kernel** — build with `CONFIG_SLUB_DEBUG_ON` / `slub_debug=FZ`: the *allocator* inserts redzones + poison and self-checks them on free, printing "Redzone overwritten" oopses the fuzzer already detects via the console oracle. Kernel-cooperative, but zero emulator poisoning and immediately usable on this target.
 2. **KFENCE-in-emulator** — on a sampled fraction of kmalloc returns, the PC-hook *rewrites a0* to relocate the allocation onto a dedicated guard-page-flanked region in emulator memory (remapping the page tables), so guards never touch neighbors. This is the true uninstrumented path (and the model for the eventual Windows-pool case).
+
+---
+
+## Kernel-side SLUB debugging (viable now) — shipped 2026-07-08
+
+Path #1 above is now built and validated: a **second** RV32 Linux kernel Image, identical to the
+stock fuzzer kernel except that the *allocator itself* red-zones/poisons every slab object and
+self-checks on free. This turns the fuzzer's existing console crash oracle (`kernel_crash_sig`)
+into a real kernel-heap-bug detector with **zero emulator-side poisoning** — sidestepping the
+adjacent-object false positives that killed `--san-poison` on stock SLUB (see the experiment
+result above).
+
+### What was built
+
+- **Config:** started from the stock `build/linux-src/.config` and flipped on
+  `CONFIG_SLUB_DEBUG_ON=y` (on top of the already-set `CONFIG_SLUB=y` / `CONFIG_SLUB_DEBUG=y`).
+  `CONFIG_SLUB_DEBUG_ON` enables red-zoning + object poisoning + freelist/padding sanity checks
+  **by default for every slab cache**, with no `slub_debug=` cmdline argument required (equivalent
+  to booting `slub_debug=FZPU` unconditionally). `CONFIG_INITRAMFS_SOURCE` still points at
+  `boot/initramfs.spec`, so the guest fuzzing agent (`build/agent`, packed as `/init`) boots and
+  reaches the snapshot exactly as on the stock kernel — the snapshot/hypercall wire protocol is
+  unchanged.
+- **Out-of-tree build:** built with `O=build/linux-slubdebug` from a *clean second git worktree*
+  `build/linux-slubdebug-src` (Kbuild refuses an `O=` build against `build/linux-src` because that
+  tree already holds the stock in-tree build; and we must not `mrproper` it). Both worktrees sit on
+  the same kernel commit, so it is the same source, just a pristine checkout to build from.
+- **Outputs:** `firmware/Image.slubdebug` (26,930,176 bytes) and `firmware/System.map.slubdebug`
+  (4,160,369 bytes). The stock `firmware/Image` and `build/linux-src/System.map` (the files the
+  main fuzzer uses) are **untouched**.
+- **Reproduce:** `scripts/build-slubdebug-kernel.sh` (bash, `set -euo pipefail`) does the whole
+  thing deterministically — creates the worktree if missing, seeds + `olddefconfig`s the `.config`,
+  flips the SLUB debug symbols, verifies they stuck, builds `Image`, and publishes the two
+  `firmware/*.slubdebug` files.
+
+### How it catches bugs
+
+When guest kernel code overruns a slab allocation, writes through a dangling/freed pointer, or
+otherwise corrupts a slab object, **SLUB's own free-time checks fire** and the kernel prints a
+report such as `Redzone overwritten`, `Poison overwritten`, `Object already free`, or an outright
+`BUG`/oops with a call trace. All of these land on the guest console (UART), which is exactly the
+stream the fuzzer's `kernel_crash_sig` oracle already scans — so no new detection code is needed
+on the emulator side. A hit is a **true positive** (the allocator, not a guessed emulator redzone,
+declared the corruption), unlike the stock-SLUB emulator-poisoning approach.
+
+### How to run the fuzzer against it
+
+```
+./target/release/fuzzsoft fuzz --cases N --seed S --kernel firmware/Image.slubdebug
+```
+
+Run it **without** `--sanitize`/`--san-poison` — the kernel self-checks now; emulator poisoning is
+neither needed nor wanted here (it would re-introduce the adjacent-object false positives). Any
+SLUB corruption report shows up in the normal crash count/console dump.
+
+### Tradeoff
+
+Slower boot and slower steady-state than the stock kernel — `SLUB_DEBUG_ON` makes every alloc/free
+walk red-zones and poison the full object, and boot to snapshot is visibly longer (guest boot
+reaches `Run /init` around the ~207s guest-time mark vs. the stock kernel's much earlier point).
+Smoke test (2026-07-08): `fuzz --cases 50 --seed 1 --kernel firmware/Image.slubdebug` reached
+`snapshot captured`, completed all 50 cases at ~139 execs/sec (~21 guest MIPS), 3403 coverage
+buckets, 28-program corpus, **0 kernel crashes and no Redzone/Poison/BUG/oops** across the run (as
+expected — 50 random seed-1 programs don't corrupt the heap; the point is the oracle is now armed).
+The asymmetry is the whole trade: slower, but a crash here is a real kernel heap bug, not a
+sanitizer false positive. Use this Image for heap-focused campaigns; keep the stock `firmware/Image`
+for raw-throughput coverage growth.

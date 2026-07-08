@@ -5,7 +5,8 @@
 //! `docs/syzlang.md` §2.
 
 use crate::genr::{
-    PoolEntry, build_pool, gen_arg_value, generate, generate_args, pick_desc, pick_res,
+    PoolEntry, build_pool, gen_arg_value, generate, generate_args, pick_desc,
+    pick_interesting_int, pick_res,
 };
 use crate::lower::ptr_size_of;
 use crate::prog::{ArgValue, MAX_CALLS, Prog, ResRef, TypedCall};
@@ -183,17 +184,138 @@ fn wire_producer(rng: &mut Rng, p: &mut Prog) {
     });
 }
 
+/// Mutation op (a) from the fs-prog expansion brief: pick a `Res(kind)`-typed arg anywhere in
+/// the program and, if a compatible producer already exists earlier in the program, rewrite the
+/// arg to reference it. Unlike `wire_producer`, this never inserts a new call — it's the
+/// lightweight "just reuse what's already there" half, so it fires cheaply and often without
+/// growing the program.
+fn splice_resource_use(rng: &mut Rng, p: &mut Prog) {
+    let mut positions: Vec<(usize, usize, ResourceKind)> = Vec::new();
+    for (i, c) in p.calls.iter().enumerate() {
+        for (j, aty) in c.desc.args.iter().enumerate() {
+            if let ArgType::Res(k) = aty {
+                positions.push((i, j, *k));
+            }
+        }
+    }
+    if positions.is_empty() {
+        return;
+    }
+    let (idx, j, kind) = *rng.pick(&positions);
+    let pool = build_pool(&p.calls[..idx]);
+    let compatible: Vec<&PoolEntry> = pool.iter().filter(|e| kind_compat(kind, e.kind)).collect();
+    if compatible.is_empty() {
+        return;
+    }
+    let e = **rng.pick(&compatible);
+    p.calls[idx].args[j] = ArgValue::Res(ResRef::Produced {
+        call_idx: e.call_idx,
+        slot: e.slot,
+    });
+}
+
+/// Mutation op (b): toggle a single known flag value on or off (XOR one element of the arg's
+/// `vals` table into its current bits) rather than only ever re-rolling the whole `Flags` value
+/// from scratch via `gen_arg_value` — reaches small, targeted flag deltas a full re-roll would
+/// rarely produce on its own.
+fn toggle_flag_bit(rng: &mut Rng, p: &mut Prog) {
+    let mut candidates: Vec<(usize, usize, &'static [u32])> = Vec::new();
+    for (i, c) in p.calls.iter().enumerate() {
+        for (j, aty) in c.desc.args.iter().enumerate() {
+            if let ArgType::Flags { vals, .. } = aty
+                && !vals.is_empty()
+            {
+                candidates.push((i, j, vals));
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return;
+    }
+    let (i, j, vals) = *rng.pick(&candidates);
+    let bit = *rng.pick(vals);
+    if let ArgValue::Imm(v) = &mut p.calls[i].args[j] {
+        *v ^= bit as u64;
+    }
+}
+
+/// Mutation op (c): grow or shrink a `Buffer` payload in place (append random bytes, or
+/// truncate) instead of only ever resampling a fresh length from its `LenSpec` — lets a
+/// buffer/its sibling `Len{of}` arg drift out of sync incrementally across a mutation chain,
+/// which is exactly the kind of "usually correct, occasionally desynced" length behavior
+/// `docs/syzlang.md` calls out as valuable.
+fn resize_buffer(rng: &mut Rng, p: &mut Prog) {
+    let mut candidates: Vec<(usize, usize)> = Vec::new();
+    for (i, c) in p.calls.iter().enumerate() {
+        for (j, aty) in c.desc.args.iter().enumerate() {
+            let ArgType::Ptr { inner, .. } = aty else {
+                continue;
+            };
+            if !matches!(inner, ArgType::Buffer { .. }) {
+                continue;
+            }
+            if matches!(&c.args[j], ArgValue::Ptr(b) if matches!(b.as_ref(), ArgValue::Bytes(_)))
+            {
+                candidates.push((i, j));
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return;
+    }
+    let (i, j) = *rng.pick(&candidates);
+    if let ArgValue::Ptr(inner) = &mut p.calls[i].args[j]
+        && let ArgValue::Bytes(b) = inner.as_mut()
+    {
+        if b.is_empty() || rng.bool() {
+            let n = 1 + rng.below(16);
+            for _ in 0..n {
+                b.push(rng.next() as u8);
+            }
+            b.truncate(4096); // stay well within the 32KiB scratch cap after many mutations
+        } else {
+            let cut = 1 + rng.below(b.len());
+            let new_len = b.len() - cut;
+            b.truncate(new_len);
+        }
+    }
+}
+
+/// Mutation op (d): swap in a curated "interesting" integer (0, 1, -1, `INT_MAX`, `PAGE_SIZE`,
+/// ...) for an `Int`-typed scalar arg — `genr::gen_int` already biases fresh generation toward
+/// these, but a dedicated mutator lets an existing, otherwise-unrelated program get nudged
+/// straight to a boundary value without re-rolling everything else about that call.
+fn mutate_interesting_int(rng: &mut Rng, p: &mut Prog) {
+    let mut candidates: Vec<(usize, usize, u8)> = Vec::new();
+    for (i, c) in p.calls.iter().enumerate() {
+        for (j, aty) in c.desc.args.iter().enumerate() {
+            if let ArgType::Int { bits, .. } = aty {
+                candidates.push((i, j, *bits));
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return;
+    }
+    let (i, j, bits) = *rng.pick(&candidates);
+    p.calls[i].args[j] = ArgValue::Imm(pick_interesting_int(rng, bits));
+}
+
 /// Mutate `base` into a new, still well-formed `Prog`. Never mutates `base` in place.
 pub fn mutate(rng: &mut Rng, base: &Prog) -> Prog {
     let mut p = base.clone();
     if p.calls.is_empty() {
         return generate(rng);
     }
-    match rng.below(4) {
+    match rng.below(8) {
         0 if p.calls.len() < MAX_CALLS => insert_call(rng, &mut p),
         1 if p.calls.len() > 1 => remove_call(rng, &mut p),
         2 => mutate_random_arg(rng, &mut p),
-        _ => wire_producer(rng, &mut p),
+        3 => wire_producer(rng, &mut p),
+        4 => splice_resource_use(rng, &mut p),
+        5 => toggle_flag_bit(rng, &mut p),
+        6 => resize_buffer(rng, &mut p),
+        _ => mutate_interesting_int(rng, &mut p),
     }
     if p.calls.is_empty() {
         return generate(rng);
@@ -297,5 +419,124 @@ mod tests {
         assert!(p.is_well_formed());
         // After enough tries, the read's fd arg should have become a Produced reference at
         // least once across many seeds (checked in the crate-level integration test too).
+    }
+
+    #[test]
+    fn splice_resource_use_rewires_without_inserting_calls() {
+        // openat -> read, but read's fd starts as a Seed (no threading yet).
+        let openat = SYSCALLS.iter().find(|d| d.name == "openat").unwrap();
+        let read = SYSCALLS.iter().find(|d| d.name == "read").unwrap();
+        let mut rng = Rng::new(77);
+        let mut p = Prog::new();
+        p.calls.push(TypedCall {
+            desc: openat,
+            args: generate_args(&mut rng, openat, &[]),
+        });
+        let mut read_args = generate_args(&mut rng, read, &p.calls);
+        read_args[0] = ArgValue::Res(ResRef::Seed(-1));
+        p.calls.push(TypedCall {
+            desc: read,
+            args: read_args,
+        });
+        assert!(p.is_well_formed());
+        let calls_before = p.calls.len();
+
+        let mut saw_produced = false;
+        for _ in 0..200 {
+            splice_resource_use(&mut rng, &mut p);
+            assert!(p.is_well_formed());
+            assert_eq!(p.calls.len(), calls_before, "must never insert/remove calls");
+            if matches!(p.calls[1].args[0], ArgValue::Res(ResRef::Produced { .. })) {
+                saw_produced = true;
+            }
+        }
+        assert!(saw_produced, "splice_resource_use never wired the fd");
+    }
+
+    #[test]
+    fn toggle_flag_bit_changes_a_flags_arg_over_many_tries() {
+        let openat = SYSCALLS.iter().find(|d| d.name == "openat").unwrap();
+        let mut rng = Rng::new(9001);
+        let mut p = Prog::new();
+        p.calls.push(TypedCall {
+            desc: openat,
+            args: generate_args(&mut rng, openat, &[]),
+        });
+        let ArgValue::Imm(initial) = p.calls[0].args[2] else {
+            panic!("openat's flags arg should be Imm");
+        };
+        let mut changed = false;
+        for _ in 0..100 {
+            toggle_flag_bit(&mut rng, &mut p);
+            assert!(p.is_well_formed());
+            if let ArgValue::Imm(v) = p.calls[0].args[2]
+                && v != initial
+            {
+                changed = true;
+            }
+        }
+        assert!(changed, "toggle_flag_bit never changed the flags value");
+    }
+
+    #[test]
+    fn resize_buffer_grows_or_shrinks_a_buffer_payload() {
+        let write = SYSCALLS.iter().find(|d| d.name == "write").unwrap();
+        let mut rng = Rng::new(555);
+        let mut p = Prog::new();
+        let mut args = generate_args(&mut rng, write, &[]);
+        // Force a known, nonzero starting length so both grow and shrink are exercisable.
+        args[1] = ArgValue::Ptr(Box::new(ArgValue::Bytes(vec![0u8; 10])));
+        args[2] = ArgValue::Imm(10);
+        p.calls.push(TypedCall { desc: write, args });
+        assert!(p.is_well_formed());
+
+        let mut saw_len_change = false;
+        for _ in 0..200 {
+            resize_buffer(&mut rng, &mut p);
+            assert!(p.is_well_formed());
+            if let ArgValue::Ptr(b) = &p.calls[0].args[1]
+                && let ArgValue::Bytes(bytes) = b.as_ref()
+                && bytes.len() != 10
+            {
+                saw_len_change = true;
+            }
+        }
+        assert!(saw_len_change, "resize_buffer never changed the buffer length");
+        // lower() must still succeed even though the Len{of:1} arg (still Imm(10)) is now
+        // desynced from the buffer's actual (mutated) length — that's the intended fuzz signal.
+        let _ = crate::lower::lower(&p, 0x9000_0000);
+    }
+
+    #[test]
+    fn mutate_interesting_int_picks_from_the_curated_pool() {
+        let prctl = SYSCALLS.iter().find(|d| d.name == "prctl").unwrap();
+        let mut rng = Rng::new(321);
+        let mut p = Prog::new();
+        p.calls.push(TypedCall {
+            desc: prctl,
+            args: generate_args(&mut rng, prctl, &[]),
+        });
+        for _ in 0..50 {
+            mutate_interesting_int(&mut rng, &mut p);
+            assert!(p.is_well_formed());
+        }
+        // prctl's args[1..] are all Int{32,unsigned}; at least one should have landed on a
+        // curated interesting value across 50 tries.
+        let saw_interesting = p.calls[0].args[1..].iter().any(|a| {
+            matches!(a, ArgValue::Imm(v) if [0u64,1,2,u32::MAX as u64,4096,(-4096i64) as u32 as u64,i32::MAX as u64].contains(v))
+        });
+        assert!(saw_interesting, "never landed on a curated interesting value");
+    }
+
+    #[test]
+    fn full_dispatch_exercises_all_new_ops_without_breaking_well_formedness() {
+        let mut rng = Rng::new(2024);
+        let mut p = generate(&mut rng);
+        for _ in 0..3000 {
+            p = mutate(&mut rng, &p);
+            assert!(p.is_well_formed());
+            assert!(!p.calls.is_empty());
+            assert!(p.calls.len() <= MAX_CALLS);
+        }
     }
 }

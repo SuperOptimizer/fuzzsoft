@@ -13,8 +13,11 @@
 //!   instruction **once** per step from the shared interleaved store (`VecMmu::ifetch16_same`,
 //!   not `LANES` per-lane fetches as in the original cut of this executor); `try_simd_alu` decodes
 //!   each ALU instruction once and executes it as one packed `Simd<u32, LANES>` op across all 16
-//!   lanes; only the loop's `bge`/`jal` fall back to the scalar path (once each per iteration, now
-//!   against the same shared `VecMmu` via `ifetch16_lane`).
+//!   lanes, and the loop's `bge`/`jal` are now *also* packed (`try_simd_branch`/`try_simd_jal`) —
+//!   every lane computes its own branch outcome/jump target from its own operands as one masked
+//!   vector op, so this loop body has no remaining always-scalar instruction at all (see
+//!   `DESIGN.md`, which used to note `bge`/`jal` as exactly the two instructions per iteration
+//!   that could never be vectorized).
 //! - **Scalar-over-lanes path**: `LANES` independent [`fs_riscv::Cpu`]s, each with its own
 //!   `fs_mmu::Mmu` and each stepped one instruction at a time. This is the exact decode/execute
 //!   logic `VecCpu`'s own scalar fallback calls, just run `LANES` times over instead of once as a
@@ -186,10 +189,11 @@ fn seed(lane: usize) -> u32 {
     (lane as u32) * 7 + 1
 }
 
-/// Runs `prog` on `VecCpu`, which takes the SIMD fast path for every converged ALU instruction.
-/// Returns `(total lane-instructions retired, SIMD ALU fast-path step() calls, SIMD same-address
-/// memory fast-path step() calls)`.
-fn run_simd(prog: &[u32]) -> (u64, u64, u64) {
+/// Runs `prog` on `VecCpu`, which takes the SIMD fast path for every converged ALU/branch/jump/
+/// memory instruction. Returns `(total lane-instructions retired, SIMD ALU fast-path step() calls,
+/// SIMD branch/jump fast-path step() calls, SIMD same-address memory fast-path step() calls, SIMD
+/// gather/scatter memory fast-path step() calls)`.
+fn run_simd(prog: &[u32]) -> (u64, u64, u64, u64, u64) {
     let mut mmu = make_vec_mmu(prog);
     let mut vcpu = VecCpu::new(BASE);
     for lane in 0..LANES {
@@ -198,7 +202,13 @@ fn run_simd(prog: &[u32]) -> (u64, u64, u64) {
     while vcpu.any_active() {
         vcpu.step(&mut mmu);
     }
-    (vcpu.insns_retired.iter().sum(), vcpu.simd_alu_steps, vcpu.simd_mem_steps)
+    (
+        vcpu.insns_retired.iter().sum(),
+        vcpu.simd_alu_steps,
+        vcpu.simd_branch_steps,
+        vcpu.simd_mem_steps,
+        vcpu.simd_gather_steps,
+    )
 }
 
 /// Runs `prog` on `LANES` independent scalar `fs_riscv::Cpu`s, one instruction at a time — the
@@ -225,12 +235,16 @@ fn bench_one(name: &str, prog: &[u32]) {
     let simd_start = Instant::now();
     let mut simd_total_insns = 0u64;
     let mut simd_alu_steps = 0u64;
+    let mut simd_branch_steps = 0u64;
     let mut simd_mem_steps = 0u64;
+    let mut simd_gather_steps = 0u64;
     for _ in 0..OUTER_REPEATS {
-        let (insns, alu_steps, mem_steps) = run_simd(prog);
+        let (insns, alu_steps, branch_steps, mem_steps, gather_steps) = run_simd(prog);
         simd_total_insns += insns;
         simd_alu_steps += alu_steps;
+        simd_branch_steps += branch_steps;
         simd_mem_steps += mem_steps;
+        simd_gather_steps += gather_steps;
     }
     let simd_elapsed = simd_start.elapsed();
 
@@ -253,8 +267,9 @@ fn bench_one(name: &str, prog: &[u32]) {
     println!("{name} ({LANES} lanes x {ITERS} loop iterations x {OUTER_REPEATS} repeats)");
     println!(
         "  SIMD fast path:    {simd_total_insns} lane-instructions in {simd_elapsed:?}  =  \
-         {simd_rate:.0} lane-instr/sec  ({simd_alu_steps} ALU-path + {simd_mem_steps} \
-         same-address-mem-path step() calls)"
+         {simd_rate:.0} lane-instr/sec  ({simd_alu_steps} ALU-path + {simd_branch_steps} \
+         branch/jump-path + {simd_mem_steps} same-address-mem-path + {simd_gather_steps} \
+         gather/scatter-mem-path step() calls)"
     );
     println!(
         "  scalar-over-lanes: {scalar_total_insns} lane-instructions in {scalar_elapsed:?}  =  \

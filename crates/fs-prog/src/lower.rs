@@ -110,7 +110,14 @@ pub fn struct_layout(fields: &[Field], vals: &[ArgValue]) -> (Vec<u32>, u32, u32
 
 /// Serialize one value's bytes standalone (i.e. as it would appear once placed at an aligned
 /// scratch offset) — recurses into `Struct` fields, writing them at their own laid-out offsets.
-fn build_bytes(ty: &ArgType, val: &ArgValue) -> Vec<u8> {
+///
+/// Takes `w`/`scratch_base_va` because a `Struct` field may itself be a `Ptr` (e.g. `msghdr`'s
+/// `msg_iov`/`msg_name`/`msg_control`): such a nested pointee is bump-allocated into `w` *before*
+/// the enclosing struct's own bytes are written (so it lands at a lower scratch offset than its
+/// parent), and the 4-byte pointer value embedded in the parent's buffer is
+/// `scratch_base_va + that offset` — exactly the same rule `lower_arg` applies to a top-level
+/// `Ptr` arg, just recursively.
+fn build_bytes(w: &mut ScratchWriter, scratch_base_va: u32, ty: &ArgType, val: &ArgValue) -> Vec<u8> {
     match (ty, val) {
         (ArgType::Const(_), ArgValue::Imm(v)) => (*v as u32).to_le_bytes().to_vec(),
         (ArgType::Int { bits, .. }, ArgValue::Imm(v)) => {
@@ -124,11 +131,18 @@ fn build_bytes(ty: &ArgType, val: &ArgValue) -> Vec<u8> {
         (ArgType::Res(_), ArgValue::Res(ResRef::Produced { .. })) => 0u32.to_le_bytes().to_vec(),
         (ArgType::Buffer { .. }, ArgValue::Bytes(b)) => b.clone(),
         (ArgType::StringConst(_), ArgValue::Bytes(b)) => b.clone(),
+        (ArgType::Ptr { nullable, .. }, ArgValue::Imm(0)) if *nullable => {
+            0u32.to_le_bytes().to_vec()
+        }
+        (ArgType::Ptr { inner, .. }, ArgValue::Ptr(pointee)) => {
+            let off = serialize_into(w, scratch_base_va, inner, pointee);
+            scratch_base_va.wrapping_add(off).to_le_bytes().to_vec()
+        }
         (ArgType::Struct(fields), ArgValue::Struct(vals)) => {
             let (offsets, total, _) = struct_layout(fields, vals);
             let mut buf = vec![0u8; total as usize];
             for ((f, v), off) in fields.iter().zip(vals).zip(offsets) {
-                let fb = build_bytes(f.ty, v);
+                let fb = build_bytes(w, scratch_base_va, f.ty, v);
                 let off = off as usize;
                 let n = fb.len().min(buf.len().saturating_sub(off));
                 buf[off..off + n].copy_from_slice(&fb[..n]);
@@ -139,9 +153,9 @@ fn build_bytes(ty: &ArgType, val: &ArgValue) -> Vec<u8> {
     }
 }
 
-fn serialize_into(w: &mut ScratchWriter, ty: &ArgType, val: &ArgValue) -> u32 {
+fn serialize_into(w: &mut ScratchWriter, scratch_base_va: u32, ty: &ArgType, val: &ArgValue) -> u32 {
     let (_, align) = value_size_align(ty, val);
-    let bytes = build_bytes(ty, val);
+    let bytes = build_bytes(w, scratch_base_va, ty, val);
     w.write(&bytes, align)
 }
 
@@ -254,7 +268,7 @@ fn lower_arg(
         }
         (ArgType::Ptr { nullable, .. }, ArgValue::Imm(0)) if *nullable => 0,
         (ArgType::Ptr { inner, .. }, ArgValue::Ptr(pointee)) => {
-            let off = serialize_into(w, inner, pointee);
+            let off = serialize_into(w, scratch_base_va, inner, pointee);
             if let Produces::OutArray { arg_idx, .. } = this_produces
                 && arg_idx as usize == arg_j
             {
