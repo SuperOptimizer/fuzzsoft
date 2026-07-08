@@ -19,10 +19,15 @@
 //! per-lane scalar path. See `DESIGN.md`'s "Full-system (VecSystem)" section for the honest
 //! accounting of how often that fast path actually fires on real kernel code.
 
-use fs_mmu::{Access, Bus, Golden};
+use fs_mmu::{Access, Golden, PAGE_SIZE};
+// `Bus` is only needed to call `CowMachine`'s trait methods inside the `debug_assertions`-only
+// equality guards below (`shared_fetch16`/`try_shared_load`); release builds compile those out
+// entirely, so import it conditionally to avoid an unused-import warning in release.
+#[cfg(debug_assertions)]
+use fs_mmu::Bus;
 use fs_platform::{CowMachine, Machine};
 use fs_riscv::sys::{self, Priv};
-use fs_riscv::{decode, decode_compressed, AluOp, Cpu, Inst, SysExit};
+use fs_riscv::{decode, decode_compressed, AluOp, Cpu, Inst, LoadOp, SysExit};
 use std::simd::prelude::*;
 use std::sync::Arc;
 
@@ -56,11 +61,19 @@ pub struct VecSystem {
     pub active: [bool; LANES],
     /// Set exactly when a lane transitions from active to inactive.
     pub exit: [Option<LaneExit>; LANES],
-    /// `step()` calls that took the converged-lane SIMD ALU fast path.
+    /// `step()` calls that executed a converged SIMD payload (ALU, or a same-address LOAD —
+    /// `docs/cow-shared-ram.md` PR4) instead of the per-lane scalar loop.
     pub simd_steps: u64,
     /// `step()` calls that fell back to the per-lane scalar `Cpu::step_system` loop (for at least
-    /// one active lane — i.e. every `step()` call that did not take the SIMD fast path).
+    /// one active lane — i.e. every `step()` call that did not take a SIMD payload).
     pub scalar_steps: u64,
+    /// `step()` calls whose instruction fetch (both halfwords, if a 32-bit instruction) was
+    /// serviced by the PR4 shared translate+fetch path — ONE golden-image translate+read instead
+    /// of `LANES` independent per-lane ones — regardless of whether the decoded instruction then
+    /// went on to execute via a SIMD payload or declined to the per-lane loop for its actual
+    /// execution (a decline still only pays for the shared fetch once, not `LANES` times). This is
+    /// the PR4 perf metric `boot_vec` reports as "shared-path fraction".
+    pub shared_fetch_steps: u64,
 }
 
 impl VecSystem {
@@ -91,6 +104,7 @@ impl VecSystem {
             exit: [None; LANES],
             simd_steps: 0,
             scalar_steps: 0,
+            shared_fetch_steps: 0,
         }
     }
 
@@ -155,7 +169,7 @@ impl VecSystem {
             fs_platform::sync_timer_cow(&mut self.lanes[lane], &self.bus[lane]);
         }
 
-        if self.try_simd_alu_step() {
+        if self.try_converged_fast_path() {
             self.simd_steps += 1;
             return;
         }
@@ -172,27 +186,31 @@ impl VecSystem {
         }
     }
 
-    /// The converged-lane SIMD ALU fast path. Returns `true` (having executed the instruction
-    /// across every active lane) only when ALL of the following hold, checked *before* anything
-    /// is mutated beyond the timer-pending-bit refresh every step already needs (see below):
+    /// The converged-lane fast path (`docs/cow-shared-ram.md` PR4). Returns `true` (having
+    /// executed the instruction across every active lane) only when ALL of the following hold,
+    /// checked *before* anything is mutated beyond the timer-pending-bit refresh every step
+    /// already needs (see below):
     ///
-    /// - every active lane shares `pc`, `privilege`, and `csr.satp` (so translation — if any —
-    ///   resolves the same way for every lane, *pending* the identical-bytes check below);
+    /// - every active lane shares `pc`, `privilege`, and `csr.satp` (so translation resolves the
+    ///   same way for every lane, *pending* the shared-fetch/overlay checks below);
     /// - `update_timers`'s effect (replicated here byte-for-byte from `fs_riscv::Cpu`'s private
     ///   method, since the fast path bypasses `step_system`) leaves no active lane with a pending,
     ///   enabled interrupt — a trap this step would need full `step_system` trap-vectoring, which
     ///   this fast path does not implement;
-    /// - the fetch (translated per-lane, byte-compared across lanes — never assumed identical
-    ///   just because `pc`/`satp` agree, since each lane owns independent physical memory) decodes
-    ///   to `Inst::OpImm`/`Inst::Op`: the only instruction classes `decode`/`decode_compressed`
-    ///   produce that touch no memory, no CSR, and cannot fault on any operand value.
+    /// - the instruction is translated+fetched ONCE against the shared golden image
+    ///   ([`Self::shared_fetch16`]) instead of once per lane — the PR4 perf win: a group that
+    ///   turns out not to qualify below still only pays for this 1× speculative fetch, not `LANES`×;
+    /// - the decoded instruction is `Inst::OpImm`/`Inst::Op` (packed ALU, no memory/CSR, cannot
+    ///   fault on any operand value — dispatched to the existing [`Self::dispatch_simd_alu`]
+    ///   payload), or `Inst::Load` whose effective address also happens to agree across every
+    ///   active lane ([`Self::try_shared_load`] translates+reads that one address once too).
     ///
     /// On any doubt this declines, having mutated nothing except the same per-lane
     /// `mip`/CLINT-derived bits `Cpu::step_system` would unconditionally mutate anyway (see
     /// `update_timers` below) — falling through to the scalar per-lane loop reproduces the exact
     /// same state from there (that loop's `step_system` recomputes the identical, idempotent
     /// `update_timers` result and does its own translation).
-    fn try_simd_alu_step(&mut self) -> bool {
+    fn try_converged_fast_path(&mut self) -> bool {
         let active = self.active;
         let Some(first) = active.iter().position(|&a| a) else {
             return false;
@@ -225,54 +243,181 @@ impl VecSystem {
             }
         }
 
-        // Fetch: translate + read per lane (translation/permission is genuinely per-lane state,
-        // even though satp/privilege agree), requiring every active lane's bytes to agree. The
-        // low halfword alone carries the full opcode for a 32-bit instruction (bits [6:0]), so a
-        // class that can never decode to `OpImm`/`Op` (load/store/branch/jal/jalr/system/amo/
-        // fence — the majority of a real kernel's non-ALU instruction mix) is rejected right here,
-        // *before* paying for a second per-lane translate+fetch that would only be thrown away.
-        let Some(lo0) = self.fetch16_converged(active, pc0) else {
+        // Shared translate+fetch (PR4): ONE golden-image translate+read instead of `LANES`
+        // independent per-lane ones. Declines to the per-lane loop (which retranslates/refetches
+        // each lane correctly, exactly as it always has) on any doubt at all.
+        let Some(lo0) = self.shared_fetch16(first, pc0) else {
             return false;
         };
         let (inst, ilen) = if lo0 & 0x3 != 0x3 {
             (decode_compressed(lo0), 2u32)
         } else {
-            let opcode = lo0 & 0x7f;
-            if opcode != 0x13 && opcode != 0x33 {
-                return false; // provably not OpImm/Op — decline without fetching the high half
-            }
-            let Some(hi0) = self.fetch16_converged(active, pc0.wrapping_add(2)) else {
+            let Some(hi0) = self.shared_fetch16(first, pc0.wrapping_add(2)) else {
                 return false;
             };
             (decode((lo0 as u32) | ((hi0 as u32) << 16)), 4u32)
         };
+        // The instruction fetch itself succeeded via the shared path, regardless of what the
+        // dispatch below does with it — this is the metric `boot_vec` reports as "shared-path
+        // fraction": how often the O(LANES) speculative fetch was replaced by an O(1) one.
+        self.shared_fetch_steps += 1;
 
-        let (op, rd, rs1, rs2, imm): (AluOp, u8, u8, Option<u8>, i32) = match inst {
-            Inst::OpImm { op, rd, rs1, imm } => (op, rd, rs1, None, imm),
-            Inst::Op { op, rd, rs1, rs2 } => (op, rd, rs1, Some(rs2), 0),
-            _ => return false, // anything else: scalar path handles it exactly as today
+        match inst {
+            Inst::OpImm { op, rd, rs1, imm } => {
+                self.dispatch_simd_alu(active, AluDispatch { op, rd, rs1, rs2: None, imm }, ilen);
+                true
+            }
+            Inst::Op { op, rd, rs1, rs2 } => {
+                self.dispatch_simd_alu(active, AluDispatch { op, rd, rs1, rs2: Some(rs2), imm: 0 }, ilen);
+                true
+            }
+            Inst::Load { op, rd, rs1, imm } => self.try_shared_load(active, op, rd, rs1, imm, ilen),
+            // Stores (data is per-lane), branches/jumps, CSR/system/mul-div/atomics: the per-lane
+            // scalar loop handles these exactly as before. The shared fetch above still saved
+            // `LANES`-1 speculative translate+fetches for this one instruction.
+            _ => false,
+        }
+    }
+
+    /// Translate+fetch one instruction halfword at `va` for the WHOLE converged group in one
+    /// shot, against the shared golden image, instead of the O(`LANES`) per-lane translate+fetch
+    /// this used to require. Uses lane `first`'s CPU state (every active lane shares `pc`/
+    /// `privilege`/`csr.satp` by the caller's convergence check, so translation resolves
+    /// identically for all of them via [`fs_riscv::Cpu::xlate_golden_readonly`]).
+    ///
+    /// Declines (`None`), having mutated nothing, when: the read-only walk itself declines (an
+    /// unmapped/faulting VA, an A/D bit that would need setting, a superpage edge, an
+    /// out-of-golden-bounds PTE read, or a page-table page privately COW'd in any lane since
+    /// golden was captured — the mutating per-lane `xlate` must run instead in every case); the
+    /// resulting physical address falls outside golden's RAM window entirely; the resulting code
+    /// page is privately COW'd (self-modified) in ANY lane, active or not — a lane that diverged
+    /// its own code/PTE page must never have that divergence painted over by a golden broadcast;
+    /// or the golden fetch itself declines (out of bounds / missing `PERM_EXEC`).
+    ///
+    /// In debug builds, on success this additionally performs lane `first`'s REAL `xlate`+
+    /// `ifetch16` (idempotent here: a clean `xlate_golden_readonly` success already proves A/D
+    /// need no writeback, so this cannot mutate any memory — it only fills lane `first`'s own TLB,
+    /// exactly as a future real step would anyway) and asserts the two agree byte-for-byte — the
+    /// runtime guard against any drift between the golden-readonly walk and the real one (compiled
+    /// out entirely in release).
+    fn shared_fetch16(&mut self, first: usize, va: u32) -> Option<u16> {
+        let golden = &self.golden;
+        let bus = &self.bus;
+        let pa = self.lanes[first]
+            .xlate_golden_readonly(golden, va, Access::Exec, |addr| any_lane_overlaid(golden, bus, addr))
+            .ok()?;
+        if any_lane_overlaid(golden, bus, pa) {
+            return None; // some lane privately modified this code page: never broadcast golden
+        }
+        let hw = self.golden.fetch_u16(pa)?;
+
+        #[cfg(debug_assertions)]
+        {
+            let real_pa = self.lanes[first].xlate(&mut self.bus[first], va, Access::Exec).unwrap_or_else(|e| {
+                panic!("PR4 guard: shared fetch succeeded (va={va:#x} pa={pa:#x}) but lane {first}'s real xlate faulted: {e}")
+            });
+            debug_assert_eq!(
+                real_pa, pa,
+                "PR4 guard: shared golden translation ({pa:#x}) disagreed with lane {first}'s real xlate ({real_pa:#x}) at va={va:#x}"
+            );
+            let real_hw = self.bus[first].ifetch16(real_pa).unwrap_or_else(|f| {
+                panic!("PR4 guard: shared fetch succeeded (va={va:#x} pa={pa:#x}) but lane {first}'s real ifetch16 faulted: {f}")
+            });
+            debug_assert_eq!(
+                hw, real_hw,
+                "PR4 guard: shared golden-broadcast fetch ({hw:#06x}) disagreed with lane {first}'s real xlate+ifetch16 ({real_hw:#06x}) at va={va:#x}"
+            );
+        }
+
+        Some(hw)
+    }
+
+    /// Converged same-address LOAD fast path (PR4): computes each active lane's effective address
+    /// from its own (independent) registers — this is address *computation*, not the shared
+    /// fetch above, so addresses may legitimately diverge even though `pc`/`satp` agree — and only
+    /// proceeds if every active lane's address is identical. On agreement, translates that one
+    /// address read-only against golden (`Access::Read`), requires the containing page to be
+    /// un-overlaid in every lane (the same self-modified-page guard `shared_fetch16` uses — a
+    /// store to a page one lane reads from must never be masked by a golden broadcast), then reads
+    /// the value ONCE from golden and broadcasts it (sign-extended per `LoadOp`) to every active
+    /// lane. Declines (`false`, having mutated nothing) on address divergence, a misaligned/
+    /// page-crossing access (serviced byte-wise by the scalar `Cpu::load` instead), a translation
+    /// decline, an overlaid page, or a golden read miss; the per-lane scalar loop then re-services
+    /// every active lane exactly as it always has. Stores are never handled here — store data is
+    /// inherently per-lane.
+    fn try_shared_load(&mut self, active: [bool; LANES], op: LoadOp, rd: u8, rs1: u8, imm: i32, ilen: u32) -> bool {
+        let Some(first) = active.iter().position(|&a| a) else {
+            return false;
         };
-
-        let mut a_arr = [0u32; LANES];
-        let mut b_arr = [0u32; LANES];
-        for lane in 0..LANES {
-            if !active[lane] {
+        let addr0 = rd_reg(&self.lanes[first], rs1).wrapping_add(imm as u32);
+        for (lane, &is_active) in active.iter().enumerate() {
+            if !is_active {
                 continue;
             }
-            a_arr[lane] = rd_reg(&self.lanes[lane], rs1);
-            b_arr[lane] = match rs2 {
-                Some(rs2) => rd_reg(&self.lanes[lane], rs2),
-                None => imm as u32,
-            };
+            if rd_reg(&self.lanes[lane], rs1).wrapping_add(imm as u32) != addr0 {
+                return false; // divergent effective address: per-lane loop handles the gather
+            }
         }
-        let result = simd_alu(op, Simd::from_array(a_arr), Simd::from_array(b_arr)).to_array();
+        let (size, signed) = match op {
+            LoadOp::Lb => (1u8, true),
+            LoadOp::Lbu => (1, false),
+            LoadOp::Lh => (2, true),
+            LoadOp::Lhu => (2, false),
+            LoadOp::Lw => (4, false),
+        };
+        // Misaligned/page-crossing accesses are serviced byte-wise by the scalar `Cpu::load`; this
+        // fast path only ever handles the common naturally-aligned, single-page case.
+        if !addr0.is_multiple_of(size as u32) {
+            return false;
+        }
+        let golden = &self.golden;
+        let bus = &self.bus;
+        let Ok(pa) =
+            self.lanes[first].xlate_golden_readonly(golden, addr0, Access::Read, |addr| any_lane_overlaid(golden, bus, addr))
+        else {
+            return false;
+        };
+        if any_lane_overlaid(golden, bus, pa) {
+            return false; // some lane privately wrote this page: never broadcast golden
+        }
+        let Some(raw) = self.golden.read_sized(pa, size) else {
+            return false;
+        };
 
-        for lane in 0..LANES {
-            if !active[lane] {
+        #[cfg(debug_assertions)]
+        {
+            let real_pa = self.lanes[first].xlate(&mut self.bus[first], addr0, Access::Read).unwrap_or_else(|e| {
+                panic!("PR4 guard: shared load succeeded (va={addr0:#x} pa={pa:#x}) but lane {first}'s real xlate faulted: {e}")
+            });
+            debug_assert_eq!(
+                real_pa, pa,
+                "PR4 guard: shared golden load translation ({pa:#x}) disagreed with lane {first}'s real xlate ({real_pa:#x}) at va={addr0:#x}"
+            );
+            let real_val = self.bus[first].load(real_pa, size).unwrap_or_else(|f| {
+                panic!("PR4 guard: shared load succeeded (va={addr0:#x} pa={pa:#x}) but lane {first}'s real bus.load faulted: {f}")
+            });
+            debug_assert_eq!(
+                raw, real_val,
+                "PR4 guard: shared golden-broadcast load ({raw:#x}) disagreed with lane {first}'s real load ({real_val:#x}) at va={addr0:#x}"
+            );
+        }
+
+        let value = if signed {
+            match size {
+                1 => raw as u8 as i8 as i32 as u32,
+                2 => raw as u16 as i16 as i32 as u32,
+                _ => raw,
+            }
+        } else {
+            raw
+        };
+
+        for (lane, &is_active) in active.iter().enumerate() {
+            if !is_active {
                 continue;
             }
             if rd != 0 {
-                self.lanes[lane].regs[rd as usize] = result[lane];
+                self.lanes[lane].regs[rd as usize] = value;
             }
             self.lanes[lane].pc = self.lanes[lane].pc.wrapping_add(ilen);
             self.lanes[lane].insns_retired += 1;
@@ -280,26 +425,75 @@ impl VecSystem {
         true
     }
 
-    /// Translate+fetch one halfword at `va` for every active lane, requiring byte-identical
-    /// results across all of them (never assumed from `pc`/`satp` agreement alone — each lane's
-    /// physical memory is genuinely independent). `None` on any lane's translation/access fault or
-    /// on the slightest byte disagreement.
-    fn fetch16_converged(&mut self, active: [bool; LANES], va: u32) -> Option<u16> {
-        let mut first: Option<u16> = None;
+    /// Shared packed-ALU payload: reads each active lane's own `rs1`/`rs2`-or-`imm` operands
+    /// (independent per lane even though `pc`/`satp` agreed), executes `op` across all `LANES`
+    /// lanes as one `Simd<u32, LANES>` op, and writes back `rd` + advances `pc`/`insns_retired`
+    /// for every active lane. Never faults, never touches memory/CSR — the only reason `OpImm`/
+    /// `Op` are safe to always dispatch here once decoded.
+    fn dispatch_simd_alu(&mut self, active: [bool; LANES], d: AluDispatch, ilen: u32) {
+        let mut a_arr = [0u32; LANES];
+        let mut b_arr = [0u32; LANES];
         for (lane, &is_active) in active.iter().enumerate() {
             if !is_active {
                 continue;
             }
-            let pa = self.lanes[lane].xlate(&mut self.bus[lane], va, Access::Exec).ok()?;
-            let v = self.bus[lane].ifetch16(pa).ok()?;
-            match first {
-                None => first = Some(v),
-                Some(f) if f != v => return None,
-                _ => {}
-            }
+            a_arr[lane] = rd_reg(&self.lanes[lane], d.rs1);
+            b_arr[lane] = match d.rs2 {
+                Some(rs2) => rd_reg(&self.lanes[lane], rs2),
+                None => d.imm as u32,
+            };
         }
-        first
+        let result = simd_alu(d.op, Simd::from_array(a_arr), Simd::from_array(b_arr)).to_array();
+
+        for (lane, &is_active) in active.iter().enumerate() {
+            if !is_active {
+                continue;
+            }
+            if d.rd != 0 {
+                self.lanes[lane].regs[d.rd as usize] = result[lane];
+            }
+            self.lanes[lane].pc = self.lanes[lane].pc.wrapping_add(ilen);
+            self.lanes[lane].insns_retired += 1;
+        }
     }
+}
+
+/// Bundled operands for [`VecSystem::dispatch_simd_alu`] (`OpImm`'s immediate and `Op`'s `rs2`
+/// collapse into one dispatch shape: `rs2: None` means "use `imm`" exactly as the scalar
+/// interpreter's own `OpImm`/`Op` handling does) — keeps the method under clippy's argument-count
+/// lint and reads as one decoded-instruction value instead of five loose parameters.
+struct AluDispatch {
+    op: AluOp,
+    rd: u8,
+    rs1: u8,
+    rs2: Option<u8>,
+    imm: i32,
+}
+
+/// Whether physical address `addr` cannot be trusted against `golden` — either it falls outside
+/// golden's RAM window entirely, or the containing 4 KiB page has been privately COW'd in any
+/// lane's `CowRam` since `golden` was captured (its *real* current content then lives in that
+/// lane's overlay, not in `golden`). This is the ONE guard consumed in two places: threaded into
+/// `Cpu::xlate_golden_readonly` as its `page_overlaid` callback (guards the page-table pages the
+/// walk itself reads), and called directly on the final leaf physical address a walk resolves to
+/// (guards the code/data page `shared_fetch16`/`try_shared_load` then read from golden) — both are
+/// required, since the walk only ever reads page-table pages, never the leaf itself.
+///
+/// This is the correctness-critical guard for PR4's whole premise: `golden` is typically captured
+/// once (e.g. `VecSystem::from_template`, well before any lane executes), so ANY physical page —
+/// including one a kernel later builds its own page tables in — can have diverged from golden by
+/// the time a lane actually consults it. A lane that hasn't touched that page still reads through
+/// to golden correctly; the moment ANY lane's `CowRam` has privately overlaid it, golden can no
+/// longer be trusted for it at all (even by lanes that never wrote it themselves), so this checks
+/// every lane, not just the currently-translating one.
+#[inline]
+fn any_lane_overlaid(golden: &Golden, bus: &[CowMachine; LANES], addr: u32) -> bool {
+    let base = golden.base();
+    if addr < base {
+        return true; // outside golden's window: nothing to trust
+    }
+    let pn = ((addr - base) as usize) / PAGE_SIZE;
+    pn >= golden.num_pages() || bus.iter().any(|b| b.ram.is_overlaid(pn))
 }
 
 /// `rd_reg` (x0 hardwired zero), copied from `fs_riscv::Cpu`'s private helper — `Cpu::regs` is a
@@ -551,5 +745,140 @@ mod tests {
         // Sanity: seeds really did drive divergent branch outcomes (not all lanes on one side).
         let taken = seeds.iter().filter(|&&s| (s.wrapping_add(5) & 0xff) < 100).count();
         assert!(taken > 0 && taken < LANES, "seeds should split across both sides of the branch");
+    }
+
+    /// Register-register encoders `fs_riscv::asm` doesn't provide (AND/XOR), mirroring `decode`'s
+    /// tables exactly (funct3=7/funct7=0 -> And, funct3=4/funct7=0 -> Xor) — used below to build a
+    /// branchless per-lane address select without needing a control-flow-diverging branch.
+    fn r_type(op: u32, funct3: u32, funct7: u32, rd: u8, rs1: u8, rs2: u8) -> u32 {
+        (funct7 << 25) | ((rs2 as u32) << 20) | ((rs1 as u32) << 15) | (funct3 << 12) | ((rd as u32) << 7) | op
+    }
+    fn and_r(rd: u8, rs1: u8, rs2: u8) -> u32 {
+        r_type(0x33, 7, 0x00, rd, rs1, rs2)
+    }
+    fn xor_r(rd: u8, rs1: u8, rs2: u8) -> u32 {
+        r_type(0x33, 4, 0x00, rd, rs1, rs2)
+    }
+    /// Standard RISC-V "li" lowering, always emitted as exactly 2 instructions (`lui`+`addi`, even
+    /// when the low 12 bits are zero) so every caller can rely on a fixed, statically-known length
+    /// when laying out a program by hand.
+    fn li2(rd: u8, imm: u32) -> [u32; 2] {
+        let hi = imm.wrapping_add(0x800) & 0xffff_f000;
+        let lo = imm.wrapping_sub(hi) as i32;
+        [asm::lui(rd, hi), asm::addi(rd, rd, lo)]
+    }
+
+    /// PR4-specific correctness stress test: a converged lane group (identical `pc`/`privilege`/
+    /// `csr.satp` throughout — no paging, no branching, so the group NEVER desyncs on `pc`) where,
+    /// via a branchless per-lane address select, HALF the lanes self-modify their own code page
+    /// (overwriting the very next instruction they are about to fetch) while the other half write
+    /// to an unrelated scratch page instead. This is the "union/overlay decline" risk
+    /// `docs/cow-shared-ram.md` calls out: at the fetch immediately after the store, the group is
+    /// perfectly `pc`-converged, but the modifying lanes' code page is privately COW'd while the
+    /// others' is still golden. If `VecSystem::shared_fetch16` ever failed to consult
+    /// `CowRam::is_overlaid` (or checked only some lanes instead of every lane), it would broadcast
+    /// golden's stale bytes to the modifying lanes too, silently corrupting their execution. This
+    /// test proves each lane instead sees exactly its own bytes, matching an independently-run
+    /// scalar oracle seeded identically.
+    #[test]
+    fn vec_system_declines_shared_fetch_when_a_lane_self_modifies_its_code_page() {
+        const T2: u8 = 7; // per-lane seed register (x7): seed & 1 selects "self-modify or not"
+        const BIT: u8 = 28;
+        const MASK: u8 = 29;
+        const SCRATCH: u8 = 18;
+        const XORC: u8 = 19;
+        const SELTMP: u8 = 20;
+        const ADDR: u8 = 21;
+        const VAL: u8 = 22;
+        const T5: u8 = 23; // tohost pointer scratch
+        let scratch_addr = BASE + 0x1000; // a different 4 KiB page than the code (page 0)
+        let new_instr: u32 = asm::addi(A0, X0, 42); // what a "self-modified" lane will execute
+        let tohost = BASE + 0x3000;
+
+        // Every lane executes the IDENTICAL straight-line instruction sequence below (no branch
+        // anywhere), so the group's `pc` never desyncs — only the STORE's target *address*
+        // (computed branchlessly from the per-lane seed bit) diverges between lanes.
+        let mut prog: Vec<u32> = Vec::new();
+        prog.push(andi(BIT, T2, 1)); // 0: bit = seed & 1
+        prog.push(asm::sub(MASK, X0, BIT)); // 1: mask = 0 - bit (all-ones if bit=1, else 0)
+        prog.extend(li2(SCRATCH, scratch_addr)); // 2,3
+        // target_addr = BASE + 11*4 (index 11 below, the "maybe modified" instruction slot).
+        let target_addr = BASE + 11 * 4;
+        let xorc = target_addr ^ scratch_addr;
+        prog.extend(li2(XORC, xorc)); // 4,5
+        prog.push(and_r(SELTMP, MASK, XORC)); // 6: seltmp = mask & xorc
+        prog.push(xor_r(ADDR, SCRATCH, SELTMP)); // 7: addr = scratch ^ seltmp = target if bit=1 else scratch
+        prog.extend(li2(VAL, new_instr)); // 8,9
+        prog.push(asm::sw(ADDR, VAL, 0)); // 10: store new_instr to ADDR (code page or scratch page)
+        assert_eq!(prog.len(), 11, "index 11 must land exactly at target_addr");
+        prog.push(asm::addi(A0, X0, 1)); // 11: target_addr — default/unmodified: a0 = 1
+        prog.extend(li2(T5, tohost)); // 12,13
+        prog.push(slli(A0, A0, 1)); // 14
+        prog.push(ori(A0, A0, 1)); // 15
+        prog.push(asm::sw(T5, A0, 0)); // 16: HTIF exit, code = (a0 << 1) | 1
+
+        let mut m = Machine::new(BASE, 0x1_0000);
+        m.ram.protect(BASE, 0x1_0000, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+        let mut bytes = Vec::new();
+        for w in &prog {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        m.ram.map(BASE, &bytes, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+        let mut cpu = Cpu::new(BASE);
+        cpu.htif_tohost = Some(tohost);
+
+        let mut vs = VecSystem::from_template(&cpu, &m);
+        let seeds: [u32; LANES] = std::array::from_fn(|lane| lane as u32); // mix of odd/even
+        for (lane, &seed) in seeds.iter().enumerate() {
+            vs.set_reg(lane, T2, seed);
+        }
+
+        let mut guard = 0;
+        while vs.any_active() {
+            vs.step();
+            guard += 1;
+            assert!(guard < 10_000, "VecSystem program did not converge to a halt");
+        }
+
+        assert!(vs.scalar_steps > 0, "the store must always decline to the per-lane loop");
+        assert!(
+            vs.total_overlay_pages() > 0,
+            "at least one lane must have privately COW'd a page (code or scratch)"
+        );
+
+        let mut modified_count = 0;
+        let mut unmodified_count = 0;
+        for (lane, &seed) in seeds.iter().enumerate() {
+            let (mut ocpu, mut om) = (Cpu::new(BASE), Machine::new(BASE, 0x1_0000));
+            om.ram.protect(BASE, 0x1_0000, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+            om.ram.map(BASE, &bytes, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+            ocpu.htif_tohost = Some(tohost);
+            ocpu.regs[T2 as usize] = seed;
+            let oracle_code = match fs_platform::run_until(&mut ocpu, &mut om, 100_000) {
+                fs_platform::Stop::Halt(c) => c,
+                other => panic!("scalar oracle (seed {seed}) did not halt: {other:?}"),
+            };
+
+            // HTIF exit code is `val >> 1` (see `Cpu::step`'s Store handling); `val = (a0 << 1) | 1`,
+            // so the reported code is just `a0` itself (1 = unmodified, 42 = self-modified).
+            let expected = if seed & 1 == 1 {
+                modified_count += 1;
+                42u32
+            } else {
+                unmodified_count += 1;
+                1u32
+            };
+            assert_eq!(oracle_code, expected, "scalar oracle sanity check for lane {lane} (seed {seed})");
+
+            match vs.exit[lane] {
+                Some(LaneExit::Halt(c)) => {
+                    assert_eq!(c, expected, "lane {lane} (seed {seed}) HTIF exit code");
+                    assert_eq!(c, oracle_code, "lane {lane} vs scalar oracle exit code");
+                }
+                other => panic!("lane {lane}: expected a Halt exit, got {other:?}"),
+            }
+        }
+
+        assert!(modified_count > 0 && unmodified_count > 0, "seeds must split across both parities");
     }
 }

@@ -7,7 +7,7 @@
 
 #![forbid(unsafe_code)]
 
-use fs_mmu::{Access, Bus, Fault, FaultKind};
+use fs_mmu::{Access, Bus, Fault, FaultKind, Golden};
 
 pub mod asm;
 pub mod sys;
@@ -549,6 +549,13 @@ impl std::fmt::Display for Trap {
     }
 }
 
+/// Why [`Cpu::xlate_golden_readonly`] declined: on ANY doubt it hands back this unit marker
+/// instead of a `Trap`, since there is nothing to recover from a decline — the only correct
+/// response is to fall back to the mutating, per-lane [`Cpu::xlate`] (which will independently
+/// compute the real translation or the real fault).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XlateDeclined;
+
 /// Number of direct-mapped software-TLB slots. 256 entries cover a 1 MiB VA working set — ample
 /// for a kernel/syscall burst — at ~4 KiB per `Cpu` (cheap to clone on snapshot reset).
 const TLB_SIZE: usize = 256;
@@ -566,6 +573,35 @@ struct TlbEntry {
     u: bool,
     /// PTE dirty bit already set, so a write hit needn't re-walk just to set D.
     d_set: bool,
+}
+
+/// Decoded leaf permission bits (R/W/X/U) — the same shape whether they came from a freshly
+/// decoded PTE word or a cached [`TlbEntry`], so [`leaf_perm_priv_ok`] can take one bundle instead
+/// of four bare bools (also keeps it under clippy's argument-count lint).
+#[derive(Clone, Copy)]
+struct LeafBits {
+    r: bool,
+    w: bool,
+    x: bool,
+    u: bool,
+}
+
+/// ONE source of truth for the sv32 leaf permission/privilege decision, shared by `Cpu::xlate`'s
+/// TLB-hit path, its full walk's leaf check, and [`Cpu::xlate_golden_readonly`]'s read-only walk
+/// (PR4 of the software-COW design, `docs/cow-shared-ram.md`).
+#[inline]
+fn leaf_perm_priv_ok(access: Access, p: Priv, sum: bool, mxr: bool, leaf: LeafBits) -> bool {
+    let perm_ok = match access {
+        Access::Exec => leaf.x,
+        Access::Read => leaf.r || (mxr && leaf.x),
+        Access::Write => leaf.w,
+    };
+    let priv_ok = match p {
+        Priv::U => leaf.u,
+        Priv::S => !(leaf.u && (access == Access::Exec || !sum)),
+        Priv::M => true,
+    };
+    perm_ok && priv_ok
 }
 
 impl TlbEntry {
@@ -696,17 +732,7 @@ impl Cpu {
         // to a page whose dirty bit isn't known-set falls through to the walk (which sets D).
         let page_vpn = va >> 12;
         if let Some(e) = self.tlb.get(page_vpn) {
-            let perm_ok = match access {
-                Access::Exec => e.x,
-                Access::Read => e.r || (mxr && e.x),
-                Access::Write => e.w,
-            };
-            let priv_ok = match p {
-                Priv::U => e.u,
-                Priv::S => !(e.u && (access == Access::Exec || !sum)),
-                _ => true,
-            };
-            if !(perm_ok && priv_ok) {
+            if !leaf_perm_priv_ok(access, p, sum, mxr, LeafBits { r: e.r, w: e.w, x: e.x, u: e.u }) {
                 return Err(fault(access));
             }
             if !(access == Access::Write && !e.d_set) {
@@ -732,20 +758,8 @@ impl Cpu {
             }
             if r == 1 || x == 1 {
                 // Leaf PTE — check permissions.
-                let perm_ok = match access {
-                    Access::Exec => x == 1,
-                    Access::Read => r == 1 || (mxr && x == 1),
-                    Access::Write => w == 1,
-                };
-                if !perm_ok {
+                if !leaf_perm_priv_ok(access, p, sum, mxr, LeafBits { r: r == 1, w: w == 1, x: x == 1, u: u == 1 }) {
                     return Err(fault(access));
-                }
-                match p {
-                    Priv::U if u == 0 => return Err(fault(access)),
-                    Priv::S if u == 1 && (access == Access::Exec || !sum) => {
-                        return Err(fault(access));
-                    }
-                    _ => {}
                 }
                 let ppn1 = (pte >> 20) & 0xfff;
                 let ppn0 = (pte >> 10) & 0x3ff;
@@ -780,6 +794,95 @@ impl Cpu {
             a = ((pte >> 10) & 0x3f_ffff) << 12;
         }
         Err(fault(access))
+    }
+
+    /// Read-only, non-mutating sv32 walk against a [`Golden`] image instead of a live `Bus` — PR4
+    /// of the software-COW design (`docs/cow-shared-ram.md`). Uses *this* CPU's `csr.satp`/
+    /// `privilege`/`mstatus` (SUM/MXR/effective-priv) exactly like [`Cpu::xlate`], and performs the
+    /// identical two-level walk + leaf permission/privilege check (via the same
+    /// [`leaf_perm_priv_ok`] helper `xlate` calls) — but reads PTEs straight from `golden`
+    /// (bypassing any `Bus`, mutating nothing) and **declines** (`Err(XlateDeclined)`) instead of
+    /// succeeding whenever the mutating `xlate` would need to touch anything, or whenever `golden`
+    /// cannot be trusted for a page-table read: a PTE read outside golden's bounds or lacking
+    /// `PERM_READ`; `page_overlaid` reporting that a page-table page has been privately COW'd in
+    /// some lane since `golden` was captured (its *current* content then lives in a per-lane
+    /// overlay, not in `golden` — the common case once a kernel constructs its own page tables at
+    /// runtime, since `golden` is typically captured once, well before that); a misaligned
+    /// superpage; an architectural translation fault (unmapped/permission); or — the
+    /// correctness-critical case — a leaf whose A bit (or D bit, for a write access) isn't
+    /// *already* set, since setting it is a mutation only the real per-lane `xlate` may perform. A
+    /// clean `Ok(pa)` therefore guarantees the mutating `xlate` would compute the exact same `pa`
+    /// without touching a single byte — exactly what a converged `VecSystem` group speculatively
+    /// translating against a shared golden image needs.
+    ///
+    /// `page_overlaid(addr)` is called once per page-table level, before trusting `golden`'s
+    /// content at that physical address, so the caller (which owns the per-lane `CowRam`s and thus
+    /// knows what's actually been privately dirtied) can veto a stale golden read. Note this only
+    /// guards the page-*table* reads this walk itself performs; the caller is still responsible for
+    /// checking overlay status of the *leaf* physical page the walk resolves to before trusting its
+    /// content — that page is data/code, not a page table, and this function never reads it. See
+    /// `xlate_golden_readonly_matches_xlate_and_declines_on_unset_ad` below for the differential
+    /// proof.
+    pub fn xlate_golden_readonly(
+        &self,
+        golden: &Golden,
+        va: u32,
+        access: Access,
+        mut page_overlaid: impl FnMut(u32) -> bool,
+    ) -> Result<u32, XlateDeclined> {
+        let p = self.effective_priv(access);
+        if p == Priv::M || (self.csr.satp >> 31) == 0 {
+            return Ok(va);
+        }
+        let sum = self.csr.mstatus & sys::MSTATUS_SUM != 0;
+        let mxr = self.csr.mstatus & sys::MSTATUS_MXR != 0;
+
+        let vpn = [(va >> 12) & 0x3ff, (va >> 22) & 0x3ff];
+        let mut a = (self.csr.satp & 0x3f_ffff) << 12; // root page-table PA
+        for level in (0..2usize).rev() {
+            let pte_addr = a.wrapping_add(vpn[level] * 4);
+            if page_overlaid(pte_addr) {
+                return Err(XlateDeclined); // this page-table page's real content is per-lane
+            }
+            let pte = golden.read_u32(pte_addr).ok_or(XlateDeclined)?;
+            let (v, r, w, x, u) = (
+                pte & 1,
+                (pte >> 1) & 1,
+                (pte >> 2) & 1,
+                (pte >> 3) & 1,
+                (pte >> 4) & 1,
+            );
+            if v == 0 || (r == 0 && w == 1) {
+                return Err(XlateDeclined);
+            }
+            if r == 1 || x == 1 {
+                if !leaf_perm_priv_ok(access, p, sum, mxr, LeafBits { r: r == 1, w: w == 1, x: x == 1, u: u == 1 }) {
+                    return Err(XlateDeclined);
+                }
+                let ppn1 = (pte >> 20) & 0xfff;
+                let ppn0 = (pte >> 10) & 0x3ff;
+                if level == 1 && ppn0 != 0 {
+                    return Err(XlateDeclined); // misaligned superpage — let the real walk fault
+                }
+                // A (and D, for a write) must already be set: setting it is a mutation only the
+                // real per-lane `xlate` may perform.
+                let need_d = access == Access::Write;
+                let a_set = (pte >> 6) & 1 == 1;
+                let d_set = (pte >> 7) & 1 == 1;
+                if !a_set || (need_d && !d_set) {
+                    return Err(XlateDeclined);
+                }
+                let pa = if level == 1 {
+                    (ppn1 << 22) | (((va >> 12) & 0x3ff) << 12) | (va & 0xfff)
+                } else {
+                    (((pte >> 10) & 0x3f_ffff) << 12) | (va & 0xfff)
+                };
+                return Ok(pa);
+            }
+            // Non-leaf: descend.
+            a = ((pte >> 10) & 0x3f_ffff) << 12;
+        }
+        Err(XlateDeclined)
     }
 
     fn fetch16(&mut self, bus: &mut dyn Bus, va: u32) -> Result<u16, Trap> {
@@ -1389,6 +1492,74 @@ mod tests {
         assert_eq!(cpu.xlate(&mut mmu, 0x0000_8000, Access::Read).unwrap(), 0x8000_4000);
         // But S-mode may never *execute* a U page, even with SUM.
         assert!(cpu.xlate(&mut mmu, 0x0000_8000, Access::Exec).is_err());
+    }
+
+    #[test]
+    fn xlate_golden_readonly_matches_xlate_and_declines_on_unset_ad() {
+        use fs_mmu::{Access, Golden, PERM_READ, PERM_WRITE};
+        use sys::Priv;
+
+        let base = 0x8000_0000u32;
+        let mut mmu = Mmu::new(base, 0x0080_0000);
+        mmu.protect(base, 0x0080_0000, PERM_READ | PERM_WRITE).unwrap();
+
+        let root = 0x8000_1000u32;
+        let l0 = 0x8000_2000u32;
+        let leaf = |pa: u32, flags: u32| ((pa >> 12) << 10) | flags;
+        const V: u32 = 1;
+        const R: u32 = 2;
+        const W: u32 = 4;
+        const X: u32 = 8;
+        const AD: u32 = (1 << 6) | (1 << 7);
+        const A_ONLY: u32 = 1 << 6;
+
+        // root[0] -> level-0 table (non-leaf).
+        mmu.write_u32(root, (l0 >> 12) << 10 | V).unwrap();
+        // VA 0x0000_4000: RWX kernel leaf, A+D already set ("already-accessed").
+        mmu.write_u32(l0 + 4 * 4, leaf(0x8000_3000, V | R | W | X | AD)).unwrap();
+        // VA 0x0000_8000: RW leaf, neither A nor D set ("never accessed").
+        mmu.write_u32(l0 + 8 * 4, leaf(0x8000_4000, V | R | W)).unwrap();
+        // VA 0x0000_c000: RW leaf, A set but D unset ("read but never written").
+        mmu.write_u32(l0 + 12 * 4, leaf(0x8000_5000, V | R | W | A_ONLY)).unwrap();
+
+        let mut cpu = Cpu::new(0);
+        cpu.privilege = Priv::S;
+        cpu.csr.satp = (1 << 31) | (root >> 12);
+
+        let golden = Golden::from_mmu(&mmu);
+
+        // Already-accessed page: the read-only walk agrees byte-for-byte with the real (mutating)
+        // xlate, for both a read and an exec access (A/D already set, so xlate performs no
+        // writeback either — the two walks must return identically).
+        let va = 0x0000_4000u32;
+        assert_eq!(
+            cpu.xlate(&mut mmu, va, Access::Read).unwrap(),
+            cpu.xlate_golden_readonly(&golden, va, Access::Read, |_| false).unwrap(),
+        );
+        assert_eq!(
+            cpu.xlate(&mut mmu, va, Access::Exec).unwrap(),
+            cpu.xlate_golden_readonly(&golden, va, Access::Exec, |_| false).unwrap(),
+        );
+
+        // Never-accessed page (A unset): the real xlate succeeds (and sets A as a side effect),
+        // but the read-only walk must decline rather than silently succeeding without setting it.
+        let va_unset = 0x0000_8000u32;
+        assert!(cpu.xlate_golden_readonly(&golden, va_unset, Access::Read, |_| false).is_err());
+
+        // A-only page: the read-only walk succeeds for a Read (D isn't required for a read), but
+        // declines for a Write (D would need to be set, a mutation only the real xlate may do).
+        let va_a_only = 0x0000_c000u32;
+        assert_eq!(
+            cpu.xlate_golden_readonly(&golden, va_a_only, Access::Read, |_| false).unwrap(),
+            0x8000_5000,
+        );
+        assert!(cpu.xlate_golden_readonly(&golden, va_a_only, Access::Write, |_| false).is_err());
+
+        // `page_overlaid` returning `true` for a page-table page must decline the walk even
+        // though the leaf itself is otherwise a clean, already-accessed success — the caller's
+        // signal that golden's PTE bytes there may be stale (some lane privately COW'd that page
+        // since golden was captured, e.g. a kernel constructing its own page tables at runtime).
+        assert!(cpu.xlate_golden_readonly(&golden, va, Access::Read, |_| true).is_err());
     }
 
     #[test]

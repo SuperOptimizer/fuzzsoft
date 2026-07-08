@@ -508,6 +508,97 @@ impl Golden {
         let end = (start + PAGE_SIZE).min(self.perms.len());
         &self.perms[start..end]
     }
+
+    // -----------------------------------------------------------------------------------------
+    // PR4 of the software COW design (`docs/cow-shared-ram.md`): direct, read-only physical
+    // access into the golden image itself — no `Bus`, no `CowRam`, no mutation. Consumed by
+    // `fs_riscv::Cpu::xlate_golden_readonly` (PTE reads) and `fs_vec::VecSystem`'s converged
+    // shared-fetch/shared-load fast path (instruction/data reads). Permission gating mirrors
+    // `Mmu` exactly (`read_*` requires `PERM_READ`, matching `Bus::load`'s gate that the mutating
+    // `xlate`'s PTE reads go through; `fetch_u16` requires `PERM_EXEC`, matching `Mmu::fetch_u16`/
+    // `Bus::ifetch16`) so a `None` here is exactly the set of cases the mutating path would fault
+    // or need to touch state for — the caller's only correct response is to decline to the
+    // per-lane path, never to synthesize a value.
+    // -----------------------------------------------------------------------------------------
+
+    #[inline]
+    fn offset(&self, addr: u32) -> Option<usize> {
+        if addr < self.base {
+            return None;
+        }
+        let off = (addr - self.base) as usize;
+        (off < self.mem.len()).then_some(off)
+    }
+
+    /// Physical byte read requiring `PERM_READ`. Mirrors `Mmu::read_u8`'s permission gate.
+    pub fn read_u8(&self, addr: u32) -> Option<u8> {
+        let off = self.offset(addr)?;
+        if self.perms[off] & PERM_READ == 0 {
+            return None;
+        }
+        Some(self.mem[off])
+    }
+
+    /// Physical 2-byte read (2-byte aligned), requiring `PERM_READ` on both bytes. Mirrors
+    /// `Mmu::read_u16`.
+    pub fn read_u16(&self, addr: u32) -> Option<u16> {
+        if !addr.is_multiple_of(2) {
+            return None;
+        }
+        let off = self.offset(addr)?;
+        if off + 2 > self.mem.len() {
+            return None;
+        }
+        if !self.perms[off..off + 2].iter().all(|&p| p & PERM_READ != 0) {
+            return None;
+        }
+        Some(u16::from_le_bytes(self.mem[off..off + 2].try_into().unwrap()))
+    }
+
+    /// Physical 4-byte read (4-byte aligned), requiring `PERM_READ` on all four bytes. Mirrors
+    /// `Mmu::read_u32` — this is what a read-only sv32 walk uses to fetch a PTE straight from the
+    /// golden image instead of through a mutating `Bus::load`.
+    pub fn read_u32(&self, addr: u32) -> Option<u32> {
+        if !addr.is_multiple_of(4) {
+            return None;
+        }
+        let off = self.offset(addr)?;
+        if off + 4 > self.mem.len() {
+            return None;
+        }
+        if !self.perms[off..off + 4].iter().all(|&p| p & PERM_READ != 0) {
+            return None;
+        }
+        Some(u32::from_le_bytes(self.mem[off..off + 4].try_into().unwrap()))
+    }
+
+    /// Sized (1/2/4-byte) physical read requiring `PERM_READ`, matching `Mmu::load`'s dispatch —
+    /// used by `VecSystem`'s converged same-address LOAD fast path to broadcast one golden read
+    /// instead of `LANES` independent per-lane loads.
+    pub fn read_sized(&self, addr: u32, size: u8) -> Option<u32> {
+        match size {
+            1 => self.read_u8(addr).map(u32::from),
+            2 => self.read_u16(addr).map(u32::from),
+            _ => self.read_u32(addr),
+        }
+    }
+
+    /// Instruction half-word fetch (2-byte aligned), requiring `PERM_EXEC` (not `PERM_READ`) on
+    /// both bytes. Mirrors `Mmu::fetch_u16` — used by `VecSystem`'s converged shared-fetch fast
+    /// path instead of a per-lane `Bus::ifetch16`.
+    pub fn fetch_u16(&self, addr: u32) -> Option<u16> {
+        if !addr.is_multiple_of(2) {
+            return None;
+        }
+        let off = self.offset(addr)?;
+        if off + 2 > self.mem.len() {
+            return None;
+        }
+        if !self.perms[off..off + 2].iter().all(|&p| p & PERM_EXEC != 0) {
+            return None;
+        }
+        Some(u16::from_le_bytes(self.mem[off..off + 2].try_into().unwrap()))
+    }
 }
 
 /// One page's private copy-on-write overlay: 4 KiB of guest memory plus its parallel permission
@@ -814,6 +905,15 @@ impl CowRam {
     pub fn dirty_pages(&self) -> &[u32] {
         &self.dirty
     }
+
+    /// Whether page `pn` currently has a private overlay (`true`) or is still golden (`false`).
+    /// Out-of-range `pn` reports `false` (there is nothing to overlay). Consumed by PR4's shared
+    /// translate/fetch fast path (`docs/cow-shared-ram.md`): a code/data page any lane has
+    /// privately COW'd (self-modified) must never have that divergence painted over by a
+    /// golden-broadcast read.
+    pub fn is_overlaid(&self, pn: usize) -> bool {
+        self.dir.get(pn).is_some_and(|&d| d != SENTINEL)
+    }
 }
 
 /// Cross-lane "this page was privately COW'd by someone" bitmap (1 bit / 4 KiB page). Consumed by
@@ -966,6 +1066,53 @@ mod tests {
         cow.write_u8(0x8000_0000, 0xAB).unwrap();
         assert_eq!(cow.read_u8(0x8000_0000).unwrap(), 0xAB);
         assert_eq!(cow.perm_at(0x8000_0000), Some(PERM_READ | PERM_WRITE));
+    }
+
+    #[test]
+    fn cow_is_overlaid_tracks_dirty_pages() {
+        let mut m = Mmu::new(0x8000_0000, 0x4000); // 4 pages
+        m.protect(0x8000_0000, 0x4000, PERM_READ | PERM_WRITE).unwrap();
+        let golden = Arc::new(Golden::from_mmu(&m));
+        let mut cow = CowRam::new(golden);
+
+        assert!(!cow.is_overlaid(0));
+        assert!(!cow.is_overlaid(2));
+        // Out-of-range page number reports false rather than panicking.
+        assert!(!cow.is_overlaid(999));
+
+        cow.write_u32(0x8000_2000, 0x1234_5678).unwrap(); // dirties page 2 only
+        assert!(!cow.is_overlaid(0));
+        assert!(cow.is_overlaid(2));
+        assert!(!cow.is_overlaid(3));
+
+        cow.reset();
+        assert!(!cow.is_overlaid(2));
+    }
+
+    #[test]
+    fn golden_read_and_fetch_require_the_right_permission_bit() {
+        let mut m = Mmu::new(0x8000_0000, 0x1000);
+        m.map(0x8000_0000, &0x1122_3344u32.to_le_bytes(), PERM_READ | PERM_WRITE)
+            .unwrap();
+        m.map(0x8000_0010, &0xBEEFu16.to_le_bytes(), PERM_EXEC).unwrap(); // exec-only, no READ
+        let golden = Golden::from_mmu(&m);
+
+        // read_* requires PERM_READ.
+        assert_eq!(golden.read_u32(0x8000_0000), Some(0x1122_3344));
+        assert_eq!(golden.read_u16(0x8000_0000), Some(0x3344));
+        assert_eq!(golden.read_u8(0x8000_0000), Some(0x44));
+        assert_eq!(golden.read_sized(0x8000_0000, 4), Some(0x1122_3344));
+        // Exec-only bytes lack PERM_READ, so a data read of them declines.
+        assert_eq!(golden.read_u16(0x8000_0010), None);
+
+        // fetch_u16 requires PERM_EXEC, not PERM_READ.
+        assert_eq!(golden.fetch_u16(0x8000_0010), Some(0xBEEF));
+        // The RW (non-exec) word has no PERM_EXEC, so fetching it declines.
+        assert_eq!(golden.fetch_u16(0x8000_0000), None);
+
+        // Misaligned / out-of-bounds declines rather than panicking.
+        assert_eq!(golden.read_u32(0x8000_0001), None);
+        assert_eq!(golden.fetch_u16(0x1234), None);
     }
 
     #[test]

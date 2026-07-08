@@ -81,18 +81,28 @@ fn main() {
     let scalar_insns = scpu.insns_retired;
 
     eprintln!(
-        "boot_vec: VecSystem lane0 retired {vec_insns} insns in {:.2}s ({} steps: {} SIMD / {} scalar)",
+        "boot_vec: VecSystem lane0 retired {vec_insns} insns in {:.2}s ({} steps: {} SIMD / {} scalar, \
+         {} via shared translate+fetch)",
         vec_elapsed.as_secs_f64(),
         vs.simd_steps + vs.scalar_steps,
         vs.simd_steps,
         vs.scalar_steps,
+        vs.shared_fetch_steps,
     );
     eprintln!(
         "boot_vec: scalar oracle retired {scalar_insns} insns in {:.2}s (stop: {stop:?})",
         scalar_elapsed.as_secs_f64()
     );
-    let simd_frac = vs.simd_steps as f64 / (vs.simd_steps + vs.scalar_steps).max(1) as f64;
-    eprintln!("boot_vec: SIMD fast-path fraction of steps = {:.1}%", simd_frac * 100.0);
+    let total_steps = (vs.simd_steps + vs.scalar_steps).max(1);
+    let simd_frac = vs.simd_steps as f64 / total_steps as f64;
+    let shared_fetch_frac = vs.shared_fetch_steps as f64 / total_steps as f64;
+    eprintln!("boot_vec: SIMD payload fraction of steps = {:.1}%", simd_frac * 100.0);
+    eprintln!(
+        "boot_vec: PR4 shared translate+fetch fraction of steps = {:.1}% (1x golden translate+fetch \
+         instead of {LANES}x per-lane, whether or not the instruction went on to execute via a SIMD \
+         payload)",
+        shared_fetch_frac * 100.0
+    );
     let vec_lane_ips = vec_insns as f64 / vec_elapsed.as_secs_f64();
     let scalar_ips = scalar_insns as f64 / scalar_elapsed.as_secs_f64();
     eprintln!(
@@ -100,6 +110,11 @@ fn main() {
          scalar oracle {:.1}M insns/s",
         vec_lane_ips / 1e6,
         scalar_ips / 1e6,
+    );
+    eprintln!(
+        "boot_vec: VecSystem wall-clock = {:.3}s for {budget} insns/lane ({LANES} lanes) — compare \
+         against the PR3 baseline wall-clock for the same budget to see PR4's net effect",
+        vec_elapsed.as_secs_f64()
     );
 
     // --- COW memory accounting (PR3, `docs/cow-shared-ram.md`): one shared golden RAM image plus
