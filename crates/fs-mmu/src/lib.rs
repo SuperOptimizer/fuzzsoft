@@ -254,7 +254,27 @@ impl Mmu {
     }
 
     /// Checked read: every byte must carry PERM_READ.
+    ///
+    /// Fast path (the overwhelmingly common case): the whole span is one contiguous, in-bounds,
+    /// fully-readable slice — one bounds check, one tight (auto-vectorizable) permission scan, one
+    /// `copy_from_slice`, instead of per-byte address recomputation + bounds/perm checks. Any miss
+    /// (out of bounds, or a byte lacking `PERM_READ` — including RAW/uninitialized bytes, which
+    /// carry RAW but not READ) falls through to the byte-wise path, which reports the exact
+    /// faulting byte address, so fault semantics are unchanged.
     pub fn read(&self, addr: u32, buf: &mut [u8]) -> Result<(), Fault> {
+        let len = buf.len();
+        if let Some(off) = self.offset(addr)
+            && off + len <= self.mem.len()
+            && self.perms[off..off + len].iter().all(|&p| p & PERM_READ != 0)
+        {
+            buf.copy_from_slice(&self.mem[off..off + len]);
+            return Ok(());
+        }
+        self.read_bytewise(addr, buf)
+    }
+
+    #[cold]
+    fn read_bytewise(&self, addr: u32, buf: &mut [u8]) -> Result<(), Fault> {
         let len = buf.len() as u32;
         for (i, out) in buf.iter_mut().enumerate() {
             let a = addr.wrapping_add(i as u32);
@@ -271,7 +291,37 @@ impl Mmu {
 
     /// Checked write: every byte must carry PERM_WRITE. Writing upgrades RAW bytes to READ
     /// (and clears RAW), unlocking reads of exactly the bytes that were written.
+    ///
+    /// Fast path (the common case): the whole span is one contiguous, in-bounds, fully-writable
+    /// slice — one bounds check, one permission scan, one `copy_from_slice`, one perm-upgrade pass,
+    /// and (under dirty tracking) marks the 1–2 blocks the span spans directly, instead of per-byte
+    /// work. Any miss falls through to the byte-wise path, preserving exact fault semantics.
     pub fn write(&mut self, addr: u32, data: &[u8]) -> Result<(), Fault> {
+        let len = data.len();
+        if let Some(off) = self.offset(addr)
+            && off + len <= self.mem.len()
+            && self.perms[off..off + len].iter().all(|&p| p & PERM_WRITE != 0)
+        {
+            self.mem[off..off + len].copy_from_slice(data);
+            for p in &mut self.perms[off..off + len] {
+                *p = (*p | PERM_READ) & !PERM_RAW;
+            }
+            if self.track_dirty && len > 0 {
+                for blk in (off / DIRTY_BLOCK)..=((off + len - 1) / DIRTY_BLOCK) {
+                    let (w, bit) = (blk / 64, blk % 64);
+                    if self.dirty_bitmap[w] & (1 << bit) == 0 {
+                        self.dirty_bitmap[w] |= 1 << bit;
+                        self.dirty.push(blk);
+                    }
+                }
+            }
+            return Ok(());
+        }
+        self.write_bytewise(addr, data)
+    }
+
+    #[cold]
+    fn write_bytewise(&mut self, addr: u32, data: &[u8]) -> Result<(), Fault> {
         let len = data.len() as u32;
         for (i, b) in data.iter().enumerate() {
             let a = addr.wrapping_add(i as u32);
@@ -329,39 +379,43 @@ impl Mmu {
         self.write(addr, &v.to_le_bytes())
     }
 
-    /// Instruction half-word fetch: 2-byte aligned (IALIGN=16 with the C extension), every byte
-    /// must carry PERM_EXEC (READ not required).
-    pub fn fetch_u16(&self, addr: u32) -> Result<u16, Fault> {
-        Self::check_align(addr, 2, Access::Exec)?;
-        let mut b = [0u8; 2];
+    /// Read `N` contiguous executable bytes at `addr` into a buffer. Fast path: in-bounds and every
+    /// byte carries `PERM_EXEC` → one bounds check + one perm scan + one `copy_from_slice`; else
+    /// byte-wise with exact fault reporting. `addr` alignment is checked by the callers below.
+    #[inline]
+    fn fetch_bytes<const N: usize>(&self, addr: u32) -> Result<[u8; N], Fault> {
+        let mut b = [0u8; N];
+        if let Some(off) = self.offset(addr)
+            && off + N <= self.mem.len()
+            && self.perms[off..off + N].iter().all(|&p| p & PERM_EXEC != 0)
+        {
+            b.copy_from_slice(&self.mem[off..off + N]);
+            return Ok(b);
+        }
         for (i, out) in b.iter_mut().enumerate() {
             let a = addr.wrapping_add(i as u32);
             let off = self
                 .offset(a)
-                .ok_or_else(|| Self::fault(a, 2, Access::Exec, FaultKind::Unmapped))?;
+                .ok_or_else(|| Self::fault(a, N as u32, Access::Exec, FaultKind::Unmapped))?;
             if self.perms[off] & PERM_EXEC == 0 {
-                return Err(Self::fault(a, 2, Access::Exec, FaultKind::Permission));
+                return Err(Self::fault(a, N as u32, Access::Exec, FaultKind::Permission));
             }
             *out = self.mem[off];
         }
-        Ok(u16::from_le_bytes(b))
+        Ok(b)
+    }
+
+    /// Instruction half-word fetch: 2-byte aligned (IALIGN=16 with the C extension), every byte
+    /// must carry PERM_EXEC (READ not required).
+    pub fn fetch_u16(&self, addr: u32) -> Result<u16, Fault> {
+        Self::check_align(addr, 2, Access::Exec)?;
+        Ok(u16::from_le_bytes(self.fetch_bytes::<2>(addr)?))
     }
 
     /// Instruction fetch: 4-byte aligned, every byte must carry PERM_EXEC (READ not required).
     pub fn fetch_u32(&self, addr: u32) -> Result<u32, Fault> {
         Self::check_align(addr, 4, Access::Exec)?;
-        let mut b = [0u8; 4];
-        for (i, out) in b.iter_mut().enumerate() {
-            let a = addr.wrapping_add(i as u32);
-            let off = self
-                .offset(a)
-                .ok_or_else(|| Self::fault(a, 4, Access::Exec, FaultKind::Unmapped))?;
-            if self.perms[off] & PERM_EXEC == 0 {
-                return Err(Self::fault(a, 4, Access::Exec, FaultKind::Permission));
-            }
-            *out = self.mem[off];
-        }
-        Ok(u32::from_le_bytes(b))
+        Ok(u32::from_le_bytes(self.fetch_bytes::<4>(addr)?))
     }
 }
 
