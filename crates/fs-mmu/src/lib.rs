@@ -81,6 +81,19 @@ pub trait Bus {
     fn load(&mut self, addr: u32, size: u8) -> Result<u32, Fault>;
     fn store(&mut self, addr: u32, size: u8, val: u32) -> Result<(), Fault>;
     fn ifetch16(&mut self, addr: u32) -> Result<u16, Fault>;
+
+    /// KMSAN Stage 1 load-taint source (`docs/kmsan.md`): gather byte-granular `PERM_RAW`
+    /// (never-written / uninitialized) state for up to 4 bytes at physical `addr`, bit `8*i` set
+    /// iff byte `i` of the span carries `PERM_RAW`. Purely additive and read-only — deliberately
+    /// separate from `load`/`read`/`read_bytewise` so it does NOT touch their RAW-clearing-on-write
+    /// semantics or ASAN-strict fault-on-first-read behavior (`docs/kmsan.md`'s KMSAN *permits*
+    /// reading uninitialized memory and reports only at consumption). Default (for `Bus` impls not
+    /// backed by an [`Mmu`], e.g. full-system `Machine`/`CowMachine`) conservatively reports every
+    /// byte clean (`0`) — KMSAN load-taint is a silent no-op there rather than a false positive
+    /// until a later increment wires those through.
+    fn read_raw_state(&self, _addr: u32, _len: u8) -> u32 {
+        0
+    }
 }
 
 /// Reset granularity for snapshot fuzzing: one cache line (decision #11).
@@ -438,6 +451,17 @@ impl Bus for Mmu {
     }
     fn ifetch16(&mut self, addr: u32) -> Result<u16, Fault> {
         self.fetch_u16(addr)
+    }
+    fn read_raw_state(&self, addr: u32, len: u8) -> u32 {
+        let mut mask = 0u32;
+        for i in 0..(len.min(4) as u32) {
+            if let Some(off) = self.offset(addr.wrapping_add(i))
+                && self.perms[off] & PERM_RAW != 0
+            {
+                mask |= 1 << (8 * i);
+            }
+        }
+        mask
     }
 }
 

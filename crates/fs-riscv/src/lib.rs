@@ -513,6 +513,128 @@ fn muldiv(op: MulOp, a: u32, b: u32) -> u32 {
     }
 }
 
+/// KMSAN (`docs/kmsan.md`) Stage 0: pure register-ALU taint propagation, zero `Cpu`/`Mmu` touch.
+/// A "byte-taint mask" packs one bit per byte, byte-aligned at bit position `8*i` (i.e. only bits
+/// 0/8/16/24 are ever meaningful) — a set bit means that byte of the 32-bit value is uninitialized.
+/// This is the v0 (sound-enough, ship-first) rule set: every [`AluOp`] just ORs the two operand
+/// byte-masks together. That is exact for Xor/shift/Slt(u) (each output byte only ever depends on
+/// the two corresponding-or-narrower input bytes) and deliberately over-approximates for And/Or
+/// (a known-0 AND-operand byte or known-1 OR-operand byte can actually force a "clean" result byte
+/// regardless of the other operand) and for Add/Sub (a tainted low byte's carry/borrow can in
+/// principle flip a "clean" high byte, which plain OR under-approximates). Both refinements —
+/// known-byte clearing and carry-smear — are named Stage 3 v1 precision work in `docs/kmsan.md`
+/// and deliberately deferred; v0 ships the sound-or-over-tainting direction only (Add/Sub/shift
+/// still need the Stage 3 smear to be fully sound; And/Or/Xor/Slt(u) are already sound as OR).
+/// `a_val`/`b_val` are accepted (unused in v0) so the signature doesn't have to change for Stage 3.
+#[inline]
+#[allow(unused_variables)]
+pub fn alu_taint(op: AluOp, a_val: u32, a_taint: u32, b_val: u32, b_taint: u32) -> u32 {
+    match op {
+        AluOp::Add
+        | AluOp::Sub
+        | AluOp::Sll
+        | AluOp::Slt
+        | AluOp::Sltu
+        | AluOp::Xor
+        | AluOp::Srl
+        | AluOp::Sra
+        | AluOp::Or
+        | AluOp::And => a_taint | b_taint,
+    }
+}
+
+/// KMSAN Stage 0: pure M-extension (mul/div/rem) taint propagation. Every [`MulOp`] mixes bits
+/// from across the whole 32-bit operands (a single tainted input byte can influence any output
+/// byte via the multiply/divide algorithm), so v0 taints the WHOLE result the instant either
+/// operand carries any taint at all, and leaves it fully clean otherwise. Coarser than the ALU
+/// rules by design — there is no cheap byte-precise rule for mul/div, and over-tainting is the
+/// sound direction for a report-and-stop oracle.
+#[inline]
+#[allow(unused_variables)]
+pub fn muldiv_taint(op: MulOp, a_val: u32, a_taint: u32, b_val: u32, b_taint: u32) -> u32 {
+    if a_taint != 0 || b_taint != 0 {
+        0xffff_ffff
+    } else {
+        0
+    }
+}
+
+#[cfg(test)]
+mod taint_tests {
+    use super::*;
+
+    const TAINT_BYTE0: u32 = 1; // bit 0 -> byte 0 tainted
+    const TAINT_BYTE3: u32 = 1 << 24; // bit 24 -> byte 3 tainted
+    const ALL_ALU_OPS: [AluOp; 10] = [
+        AluOp::Add,
+        AluOp::Sub,
+        AluOp::Sll,
+        AluOp::Slt,
+        AluOp::Sltu,
+        AluOp::Xor,
+        AluOp::Srl,
+        AluOp::Sra,
+        AluOp::Or,
+        AluOp::And,
+    ];
+    const ALL_MUL_OPS: [MulOp; 8] = [
+        MulOp::Mul,
+        MulOp::Mulh,
+        MulOp::Mulhsu,
+        MulOp::Mulhu,
+        MulOp::Div,
+        MulOp::Divu,
+        MulOp::Rem,
+        MulOp::Remu,
+    ];
+
+    #[test]
+    fn alu_taint_clean_case_is_untainted_for_every_op() {
+        for op in ALL_ALU_OPS {
+            assert_eq!(alu_taint(op, 5, 0, 7, 0), 0, "{op:?} clean case should be untainted");
+        }
+    }
+
+    #[test]
+    fn alu_taint_tainted_case_ors_operand_masks_for_every_op() {
+        for op in ALL_ALU_OPS {
+            // Tainted lhs only.
+            assert_eq!(alu_taint(op, 5, TAINT_BYTE0, 7, 0), TAINT_BYTE0, "{op:?} lhs-tainted");
+            // Tainted rhs only.
+            assert_eq!(alu_taint(op, 5, 0, 7, TAINT_BYTE3), TAINT_BYTE3, "{op:?} rhs-tainted");
+            // Both tainted, disjoint bytes -> both bits set.
+            assert_eq!(
+                alu_taint(op, 5, TAINT_BYTE0, 7, TAINT_BYTE3),
+                TAINT_BYTE0 | TAINT_BYTE3,
+                "{op:?} both-tainted"
+            );
+        }
+    }
+
+    #[test]
+    fn muldiv_taint_clean_case_is_untainted_for_every_op() {
+        for op in ALL_MUL_OPS {
+            assert_eq!(muldiv_taint(op, 6, 0, 7, 0), 0, "{op:?} clean case should be untainted");
+        }
+    }
+
+    #[test]
+    fn muldiv_taint_taints_whole_result_if_either_operand_tainted() {
+        for op in ALL_MUL_OPS {
+            assert_eq!(
+                muldiv_taint(op, 6, TAINT_BYTE0, 7, 0),
+                0xffff_ffff,
+                "{op:?} lhs-tainted taints all"
+            );
+            assert_eq!(
+                muldiv_taint(op, 6, 0, 7, TAINT_BYTE3),
+                0xffff_ffff,
+                "{op:?} rhs-tainted taints all"
+            );
+        }
+    }
+}
+
 /// Outcome of a single [`Cpu::step`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exit {
@@ -533,6 +655,14 @@ pub enum Trap {
     Mem(Fault),
     Illegal { pc: u32, raw: u32 },
     Exception { cause: u32, tval: u32 },
+    /// KMSAN (Stage 1, `docs/kmsan.md`) checkpoint: a conditional `Branch` compared at least one
+    /// operand whose register-shadow byte-taint (see [`Cpu::set_kmsan`]) is nonzero — a
+    /// branch-on-uninitialized-value. Report-and-STOP (not an accumulating log), matching the
+    /// codebase's fault-shaped bug-oracle idiom (this is a host-side finding, not an architectural
+    /// RISC-V exception — never delivered to the guest via `take_trap`). `rs1`/`rs2` are the
+    /// compared register indices; `taint_a`/`taint_b` are their byte-taint masks (bit `8*i` set =
+    /// byte `i` of that operand's value is uninitialized).
+    KmsanTainted { pc: u32, rs1: u8, rs2: u8, taint_a: u32, taint_b: u32 },
 }
 
 impl std::fmt::Display for Trap {
@@ -542,6 +672,10 @@ impl std::fmt::Display for Trap {
             Trap::Illegal { pc, raw } => {
                 write!(f, "illegal instruction {raw:#010x} @ {pc:#010x}")
             }
+            Trap::KmsanTainted { pc, rs1, rs2, taint_a, taint_b } => write!(
+                f,
+                "KMSAN: branch on uninitialized value @ {pc:#010x} (x{rs1}={taint_a:#010x} x{rs2}={taint_b:#010x})"
+            ),
             Trap::Exception { cause, tval } => {
                 write!(f, "exception cause {cause} tval {tval:#010x}")
             }
@@ -697,6 +831,14 @@ pub struct Cpu {
     /// capped at [`UBSAN_CAP`]. `None` costs exactly one discriminant check per such instruction
     /// and no allocation — zero cost unless a case explicitly opts in via `--ubsan`.
     ubsan: Option<Vec<u32>>,
+    /// KMSAN (Stage 1, `docs/kmsan.md`) register-shadow: `Some(taint)` while value-taint tracking
+    /// is enabled via [`Cpu::set_kmsan`], `None` (the default) otherwise. `taint[i]` is register
+    /// `i`'s byte-taint mask (bit `8*i` set = that byte of the register's current value is
+    /// uninitialized); `x0`'s taint is always read as `0` regardless of what's stored at index 0.
+    /// `Option<Box<[u32;32]>>`, NOT a bare `[u32;32]`, because `Cpu` is `clone()`d on *every* fuzz
+    /// case — a bare array would be a 128-byte memcpy per case even with KMSAN off, whereas `None`
+    /// keeps the off-cost at one pointer, exactly mirroring [`Cpu::cmplog`]'s cost model.
+    regs_taint: Option<Box<[u32; 32]>>,
 }
 
 impl Cpu {
@@ -713,6 +855,7 @@ impl Cpu {
             tlb: Tlb::new(),
             cmplog: None,
             ubsan: None,
+            regs_taint: None,
         }
     }
 
@@ -759,6 +902,20 @@ impl Cpu {
         }
     }
 
+    /// Enable or disable KMSAN value-taint tracking (Stage 1, `docs/kmsan.md`). Enabling allocates
+    /// a freshly zeroed register-shadow (`regs_taint`); disabling drops it and reverts `exec_one`
+    /// to zero extra cost — mirrors [`Cpu::set_cmplog`]'s cost model exactly. Purely observational
+    /// except for the [`Trap::KmsanTainted`] checkpoint it can now raise on a tainted `Branch`:
+    /// toggling it never changes what a fully-initialized program computes.
+    pub fn set_kmsan(&mut self, on: bool) {
+        self.regs_taint = if on { Some(Box::new([0u32; 32])) } else { None };
+    }
+
+    /// True if KMSAN value-taint tracking is currently enabled.
+    pub fn kmsan_enabled(&self) -> bool {
+        self.regs_taint.is_some()
+    }
+
     #[inline]
     fn rd_reg(&self, i: u8) -> u32 {
         if i == 0 { 0 } else { self.regs[i as usize] }
@@ -768,6 +925,26 @@ impl Cpu {
     fn wr_reg(&mut self, i: u8, v: u32) {
         if i != 0 {
             self.regs[i as usize] = v;
+        }
+    }
+
+    /// Read register `i`'s KMSAN byte-taint mask (`0` if tracking is disabled or `i` is `x0`).
+    #[inline]
+    fn rd_taint(&self, i: u8) -> u32 {
+        match &self.regs_taint {
+            Some(t) if i != 0 => t[i as usize],
+            _ => 0,
+        }
+    }
+
+    /// Write register `i`'s KMSAN byte-taint mask (a no-op if tracking is disabled or `i` is
+    /// `x0`).
+    #[inline]
+    fn wr_taint(&mut self, i: u8, t: u32) {
+        if i != 0
+            && let Some(taint) = self.regs_taint.as_deref_mut()
+        {
+            taint[i as usize] = t;
         }
     }
 
@@ -1012,6 +1189,47 @@ impl Cpu {
         }
     }
 
+    /// KMSAN Stage 1 load-taint (`docs/kmsan.md`): gather the byte-taint mask for the SAME span a
+    /// same-shaped [`Cpu::load`] call would read (byte-wise translate across a page-crossing/
+    /// misaligned span, one translate + one [`Bus::read_raw_state`] call otherwise), via
+    /// `PERM_RAW` state rather than the value itself. Only ever consulted when
+    /// [`Cpu::kmsan_enabled`]. Read-only: never touches `read`/`read_bytewise`'s RAW-clearing.
+    fn load_taint(&mut self, bus: &mut dyn Bus, va: u32, size: u8) -> Result<u32, Trap> {
+        if Self::misaligned(va, size) || Self::crosses_page(va, size) {
+            let mut mask = 0u32;
+            for i in 0..size as u32 {
+                let pa = self.xlate(bus, va.wrapping_add(i), Access::Read)?;
+                mask |= bus.read_raw_state(pa, 1) << (8 * i);
+            }
+            Ok(mask)
+        } else {
+            let pa = self.xlate(bus, va, Access::Read)?;
+            Ok(bus.read_raw_state(pa, size))
+        }
+    }
+
+    /// Extend a loaded span's byte-taint mask (bits set only at `8*i` for `i < size`) to a full
+    /// register-width taint, mirroring exactly how [`Cpu::load`] extends the VALUE: sign-extension
+    /// replicates the top loaded byte's taint into the newly-filled high bytes (those bits really
+    /// are copies of that one real byte's state); zero-extension leaves the high bytes untainted
+    /// (the fill is the known constant `0`, not a copy of anything uninitialized). A no-op for a
+    /// full-word (`size == 4`) load, which fills every byte position already.
+    #[inline]
+    fn extend_load_taint(mask: u32, size: u8, signed: bool) -> u32 {
+        if size >= 4 || !signed {
+            return mask;
+        }
+        let top_bit = 1u32 << (8 * (size as u32 - 1));
+        if mask & top_bit == 0 {
+            return mask;
+        }
+        let mut m = mask;
+        for pos in size as u32..4 {
+            m |= 1 << (8 * pos);
+        }
+        m
+    }
+
     /// Execute one instruction. Advances `pc` and `insns_retired`.
     pub fn step(&mut self, bus: &mut dyn Bus) -> Result<Exit, Trap> {
         let pc = self.pc;
@@ -1053,15 +1271,36 @@ impl Cpu {
         let mut exit = Exit::Continue;
 
         match inst {
-            Inst::Lui { rd, imm } => self.wr_reg(rd, imm),
-            Inst::Auipc { rd, imm } => self.wr_reg(rd, pc.wrapping_add(imm)),
+            Inst::Lui { rd, imm } => {
+                self.wr_reg(rd, imm);
+                // Fully-known value (an immediate) — clear any stale taint left over from a
+                // previous, different-shaped write to this register (see `docs/kmsan.md` Stage 1:
+                // only Op/OpImm/Mul/Load compute a real taint result; every other register-write
+                // site must at least clear it, or a since-overwritten register could still spuriously
+                // trip the `Branch` checkpoint on stale taint).
+                if self.kmsan_enabled() {
+                    self.wr_taint(rd, 0);
+                }
+            }
+            Inst::Auipc { rd, imm } => {
+                self.wr_reg(rd, pc.wrapping_add(imm));
+                if self.kmsan_enabled() {
+                    self.wr_taint(rd, 0);
+                }
+            }
             Inst::Jal { rd, imm } => {
                 self.wr_reg(rd, next);
+                if self.kmsan_enabled() {
+                    self.wr_taint(rd, 0); // link address is fully known
+                }
                 next = pc.wrapping_add(imm as u32);
             }
             Inst::Jalr { rd, rs1, imm } => {
                 let target = self.rd_reg(rs1).wrapping_add(imm as u32) & !1;
                 self.wr_reg(rd, next);
+                if self.kmsan_enabled() {
+                    self.wr_taint(rd, 0); // link address is fully known
+                }
                 next = target;
             }
             Inst::Branch { op, rs1, rs2, imm } => {
@@ -1071,6 +1310,13 @@ impl Cpu {
                     && log.len() < CMPLOG_CAP
                 {
                     log.push((a, b));
+                }
+                if self.kmsan_enabled() {
+                    let taint_a = self.rd_taint(rs1);
+                    let taint_b = self.rd_taint(rs2);
+                    if taint_a != 0 || taint_b != 0 {
+                        return Err(Trap::KmsanTainted { pc, rs1, rs2, taint_a, taint_b });
+                    }
                 }
                 let taken = match op {
                     BranchOp::Eq => a == b,
@@ -1094,6 +1340,15 @@ impl Cpu {
                     LoadOp::Lw => (4, false),
                 };
                 let v = self.load(bus, addr, size, signed)?;
+                // KMSAN Stage 1 load-taint (`docs/kmsan.md`): shadow the destination register from
+                // the `PERM_RAW` state of the exact bytes just loaded, sign/zero-extended the same
+                // way the value itself was. RAW-only (no memory-taint plane until Stage 2), and
+                // read-only — `load` above already performed (and would have faulted on) the actual
+                // checked read; this just additionally consults `Bus::read_raw_state`.
+                if self.kmsan_enabled() {
+                    let raw_mask = self.load_taint(bus, addr, size)?;
+                    self.wr_taint(rd, Self::extend_load_taint(raw_mask, size, signed));
+                }
                 self.wr_reg(rd, v);
             }
             Inst::Store { op, rs1, rs2, imm } => {
@@ -1104,6 +1359,11 @@ impl Cpu {
                     StoreOp::Sh => 2,
                     StoreOp::Sw => 4,
                 };
+                // KMSAN Stage 1 has no memory-taint plane yet (that's Stage 2's `PERM_VTAINT`), so
+                // a store of a tainted value into RAW-clear memory has nowhere to record taint —
+                // this is `docs/kmsan.md`'s documented Stage 1 limitation (store-then-reload won't
+                // propagate until Stage 2). Deliberately a taint no-op.
+                //
                 // HTIF: a word store to `tohost` with bit0 set is an exit request.
                 if op == StoreOp::Sw && self.htif_tohost == Some(addr) {
                     self.store(bus, addr, 4, val)?;
@@ -1115,7 +1375,13 @@ impl Cpu {
                 }
             }
             Inst::OpImm { op, rd, rs1, imm } => {
-                let v = alu(op, self.rd_reg(rs1), imm as u32);
+                let ra = self.rd_reg(rs1);
+                if self.kmsan_enabled() {
+                    // The immediate is always fully known (taint 0).
+                    let t = alu_taint(op, ra, self.rd_taint(rs1), imm as u32, 0);
+                    self.wr_taint(rd, t);
+                }
+                let v = alu(op, ra, imm as u32);
                 self.wr_reg(rd, v);
             }
             Inst::Op { op, rd, rs1, rs2 } => {
@@ -1130,6 +1396,10 @@ impl Cpu {
                     && log.len() < CMPLOG_CAP
                 {
                     log.push((ra, rb));
+                }
+                if self.kmsan_enabled() {
+                    let t = alu_taint(op, ra, self.rd_taint(rs1), rb, self.rd_taint(rs2));
+                    self.wr_taint(rd, t);
                 }
                 let v = alu(op, ra, rb);
                 self.wr_reg(rd, v);
@@ -1147,12 +1417,21 @@ impl Cpu {
                 {
                     log.push(pc);
                 }
+                if self.kmsan_enabled() {
+                    let t = muldiv_taint(op, a, self.rd_taint(rs1), b, self.rd_taint(rs2));
+                    self.wr_taint(rd, t);
+                }
                 let v = muldiv(op, a, b);
                 self.wr_reg(rd, v);
             }
             Inst::LrW { rd, rs1, .. } => {
                 let addr = self.rd_reg(rs1);
                 let v = self.load(bus, addr, 4, false)?;
+                // A load-reserved is a plain 4-byte load for taint purposes (see the `Load` arm).
+                if self.kmsan_enabled() {
+                    let raw_mask = self.load_taint(bus, addr, 4)?;
+                    self.wr_taint(rd, raw_mask);
+                }
                 self.reservation = Some(addr);
                 self.wr_reg(rd, v);
             }
@@ -1165,6 +1444,10 @@ impl Cpu {
                 }
                 // A reservation is single-use, and any trap/context-switch would clear it too.
                 self.reservation = None;
+                // Success/failure flag is fully known, not a copy of any memory or register value.
+                if self.kmsan_enabled() {
+                    self.wr_taint(rd, 0);
+                }
                 self.wr_reg(rd, if success { 0 } else { 1 });
             }
             Inst::AmoW { op, rd, rs1, rs2, .. } => {
@@ -1183,6 +1466,11 @@ impl Cpu {
                     AmoOp::Minu => old.min(src),
                     AmoOp::Maxu => old.max(src),
                 };
+                // `old` came straight off the bus at `pa` — shadow it like a plain 4-byte load
+                // (see the `Load` arm) before it's overwritten by the AMO's read-modify-write.
+                if self.kmsan_enabled() {
+                    self.wr_taint(rd, bus.read_raw_state(pa, 4));
+                }
                 bus.store(pa, 4, result).map_err(Trap::Mem)?;
                 self.reservation = None;
                 self.wr_reg(rd, old);
@@ -1232,6 +1520,11 @@ impl Cpu {
                     if csr == sys::SATP {
                         self.tlb.flush();
                     }
+                }
+                // CSR state is host-controlled architectural state, not a copy of a user register
+                // or of tainted guest memory — always fully known.
+                if self.kmsan_enabled() {
+                    self.wr_taint(rd, 0);
                 }
                 self.wr_reg(rd, old);
             }
@@ -1426,6 +1719,18 @@ impl Cpu {
                 self.take_trap(cause, tval, false);
                 SysExit::Continue
             }
+            Err(Trap::KmsanTainted { pc, .. }) => {
+                // KMSAN (Stage 1, `docs/kmsan.md`) is a host-side bug oracle, not an architectural
+                // RISC-V exception — there is no guest-deliverable cause for "branch on
+                // uninitialized value", so (unlike Mem/Illegal/Exception above) this must NOT be
+                // vectored into the guest's trap handler via `take_trap`. `SysExit` has no
+                // dedicated outcome for it yet — adding one would ripple into every full-system
+                // caller (fs-platform/fs-vec/fs-jit/fs-diff), which is out of Stage 1's scope and
+                // none of them wire up `set_kmsan` yet anyway. Until a later stage adds a proper
+                // outcome, surface it as an immediate halt keyed on the faulting `pc` so a run at
+                // least stops instead of silently resuming past a real finding.
+                SysExit::Halt(pc)
+            }
         }
     }
 
@@ -1472,7 +1777,7 @@ fn mem_cause(f: Fault) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fs_mmu::{Mmu, PERM_EXEC, PERM_READ, PERM_WRITE};
+    use fs_mmu::{Mmu, PERM_EXEC, PERM_RAW, PERM_READ, PERM_WRITE};
 
     /// Assemble a program, run it in a fresh MMU, return (exit_code, cpu).
     fn run(program: &[u32]) -> (u32, Cpu) {
@@ -1777,5 +2082,144 @@ mod tests {
             decode(asm::add(A0, A0, T0)),
             Inst::Op { op: AluOp::Add, rd: A0, rs1: A0, rs2: T0 }
         );
+    }
+
+    /// Shared KMSAN test program: x28 = 5 (clean); x29 = `scratch`; x30 = `*scratch` (a `Lw`);
+    /// x30 += x28 (an `Add`, so v0 taint propagation is exercised, not just a bare load-then-branch);
+    /// `beq x30, x28` (the Stage 1 checkpoint); then a normal `ecall` exit if the branch didn't trap.
+    /// Whether it traps depends entirely on whether `scratch`'s word is RAW-tainted and KMSAN is on.
+    fn kmsan_test_program() -> [u32; 7] {
+        use asm::*;
+        let scratch = 0x8000_1000u32;
+        [
+            addi(28, X0, 5),  // 0: x28 = 5
+            lui(29, scratch), // 1: x29 = scratch
+            lw(30, 29, 0),    // 2: x30 = *scratch
+            add(30, 30, 28),  // 3: x30 += x28
+            beq(30, 28, 4),   // 4: branch (KMSAN checkpoint if x30 or x28 is tainted)
+            addi(A7, X0, 93), // 5: (reached only if the branch didn't trap)
+            ecall(),          // 6
+        ]
+    }
+
+    /// POSITIVE control (`docs/kmsan.md` Stage 1): `scratch`'s word is allocated READ|WRITE|RAW —
+    /// readable (KMSAN, unlike `PERM_RAW`'s ASAN-strict fault-on-first-read, *permits* reading
+    /// uninitialized memory) but never actually written, so it is genuinely uninitialized. The `Lw`
+    /// shadows x30 from that RAW state, `Add` ORs the taint into x30 (v0 propagation), and the
+    /// `Branch` comparing the now-tainted x30 must raise `Trap::KmsanTainted` — not run to
+    /// completion.
+    #[test]
+    fn kmsan_positive_branch_on_uninitialized_load_traps() {
+        let base = 0x8000_0000u32;
+        let scratch = 0x8000_1000u32;
+        let mut mmu = Mmu::new(base, 0x1_0000);
+        mmu.protect(base, 0x1_0000, PERM_READ | PERM_WRITE).unwrap();
+        mmu.protect(scratch, 4, PERM_READ | PERM_WRITE | PERM_RAW).unwrap();
+        let prog = kmsan_test_program();
+        let mut bytes = Vec::new();
+        for w in prog {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        mmu.map(base, &bytes, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+
+        let mut cpu = Cpu::new(base);
+        cpu.set_kmsan(true);
+        assert!(cpu.kmsan_enabled());
+        let branch_pc = base + 4 * 4; // the beq instruction's address
+        for _ in 0..1000 {
+            match cpu.step(&mut mmu) {
+                Ok(Exit::Continue) => {}
+                Ok(other) => panic!("expected a KmsanTainted trap, got exit {other:?}"),
+                Err(Trap::KmsanTainted { pc, rs1, rs2, taint_a, taint_b }) => {
+                    assert_eq!(pc, branch_pc);
+                    assert_eq!(rs1, 30);
+                    assert_eq!(rs2, 28);
+                    assert_ne!(taint_a, 0, "x30 (loaded from uninitialized memory) must be tainted");
+                    assert_eq!(taint_b, 0, "x28 (a known constant) must not be tainted");
+                    return;
+                }
+                Err(other) => panic!("expected a KmsanTainted trap, got {other:?}"),
+            }
+        }
+        panic!("program did not terminate without trapping");
+    }
+
+    /// NEGATIVE control: identical program, except `scratch` is stored to (a known value) BEFORE
+    /// the `Lw` — clearing RAW/granting READ the normal way. The load is now clean, so taint never
+    /// propagates and the `Branch` must NOT trap; the program runs to its normal `ecall` exit.
+    #[test]
+    fn kmsan_negative_load_after_store_does_not_trap() {
+        use asm::*;
+        let base = 0x8000_0000u32;
+        let scratch = 0x8000_1000u32;
+        let mut mmu = Mmu::new(base, 0x1_0000);
+        mmu.protect(base, 0x1_0000, PERM_READ | PERM_WRITE).unwrap();
+        mmu.protect(scratch, 4, PERM_READ | PERM_WRITE | PERM_RAW).unwrap();
+        let mut prog = vec![
+            addi(28, X0, 5),  // 0: x28 = 5
+            lui(29, scratch), // 1: x29 = scratch
+            sw(29, 28, 0),    // 2: *scratch = 5 (a real store: clears RAW, grants READ)
+        ];
+        // Same tail as `kmsan_test_program`, just shifted 3 instructions later.
+        prog.extend_from_slice(&kmsan_test_program()[2..]);
+        let mut bytes = Vec::new();
+        for w in &prog {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        mmu.map(base, &bytes, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+
+        let mut cpu = Cpu::new(base);
+        cpu.set_kmsan(true);
+        for _ in 0..1000 {
+            match cpu.step(&mut mmu).unwrap() {
+                Exit::Continue => {}
+                Exit::Ecall => {
+                    assert_eq!(cpu.regs[A7 as usize], 93);
+                    assert_eq!(cpu.regs[30], 10); // *scratch (5) + x28 (5), no taint anywhere
+                    return;
+                }
+                other => panic!("unexpected exit {other:?}"),
+            }
+        }
+        panic!("program did not terminate");
+    }
+
+    /// CLEAN-REGRESSION control: the exact POSITIVE-control program (uninitialized `scratch`),
+    /// but with KMSAN left off (the default). `Cpu::exec_one`'s Stage 1 checkpoint is gated behind
+    /// `kmsan_enabled()`, so the branch on x30 must NOT trap — the program runs to the identical
+    /// completion state a build with no KMSAN code at all would produce — and `regs_taint` must
+    /// stay `None` the entire time (the clone-cost-avoidance half of the `docs/kmsan.md` design).
+    #[test]
+    fn kmsan_disabled_is_behavior_preserving_and_never_allocates_regs_taint() {
+        let base = 0x8000_0000u32;
+        let scratch = 0x8000_1000u32;
+        let mut mmu = Mmu::new(base, 0x1_0000);
+        mmu.protect(base, 0x1_0000, PERM_READ | PERM_WRITE).unwrap();
+        mmu.protect(scratch, 4, PERM_READ | PERM_WRITE | PERM_RAW).unwrap();
+        let prog = kmsan_test_program();
+        let mut bytes = Vec::new();
+        for w in prog {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        mmu.map(base, &bytes, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+
+        let mut cpu = Cpu::new(base);
+        assert!(!cpu.kmsan_enabled());
+        assert!(cpu.regs_taint.is_none());
+        for _ in 0..1000 {
+            match cpu.step(&mut mmu).unwrap() {
+                Exit::Continue => {
+                    assert!(cpu.regs_taint.is_none());
+                }
+                Exit::Ecall => {
+                    assert_eq!(cpu.regs[A7 as usize], 93);
+                    assert_eq!(cpu.regs[30], 5); // *scratch (uninitialized bytes read as 0) + 5
+                    assert!(cpu.regs_taint.is_none(), "KMSAN off must never allocate regs_taint");
+                    return;
+                }
+                other => panic!("unexpected exit {other:?}"),
+            }
+        }
+        panic!("program did not terminate");
     }
 }
