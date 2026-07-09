@@ -173,6 +173,90 @@ signal — usable for validating the mechanism, not yet for autonomous triage. T
 the ALU precision refinements (carry-smear, known-byte clearing) are NOT what's blocking real usage
 — the seed's allocator-convention coverage is.
 
+## T3.2.5 outcome — ctor-skip closes the one root-caused FP class (2026-07-08)
+
+Closed exactly the gap T3.2's outcome section identified: `kmem_cache_alloc` returns whose cache
+has a non-null constructor are now skipped by `--kmsan`'s seeding, mirroring the existing
+`__GFP_ZERO` skip and real Linux KMSAN's own `kmsan_slab_alloc()` special-case.
+
+**`ctor` offset derivation.** `struct kmem_cache` (`build/linux-src/mm/slab.h`) lists, after
+`object_size` (offset 16, the pre-existing `KMEM_CACHE_OBJECT_SIZE_OFFSET`, unchanged): `struct
+reciprocal_value reciprocal_size` (8B — `u32 m` + `u8 sh1` + `u8 sh2`, padded to 4-byte alignment),
+`unsigned int offset`, `unsigned int sheaf_capacity`, `struct kmem_cache_order_objects oo` (4B, one
+`unsigned int x`), `struct kmem_cache_order_objects min`, `gfp_t allocflags`, `int refcount`, then
+`void (*ctor)(void *object)` — no `CONFIG_`-gated fields intervene. Hand-summing RV32 sizes
+(4-byte pointers/`unsigned int`/`unsigned long`, natural alignment) gives offset 16 + 4 + 8 + 4 + 4
++ 4 + 4 + 4 + 4 = **52**. Cross-checked (no RV32 cross-compiler available in this environment) by
+compiling an equivalent struct with the host `gcc`, using fixed-width `uint32_t` stand-ins for
+every RV32 4-byte type (pointers, `unsigned long`, `gfp_t`, `slab_flags_t`) and reading
+`offsetof(...)`: this independently reproduced `object_size` at 16 (matching the pre-existing,
+already-trusted constant — a self-consistency check on the method itself) and `ctor` at 52. Pinned
+as `fs_san::linux::KMEM_CACHE_CTOR_OFFSET = 52`, with a unit test
+(`kmem_cache_ctor_offset_matches_documented_derivation`) that also re-derives it arithmetically from
+`KMEM_CACHE_OBJECT_SIZE_OFFSET` plus the documented per-field byte count, so the two constants can't
+silently drift apart. Re-derive both for any other kernel version/config, exactly like the existing
+`object_size`/`GFP_ZERO` constants' doc comments already require.
+
+**The seeding-skip change** (`crates/fs-cli/src/main.rs`, localized to `KmsanCtx`'s
+`KmsanAllocEvent::Cache` arm in `run_case` — the same block that already reads `object_size` and
+checks `__GFP_ZERO`): after the `object_size` sanity-bounded read succeeds, additionally read
+`cachep->ctor` at `KMEM_CACHE_CTOR_OFFSET` and treat it as "has a constructor" if the read value is
+`>= fs_san::linux::PAGE_OFFSET` (a real kernel VA never being dereferenced, only compared as an
+integer — no unsafe, no indirection through it). If so, count it in a new `ctor_skipped` stat and
+skip the `set_vtaint` call entirely (same `else if` ladder as the `__GFP_ZERO` check, so a
+`__GFP_ZERO` + ctor cache is counted once, under `zeroed_skipped`). The plain `kmalloc`
+(`KmsanAllocEvent::Sized`) path is untouched — it has no `cache` pointer and therefore no `ctor` to
+check, exactly as scoped.
+
+**FP measurement — BEFORE vs. AFTER, same methodology as T3.2** (clean `firmware/Image`, `--kmsan`,
+seed 1 × 5000 + seed 2 × 3000 = 8000 cases total, run by invoking the built `fuzzsoft` binary with
+cwd = the main checkout so the default `firmware/`/`build/linux-src/System.map` relative paths
+resolve — `build/`/`firmware/` are gitignored artifacts that live only in the main checkout, not
+this worktree):
+
+| | seed 1 (5000 cases) | seed 2 (3000 cases) | combined |
+|---|---|---|---|
+| **BEFORE (T3.2)** | 364 halts, 1 unique pc | 548 halts, 1 unique pc | 912/8000 (~11%) |
+| **AFTER (T3.2.5)** | **0 halts, 0 unique pc** | **0 halts, 0 unique pc** | **0/8000 (0%)** |
+
+Seeding stats confirm the mechanism is still live, just narrower: seed 1 tainted 12103 allocations
+(3.04 MB), skipped 1514 for `__GFP_ZERO`, and now additionally skips 657 for a ctor-having cache;
+seed 2 tainted 10148 (2.86 MB), skipped 1295 `__GFP_ZERO`, 924 ctor. `kmem_cache_alloc`
+size-unavailable stayed 0 in both runs (the pre-existing `object_size` offset is unaffected).
+Coverage/corpus/kernel-crash counts are bit-for-bit identical to the equivalent `--sanitize` run at
+the same seed/cases (14892 buckets / 958 corpus for seed 1), confirming this change altered only
+KMSAN's seeding decision, nothing about execution. **The `pc=0xc0b0581e` `_raw_spin_lock_irq` FP
+class from T3.2 is gone: 0 recurrences in either run.**
+
+**Is the skip too broad?** Cross-checked against a same-seed/same-cases `--sanitize` run (mutually
+exclusive with `--kmsan`, so run separately): 13670 total `kmem_cache_alloc` events were observed at
+seed 1/5000-cases (`sanitizer: ... 13670 kmem_cache_alloc ...`), against which the 657 ctor-skips
+measured on the identical seed/cases under `--kmsan` are **~4.8%** — a narrow, plausible fraction,
+not a blanket "cache allocs never get tainted anymore." The large majority of `kmem_cache_alloc`
+returns are still exposed to VTAINT seeding.
+
+**Positive control — survives.** The fs-riscv unit-level mechanism tests
+(`kmsan_stage2_store_scatter_then_reload_then_branch_fires`,
+`kmsan_stage2_store_of_clean_value_clears_stale_vtaint`, `kmsan_positive_branch_on_uninitialized_load_traps`,
+`kmsan_negative_load_after_store_does_not_trap`, `kmsan_disabled_never_sets_vtaint`,
+`kmsan_disabled_is_behavior_preserving_and_never_allocates_regs_taint`,
+`kmsan_live_oracle_stashes_report_in_finish_exit`) all still pass unmodified — none of them route
+through `KmsanCtx`/the allocator hooks this change touches, so they're an independent confirmation
+that the shadow, propagation, and checkpoint-trap plumbing are untouched by the ctor-skip; the skip
+only narrows *seeding*, not detection. A genuinely fresh live "seeded-uninit, non-ctor" positive
+control on the clean kernel was not constructed in this pass (0/8000 hits is the expected outcome
+on a bug-free stock kernel by construction, not evidence against the mechanism — see the unit tests
+above for that); building a deliberately-planted uninitialized-value kernel bug (parallel to
+`scripts/build-buggy-kernel.sh`'s planted OOB-write bug, but for KMSAN) is flagged as a good
+follow-up if an end-to-end "found a real bug" demonstration is wanted, but was out of scope here.
+
+**Verdict: `--kmsan` is now campaign-ready.** The one root-caused FP class T3.2 measured (~11% of
+clean-kernel cases, entirely one recurring code path) is eliminated (0/8000), the fix is narrowly
+scoped (confirmed via the `--sanitize` cross-check, not a blanket cache-alloc taint suppression),
+and the underlying mechanism (shadow, propagation, live oracle) is unmodified and still passes its
+own unit tests. A live campaign can now run `--kmsan` unattended without spending cases
+re-discovering a known, understood non-bug.
+
 ## Open questions (decide, don't assume)
 Byte-taint packing (bits 0-3 vs byte-aligned 0/8/16/24 — recommend byte-aligned for Stage-3 shift math);
 mode flag as runtime `Option` (start here, matches cmplog) vs const-generic (only if profiled);

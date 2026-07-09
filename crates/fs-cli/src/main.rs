@@ -134,13 +134,14 @@ impl SanCtx {
 /// unknown," never "is this address still live." Mutually exclusive with `--sanitize` (checked at
 /// startup, same as T3.1's `--kmsan`/`--sanitize` gate).
 ///
-/// Known, documented residual FP source (flagged rather than silently risked): a `kmem_cache_alloc`
-/// whose cache has a constructor (`ctor`) is *also* effectively pre-initialized on every fresh
-/// (never-before-used) handout — real KMSAN special-cases ctor-having caches; this first cut does
-/// not (reading `cachep->ctor` would need another kernel-version-specific struct-offset guess, the
-/// same class of risk `fs_san::linux::KMEM_CACHE_OBJECT_SIZE_OFFSET`'s doc comment already flags).
-/// If the false-positive measurement below shows this dominates, that is exactly the signal to add
-/// it next.
+/// Closed residual FP source (T3.2 -> T3.2.5, `docs/kmsan.md`'s outcome section): a
+/// `kmem_cache_alloc` whose cache has a constructor (`ctor`) is *also* effectively pre-initialized
+/// on every fresh (never-before-used) handout — real KMSAN special-cases ctor-having caches, and
+/// this does too, via `fs_san::linux::KMEM_CACHE_CTOR_OFFSET` (a guest-memory read of
+/// `cachep->ctor`, the same shape as the existing `object_size` read, sanity-checked against
+/// `fs_san::linux::PAGE_OFFSET` rather than dereferenced). This was T3.2's empirically-measured
+/// dominant FP class (~11% of clean-kernel cases, all `_raw_spin_lock_irq` on a ctor/convention-
+/// initialized `struct sock`-shaped object) — see `KmsanCtx::Cache` handling in `run_case` below.
 ///
 /// `golden_perms`/`dirtied`/`restore_dirtied_perms`: identical workaround to `SanCtx`'s (see that
 /// struct's doc comment) — `Mmu::set_vtaint` is a permission-only mutation `Mmu`'s dirty-block
@@ -159,6 +160,12 @@ struct KmsanCtx {
     /// `kmem_cache_alloc` hits whose `cachep->object_size` guest-memory read failed the sanity
     /// self-check (mirrors `SanCtx::cache_alloc_size_unavailable`).
     cache_size_unavailable: u64,
+    /// `kmem_cache_alloc` hits skipped because `cachep->ctor` was non-null (T3.2.5: the cache's
+    /// constructor — or an allocator-internal reuse convention it backs, e.g. `struct sock`'s
+    /// `sk_lock` — already legitimately initializes the object on a fresh handout, so tainting it
+    /// would be a false positive; see the `KMEM_CACHE_CTOR_OFFSET` doc comment for the root cause
+    /// this closes).
+    ctor_skipped: u64,
 }
 
 impl KmsanCtx {
@@ -394,8 +401,26 @@ fn run_case(
                                     if object_size > 0
                                         && object_size < fs_san::linux::KMEM_CACHE_OBJECT_SIZE_MAX =>
                                 {
+                                    // T3.2.5 (docs/kmsan.md): a non-null `cachep->ctor` means this
+                                    // object is legitimately pre-initialized on a fresh handout
+                                    // (the ctor already ran when the slab page was carved, or it
+                                    // backs a "don't-copy-this-region, a dedicated init call
+                                    // handles it" reuse convention — e.g. struct sock's sk_lock via
+                                    // sock_lock_init) — never dereferenced, only checked for
+                                    // "looks like a real kernel VA" against PAGE_OFFSET.
+                                    let has_ctor = m
+                                        .ram
+                                        .read_u32(
+                                            cache_pa.wrapping_add(
+                                                fs_san::linux::KMEM_CACHE_CTOR_OFFSET,
+                                            ),
+                                        )
+                                        .map(|ctor| ctor >= fs_san::linux::PAGE_OFFSET)
+                                        .unwrap_or(false);
                                     if gfp_flags & fs_san::GFP_ZERO != 0 {
                                         ctx.zeroed_skipped += 1;
+                                    } else if has_ctor {
+                                        ctx.ctor_skipped += 1;
                                     } else {
                                         ctx.mark_dirtied(pa, object_size);
                                         if m.ram.set_vtaint(pa, object_size, true).is_ok() {
@@ -1712,6 +1737,7 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
                         tainted_bytes: 0,
                         zeroed_skipped: 0,
                         cache_size_unavailable: 0,
+                        ctor_skipped: 0,
                     })
                 }
             }
@@ -2045,8 +2071,12 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
         );
         if let Some(ctx) = &kmsan_ctx {
             println!(
-                "  kmsan seeding : {} kmalloc/kmem_cache_alloc alloc(s) tainted ({} bytes)  |  {} __GFP_ZERO alloc(s) skipped  |  {} kmem_cache_alloc size-unavailable  [Stage 2, docs/kmsan.md]",
-                ctx.tainted_allocs, ctx.tainted_bytes, ctx.zeroed_skipped, ctx.cache_size_unavailable
+                "  kmsan seeding : {} kmalloc/kmem_cache_alloc alloc(s) tainted ({} bytes)  |  {} __GFP_ZERO alloc(s) skipped  |  {} ctor-having cache alloc(s) skipped  |  {} kmem_cache_alloc size-unavailable  [Stage 2/2.5, docs/kmsan.md]",
+                ctx.tainted_allocs,
+                ctx.tainted_bytes,
+                ctx.zeroed_skipped,
+                ctx.ctor_skipped,
+                ctx.cache_size_unavailable
             );
         }
     }

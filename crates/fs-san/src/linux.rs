@@ -313,7 +313,16 @@ impl LinearMap {
 ///     slab_flags_t flags;                               // offset  4 (`unsigned int`, 4B)
 ///     unsigned long min_partial;                        // offset  8 (4B on RV32)
 ///     unsigned int size;                                // offset 12
-///     unsigned int object_size;                          // offset 16  <-- this constant
+///     unsigned int object_size;                          // offset 16  <-- KMEM_CACHE_OBJECT_SIZE_OFFSET
+///     struct reciprocal_value reciprocal_size;          // offset 20 (8B: u32 m + u8 sh1 + u8 sh2,
+///                                                        //             padded to 4-byte alignment)
+///     unsigned int offset;                              // offset 28 (free pointer offset)
+///     unsigned int sheaf_capacity;                       // offset 32
+///     struct kmem_cache_order_objects oo;               // offset 36 (4B: one `unsigned int x`)
+///     struct kmem_cache_order_objects min;              // offset 40
+///     gfp_t allocflags;                                  // offset 44
+///     int refcount;                                      // offset 48
+///     void (*ctor)(void *object);                        // offset 52  <-- KMEM_CACHE_CTOR_OFFSET
 ///     ...
 /// };
 /// ```
@@ -331,6 +340,27 @@ pub const KMEM_CACHE_OBJECT_SIZE_OFFSET: u32 = 16;
 /// `cachep` pointer — not a real cache — and the read should be treated as unusable rather than
 /// fed to the sanitizer.
 pub const KMEM_CACHE_OBJECT_SIZE_MAX: u32 = 0x0010_0000; // 1 MiB
+
+/// Byte offset of `struct kmem_cache::ctor` (`mm/slab.h`) for **this project's own kernel build**
+/// — derived the same way as [`KMEM_CACHE_OBJECT_SIZE_OFFSET`] (re-read `mm/slab.h`, recompute the
+/// RV32 field layout); see that constant's doc comment for the field-by-field derivation table
+/// through this offset. Re-derive for any other kernel version/config.
+///
+/// This closes KMSAN Stage 2's (`docs/kmsan.md`, T3.2 outcome) one root-caused false-positive
+/// class: a `kmem_cache_alloc` whose cache has a non-null constructor is *not* actually
+/// uninitialized on a fresh handout (the ctor already ran when the slab page was carved, or SLUB
+/// re-establishes ctor-managed fields across reuse — e.g. `struct sock`'s `sk_lock` via a
+/// convention `sk_prot_alloc`/`sock_lock_init` implement, empirically confirmed as the
+/// `_raw_spin_lock_irq` FP class T3.2's measurement root-caused). Real Linux KMSAN's own
+/// `kmsan_slab_alloc()` special-cases exactly this (`cache->ctor` -> skip poisoning); this constant
+/// lets `fs-cli`'s `KmsanCtx` seeding path do the same, mirroring the existing `__GFP_ZERO` skip.
+///
+/// `ctor` is a function pointer, so "has a constructor" is "the guest-memory-read value is
+/// non-null and looks like a plausible kernel VA" — checked at the call site against
+/// [`PAGE_OFFSET`] (any real kernel text/data pointer is `>= PAGE_OFFSET` on this RV32 port),
+/// never trusted as an unconditionally dereferenceable address (the seeding path never calls
+/// through it, only compares the raw integer).
+pub const KMEM_CACHE_CTOR_OFFSET: u32 = 52;
 
 /// The `__GFP_ZERO` bit (`include/linux/gfp_types.h`'s `___GFP_ZERO_BIT`), for KMSAN Stage 2's
 /// (`docs/kmsan.md`) allocator-hook taint seeding: a `kzalloc()`/`kmalloc(..., __GFP_ZERO)`
@@ -380,6 +410,22 @@ mod tests {
     fn kmem_cache_object_size_offset_matches_documented_derivation() {
         assert_eq!(KMEM_CACHE_OBJECT_SIZE_OFFSET, 16);
         assert_eq!(KMEM_CACHE_OBJECT_SIZE_MAX, 0x0010_0000);
+    }
+
+    /// Pins `KMEM_CACHE_CTOR_OFFSET`'s documented derivation the same way, and additionally
+    /// cross-checks it against an independently-computed C `offsetof` layout (see the doc
+    /// comment's field table) so a future field reorder in this doc comment can't silently drift
+    /// from what the real struct would produce: `object_size`(4B) + `reciprocal_value`(8B,
+    /// natural-aligned) + `offset`(4B) + `sheaf_capacity`(4B) + `oo`(4B) + `min`(4B) +
+    /// `allocflags`(4B) + `refcount`(4B) = 32 bytes after `object_size`'s offset of 16.
+    #[test]
+    fn kmem_cache_ctor_offset_matches_documented_derivation() {
+        assert_eq!(KMEM_CACHE_CTOR_OFFSET, 52);
+        let bytes_after_object_size: u32 = 4 + 8 + 4 + 4 + 4 + 4 + 4 + 4;
+        assert_eq!(
+            KMEM_CACHE_OBJECT_SIZE_OFFSET + bytes_after_object_size,
+            KMEM_CACHE_CTOR_OFFSET
+        );
     }
 
     /// Pins `GFP_ZERO`'s documented derivation (gfp_types.h bit-index enum position) the same way.
