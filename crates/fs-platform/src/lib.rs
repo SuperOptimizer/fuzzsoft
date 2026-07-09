@@ -672,6 +672,80 @@ pub fn run_smp(
     stops.into_iter().map(|s| s.unwrap_or(Stop::Budget)).collect()
 }
 
+/// SMP fuzz-loop mechanics (T5.1c, `docs/smp-design.md`'s "mechanics only" chunk): identical
+/// round-robin/CLINT/cross-hart-invalidation core as [`run_smp`] (in fact byte-for-byte the same
+/// body, deliberately duplicated rather than refactored — exactly the project's existing
+/// `run`/`run_until` and `run_case`/`dump_edges_replay` precedent for "a coverage-recording twin of
+/// an existing driver loop"), but additionally invokes `on_edge(hart_index, from_pc, to_pc)` for
+/// every non-fall-through control-flow transition on EVERY hart, so a caller (`fs-cli`'s
+/// `smp-fuzz`) can fold coverage from BOTH harts into one shared AFL-style bitmap (edges from
+/// either hart count — there is no per-hart bitmap). `run_smp` itself is completely untouched by
+/// this addition, so `smp-boot` and the T5.1a mechanical tests keep calling the exact same
+/// function they always have.
+pub fn run_smp_with_edges(
+    cpus: &mut [Cpu],
+    machine: &mut Machine,
+    quantum: u64,
+    deadline_ticks: u64,
+    stop_on_hypercall: bool,
+    mut on_edge: impl FnMut(usize, u32, u32),
+) -> SmpStop {
+    let n = cpus.len();
+    let mut stops: Vec<Option<Stop>> = vec![None; n];
+    let mut tick: u64 = 0;
+    if n == 0 {
+        return Vec::new();
+    }
+    'outer: loop {
+        for h in 0..n {
+            if stops[h].is_some() {
+                continue;
+            }
+            let turn_deadline = cpus[h].insns_retired + quantum;
+            let mut hypercalled = false;
+            let mut rec = RecordingBus { machine: &mut *machine, writes: Vec::new() };
+            loop {
+                rec.machine.clint.mtime = tick;
+                apply_clint_hart(&mut cpus[h], &rec.machine.clint, h);
+                let prev = cpus[h].pc;
+                match cpus[h].step_system(&mut rec) {
+                    SysExit::Continue => {
+                        let cur = cpus[h].pc;
+                        if cur != prev.wrapping_add(4) && cur != prev.wrapping_add(2) {
+                            on_edge(h, prev, cur);
+                        }
+                    }
+                    SysExit::Halt(c) => {
+                        stops[h] = Some(Stop::Halt(c));
+                    }
+                    SysExit::Hypercall(c) => {
+                        stops[h] = Some(Stop::Hypercall(c));
+                        hypercalled = true;
+                    }
+                }
+                tick += 1;
+                if stops[h].is_some() || cpus[h].insns_retired >= turn_deadline || tick >= deadline_ticks {
+                    break;
+                }
+            }
+            for &(addr, len) in &rec.writes {
+                for (other, cpu_other) in cpus.iter_mut().enumerate() {
+                    if other != h {
+                        cpu_other.invalidate_reservation(addr, len as u32);
+                    }
+                }
+            }
+            if (stop_on_hypercall && hypercalled)
+                || stops.iter().all(|s| s.is_some())
+                || tick >= deadline_ticks
+            {
+                break 'outer;
+            }
+        }
+    }
+    stops.into_iter().map(|s| s.unwrap_or(Stop::Budget)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

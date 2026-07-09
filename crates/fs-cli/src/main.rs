@@ -27,6 +27,7 @@ fn main() -> ExitCode {
         Some("boot") => cmd_boot(&args[2..]),
         Some("smp-boot") => cmd_smp_boot(&args[2..]),
         Some("fuzz") => cmd_fuzz(&args[2..]),
+        Some("smp-fuzz") => cmd_smp_fuzz(&args[2..]),
         _ => {
             usage();
             ExitCode::FAILURE
@@ -2900,6 +2901,295 @@ fn smp_state_fingerprint(cpus: &[Cpu], m: &fs_platform::Machine) -> String {
     s
 }
 
+/// 2-hart SMP coverage-guided syscall fuzzer (T5.1c, `docs/smp-design.md`'s "mechanics only"
+/// chunk): boot SMP to a dual-hart snapshot rendezvous (both harts independently reach their own
+/// HC_SNAPSHOT — see `boot/agent-smp.c`'s header comment for why this needs its own kernel image,
+/// never `firmware/Image`/`boot/agent.c`, the single-hart path's), then loop: reset ALL harts +
+/// memory to that golden `SnapshotSmp`, inject ONE independently generated/mutated `fs_prog`
+/// program per hart (hart 0's own `(prog, scratch)` buffer pair, hart 1's own — each hart's own
+/// hypercall told us where its buffers live, no fixed-VA convention needed), run BOTH harts
+/// concurrently to completion via `run_smp_with_edges`, fold coverage from EITHER hart into one
+/// shared bitmap (a union, not per-hart maps), and run the existing kernel-crash oracle on the
+/// shared console. This is deliberately NOT a race-detector or a concurrent-program generator
+/// (`docs/smp-design.md` Phase 3/5) — two independent syscall streams racing the SAME kernel is
+/// exactly what makes a genuine UAF-via-race/TOCTOU observable at all; finding one is left to the
+/// existing oracle plus luck, same as decision #19's single-hart oracle always has been.
+///
+/// JIT stays gated off entirely (interpreter-only, matching `run_smp`'s `RecordingBus`, which
+/// never exposes `fast_ptr`) per `docs/smp-design.md`'s explicit Phase 2 decision.
+fn cmd_smp_fuzz(args: &[String]) -> ExitCode {
+    use fs_cov::{CovBitmap, VirginMap};
+    use fs_mmu::{PERM_EXEC, PERM_READ, PERM_WRITE};
+    use fs_platform::{Machine, SnapshotSmp, Stop, run_smp, run_smp_with_edges};
+
+    let mut firmware = "firmware/fw_jump.bin";
+    let mut dtb = "firmware/fuzzsoft-smp.dtb";
+    let mut kernel = "firmware/Image.smp";
+    let mut ram_mb = 128u32;
+    // Boot budget: combined scheduler ticks (`run_smp`'s tick, NOT per-hart insns_retired) to wait
+    // for BOTH harts to independently reach their own first HC_SNAPSHOT. Generous multiple of
+    // `smp-boot`'s already-measured ~3.2B-tick single-snapshot boot (docs/smp-design.md's T5.1b
+    // number) since this agent additionally clones + sets affinity on two flows before either
+    // hypercalls — a runaway guard, not a tuned budget.
+    let mut boot_ticks = 8_000_000_000u64;
+    let mut quantum = 10_000u64;
+    // Per-case combined tick budget across both harts (the `run_smp_with_edges` deadline) --
+    // double the single-hart default `--case-insns` (2_000_000) since two harts share it.
+    let mut case_ticks = 4_000_000u64;
+    let mut cases = 2000u32;
+    let mut seed = 1u32;
+    let ram_base = 0x8000_0000u32;
+    let kernel_addr = 0x8040_0000u32;
+
+    let mut i = 0;
+    while i < args.len() {
+        let key = args[i].as_str();
+        let val = |i: usize| args.get(i + 1).cloned().unwrap_or_default();
+        match key {
+            "--firmware" => firmware = Box::leak(val(i).into_boxed_str()),
+            "--dtb" => dtb = Box::leak(val(i).into_boxed_str()),
+            "--kernel" => kernel = Box::leak(val(i).into_boxed_str()),
+            "--ram-mb" => ram_mb = val(i).parse().unwrap_or(ram_mb),
+            "--boot-ticks" => boot_ticks = val(i).parse().unwrap_or(boot_ticks),
+            "--quantum" => quantum = val(i).parse().unwrap_or(quantum),
+            "--case-ticks" => case_ticks = val(i).parse().unwrap_or(case_ticks),
+            "--cases" => cases = val(i).parse().unwrap_or(cases),
+            "--seed" => seed = val(i).parse().unwrap_or(1),
+            other => {
+                eprintln!("smp-fuzz: unexpected argument {other:?}");
+                return ExitCode::FAILURE;
+            }
+        }
+        i += 2;
+    }
+
+    let ram_size = ram_mb * 0x0010_0000;
+    let mut m = Machine::new_smp(ram_base, ram_size, 2);
+    m.ram.protect(ram_base, ram_size, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+    for (path, addr) in [(firmware, ram_base), (kernel, kernel_addr)] {
+        match std::fs::read(path) {
+            Ok(b) => m.ram.map(addr, &b, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap(),
+            Err(e) => {
+                eprintln!("smp-fuzz: cannot read {path}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let dtb_bytes = match std::fs::read(dtb) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("smp-fuzz: cannot read {dtb}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let dtb_addr = ram_base + ram_size - 0x0020_0000;
+    m.ram.map(dtb_addr, &dtb_bytes, PERM_READ | PERM_WRITE).unwrap();
+
+    let mut cpus = Vec::with_capacity(2);
+    for hart in 0..2u32 {
+        let mut cpu = Cpu::new_hart(ram_base, hart);
+        cpu.hypercall_eid = Some(HC_EID);
+        cpu.regs[10] = hart;
+        cpu.regs[11] = dtb_addr;
+        cpus.push(cpu);
+    }
+
+    // --- boot: wait for BOTH harts to independently reach their own first HC_SNAPSHOT.
+    // `stop_on_hypercall = false` (already exercised by the T5.1a mechanical tests): each hart's
+    // own hypercall only stops THAT hart; the scheduler itself only returns once every hart has
+    // stopped (or the boot deadline hits) -- exactly "wait for both", no new scheduler semantics.
+    eprintln!("smp-fuzz: booting SMP to dual-hart snapshot rendezvous (budget {boot_ticks} ticks)...");
+    let stops = run_smp(&mut cpus, &mut m, quantum, boot_ticks, false);
+    print!("{}", String::from_utf8_lossy(&m.uart.out));
+    println!();
+    for (h, s) in stops.iter().enumerate() {
+        eprintln!(
+            "smp-fuzz: hart {h}: {s:?}  insns_retired={}  pc={:#010x}",
+            cpus[h].insns_retired, cpus[h].pc
+        );
+    }
+    if !stops.iter().all(|s| matches!(s, Stop::Hypercall(HC_SNAPSHOT))) {
+        eprintln!(
+            "smp-fuzz: not every hart reached its own HC_SNAPSHOT within the boot budget -- aborting \
+             (see boot/agent-smp.c: this needs firmware/Image.smp, built from boot/agent-smp.c + \
+             boot/initramfs-smp.spec, NOT the shared firmware/Image)"
+        );
+        return ExitCode::FAILURE;
+    }
+    eprintln!("smp-fuzz: both harts reached their own HC_SNAPSHOT -- capturing SnapshotSmp");
+
+    // Each hart passed a1=prog buffer VA, a2=scratch buffer VA in ITS OWN hypercall call -- read
+    // straight from that hart's own registers, then translate with THAT hart's own `xlate` (sound
+    // even though both flows currently share one address space via CLONE_VM: it's the hart's own
+    // page-table walk either way, not an assumption about which hart owns which VA).
+    let scratch_words = (fs_prog::DEFAULT_SCRATCH_CAP / 4) as usize;
+    let mut prog_pas: Vec<Vec<u32>> = Vec::with_capacity(2);
+    let mut scratch_pas: Vec<Vec<u32>> = Vec::with_capacity(2);
+    let mut scratch_va: Vec<u32> = Vec::with_capacity(2);
+    for (h, cpu) in cpus.iter_mut().enumerate() {
+        let prog_va = cpu.regs[11];
+        let sva = cpu.regs[12];
+        let mut pas = Vec::with_capacity(fs_prog::WIRE_WORDS);
+        for k in 0..fs_prog::WIRE_WORDS as u32 {
+            match cpu.xlate(&mut m, prog_va + k * 4, fs_mmu::Access::Write) {
+                Ok(pa) => pas.push(pa),
+                Err(_) => {
+                    eprintln!("smp-fuzz: hart {h}: could not translate program buffer @ {prog_va:#x}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        let mut spas = Vec::with_capacity(scratch_words);
+        for k in 0..scratch_words as u32 {
+            match cpu.xlate(&mut m, sva + k * 4, fs_mmu::Access::Write) {
+                Ok(pa) => spas.push(pa),
+                Err(_) => {
+                    eprintln!("smp-fuzz: hart {h}: could not translate scratch buffer @ {sva:#x}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        eprintln!(
+            "smp-fuzz: hart {h}: prog @ {prog_va:#010x} ({} words)  scratch @ {sva:#010x} ({} words)",
+            pas.len(),
+            spas.len()
+        );
+        prog_pas.push(pas);
+        scratch_pas.push(spas);
+        scratch_va.push(sva);
+    }
+    let base_uart = m.uart.out.len();
+
+    let snap = SnapshotSmp::capture(&cpus, &mut m);
+
+    let mut virgin = VirginMap::new();
+    let mut run_map = CovBitmap::new();
+    let mut rng = fs_prog::Rng::new(seed);
+    let mut corpus: Vec<fs_prog::Prog> = Vec::new();
+    let mut crash_sigs = std::collections::HashSet::new();
+    let mut crashes = 0u32;
+    let mut done = [0u32; 2];
+    let mut budget_hit = 0u32;
+    let t0 = std::time::Instant::now();
+    let mut determinism_ok: Option<bool> = None;
+
+    for case in 0..cases {
+        let gen_one = |rng: &mut fs_prog::Rng, corpus: &[fs_prog::Prog]| {
+            if !corpus.is_empty() && rng.chance(85) {
+                let idx = rng.below(corpus.len());
+                fs_prog::mutate(rng, &corpus[idx])
+            } else {
+                fs_prog::generate(rng)
+            }
+        };
+        let prog0 = gen_one(&mut rng, &corpus);
+        let prog1 = gen_one(&mut rng, &corpus);
+        let lowered0 = fs_prog::lower(&prog0, scratch_va[0]);
+        let lowered1 = fs_prog::lower(&prog1, scratch_va[1]);
+        let wire0 = fs_prog::to_wire(&lowered0);
+        let wire1 = fs_prog::to_wire(&lowered1);
+
+        let inject = |cpus: &mut Vec<Cpu>, m: &mut Machine| {
+            snap.reset(cpus, m);
+            write_words(m, &prog_pas[0], &wire0);
+            write_scratch_bytes(m, &scratch_pas[0], &lowered0.scratch);
+            write_words(m, &prog_pas[1], &wire1);
+            write_scratch_bytes(m, &scratch_pas[1], &lowered1.scratch);
+        };
+
+        inject(&mut cpus, &mut m);
+        run_map.clear();
+        let stops = run_smp_with_edges(&mut cpus, &mut m, quantum, case_ticks, false, |_hart, from, to| {
+            run_map.record_edge(from, to);
+        });
+
+        for (h, s) in stops.iter().enumerate() {
+            match s {
+                Stop::Hypercall(HC_DONE) => done[h] += 1,
+                Stop::Budget => budget_hit += 1,
+                _ => {}
+            }
+        }
+
+        if virgin.has_new_bits(&run_map) {
+            corpus.push(prog0.clone());
+            corpus.push(prog1.clone());
+        }
+
+        let out = &m.uart.out[base_uart.min(m.uart.out.len())..];
+        if let Some(sig) = kernel_crash_sig(out) {
+            crashes += 1;
+            if crash_sigs.insert(sig) {
+                let names0: Vec<&str> = prog0.calls.iter().map(|c| c.desc.name).collect();
+                let names1: Vec<&str> = prog1.calls.iter().map(|c| c.desc.name).collect();
+                eprintln!(
+                    "smp-fuzz: [KERNEL CRASH] epc={sig:#010x} case {case} hart0={names0:?} hart1={names1:?}"
+                );
+                eprintln!("{}", String::from_utf8_lossy(out));
+            }
+        }
+
+        // Per-case determinism gate (the whole basis of the fuzzer, generalized to SMP): replay
+        // THIS case's exact (snapshot, two programs, schedule) a second time from the same golden
+        // state and require byte-identical stops/hart-state/RAM/coverage. Checked once (case 0) --
+        // the mechanism has no case-index-dependent state, so one check is representative; see the
+        // report for this reasoning spelled out.
+        if case == 0 {
+            let stops_a = stops.clone();
+            let fp_a = smp_state_fingerprint(&cpus, &m);
+            let cov_a = run_map.as_slice().to_vec();
+            inject(&mut cpus, &mut m);
+            let mut replay_map = CovBitmap::new();
+            let stops_b =
+                run_smp_with_edges(&mut cpus, &mut m, quantum, case_ticks, false, |_h, from, to| {
+                    replay_map.record_edge(from, to);
+                });
+            let fp_b = smp_state_fingerprint(&cpus, &m);
+            let ok = stops_a == stops_b && fp_a == fp_b && cov_a.as_slice() == replay_map.as_slice();
+            determinism_ok = Some(ok);
+            eprintln!(
+                "smp-fuzz: per-case determinism check (case 0 replay): {}",
+                if ok { "MATCH (byte-identical)" } else { "MISMATCH" }
+            );
+            if !ok {
+                eprintln!(
+                    "smp-fuzz: DETERMINISM FAILED -- stops_a={stops_a:?} stops_b={stops_b:?}\n  fp_a={fp_a}\n  fp_b={fp_b}"
+                );
+            }
+        }
+
+        if case % 100 == 99 {
+            eprintln!(
+                "smp-fuzz: {} cases | {} cov | corpus {} | {} kcrash ({} uniq) | done0={} done1={} budget={} | {:.1} exec/s",
+                case + 1,
+                virgin.covered_buckets(),
+                corpus.len(),
+                crashes,
+                crash_sigs.len(),
+                done[0],
+                done[1],
+                budget_hit,
+                (case + 1) as f64 / t0.elapsed().as_secs_f64(),
+            );
+        }
+    }
+
+    let elapsed = t0.elapsed().as_secs_f64();
+    println!("== smp-fuzz complete ==");
+    println!("  cases          : {cases}  in {elapsed:.1}s  ({:.1} execs/sec)", cases as f64 / elapsed);
+    println!("  hart0 done/budget: {} / {budget_hit}", done[0]);
+    println!("  hart1 done       : {}", done[1]);
+    println!("  coverage       : {} bitmap buckets (union of both harts)", virgin.covered_buckets());
+    println!("  corpus         : {} programs", corpus.len());
+    println!("  kernel crashes : {crashes}  ({} unique kernel PCs)", crash_sigs.len());
+    match determinism_ok {
+        Some(true) => println!("  determinism    : case-0 replay byte-identical (PASS)"),
+        Some(false) => println!("  determinism    : case-0 replay MISMATCH (FAIL)"),
+        None => {}
+    }
+    ExitCode::SUCCESS
+}
+
 fn usage() {
     eprintln!("fuzzsoft — vectorized RISC-V syscall fuzzer (M0)");
     eprintln!();
@@ -2909,6 +3199,9 @@ fn usage() {
     eprintln!("  fuzzsoft boot --firmware FW --dtb DTB [--kernel IMG] [--ram-mb N] [--max-insns N]");
     eprintln!(
         "  fuzzsoft smp-boot --firmware FW --dtb DTB --kernel IMG [--quantum N] [--deadline-ticks N] [--replay]"
+    );
+    eprintln!(
+        "  fuzzsoft smp-fuzz [--firmware FW] [--dtb DTB] [--kernel IMG] [--cases N] [--seed N] [--case-ticks N]"
     );
 }
 
