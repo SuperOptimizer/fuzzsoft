@@ -83,7 +83,7 @@ fn smp_cas_increment_matches_sequential_reference() {
     // Interleaved: both harts run concurrently over one shared `Machine` via the round-robin
     // scheduler, quantum small enough to guarantee heavy interleaving.
     let (mut cpus, mut m) = setup(iters0, iters1, EID);
-    let stops = fs_platform::run_smp(&mut cpus, &mut m, 7, 2_000_000);
+    let stops = fs_platform::run_smp(&mut cpus, &mut m, 7, 2_000_000, false);
     assert!(matches!(stops[0], Stop::Hypercall(_)), "hart0 did not finish: {:?}", stops[0]);
     assert!(matches!(stops[1], Stop::Hypercall(_)), "hart1 did not finish: {:?}", stops[1]);
     let interleaved_final = m.load(COUNTER, 4).unwrap();
@@ -137,10 +137,10 @@ fn smp_replay_is_byte_identical() {
     let iters1 = 211i32;
 
     let (mut cpus_a, mut m_a) = setup(iters0, iters1, EID);
-    let stops_a = fs_platform::run_smp(&mut cpus_a, &mut m_a, 7, 2_000_000);
+    let stops_a = fs_platform::run_smp(&mut cpus_a, &mut m_a, 7, 2_000_000, false);
 
     let (mut cpus_b, mut m_b) = setup(iters0, iters1, EID);
-    let stops_b = fs_platform::run_smp(&mut cpus_b, &mut m_b, 7, 2_000_000);
+    let stops_b = fs_platform::run_smp(&mut cpus_b, &mut m_b, 7, 2_000_000, false);
 
     assert_eq!(stops_a, stops_b, "replay produced different stop reasons");
     assert_eq!(
@@ -210,7 +210,7 @@ fn cross_hart_store_invalidates_reservation_sc_fails() {
 
     // quantum = 1: strict one-instruction-at-a-time alternation (hart0, hart1, hart0, hart1, ...)
     // — the exact, deterministic interleaving worked out above, not a statistical hope.
-    let stops = fs_platform::run_smp(&mut cpus, &mut m, 1, 1_000);
+    let stops = fs_platform::run_smp(&mut cpus, &mut m, 1, 1_000, false);
 
     assert_eq!(stops[0], Stop::Hypercall(1), "hart0's sc.w should have FAILED (a0=1)");
     assert_eq!(stops[1], Stop::Hypercall(999), "hart1 should have completed with marker 999");

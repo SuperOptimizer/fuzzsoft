@@ -25,6 +25,7 @@ fn main() -> ExitCode {
         Some("run") => cmd_run(&args[2..]),
         Some("gen-elf") => cmd_gen_elf(&args[2..]),
         Some("boot") => cmd_boot(&args[2..]),
+        Some("smp-boot") => cmd_smp_boot(&args[2..]),
         Some("fuzz") => cmd_fuzz(&args[2..]),
         _ => {
             usage();
@@ -2688,12 +2689,227 @@ fn cmd_boot(args: &[String]) -> ExitCode {
     }
 }
 
+/// SMP mechanical core (`docs/smp-design.md` §2 Phase 1, T5.1b): boot 2 real harts through
+/// OpenSBI HSM + Linux `secondary_start_kernel` bring-up to the agent's `HC_SNAPSHOT` hypercall,
+/// driven by [`fs_platform::run_smp`]'s fixed-quantum round-robin scheduler over ONE shared
+/// [`Machine`] (never real OS threads across harts — the permanent constraint, §4 risk 7). This is
+/// wholly additive: the single-hart `cmd_fuzz`/`cmd_boot` paths above are byte-for-byte untouched,
+/// so the default fuzzer is not on this code path at all.
+///
+/// Prints UART console output so secondary-hart bring-up ("smp: Bringing up secondary CPUs ...",
+/// "CPU1: ... online") is directly observable — the Phase 1 "win" condition. `--replay` additionally
+/// re-runs the *entire* boot from scratch a second time (fresh `Vec<Cpu>`/`Machine`, same firmware/
+/// dtb/kernel/quantum/deadline) and diffs final per-hart register/CSR state plus RAM/CLINT/UART
+/// content byte-for-byte — the Phase 1 determinism gate (§2): two runs from the same starting state
+/// must produce byte-identical final state, exactly generalizing decision #7's single-hart
+/// reproducibility guarantee to N harts.
+fn cmd_smp_boot(args: &[String]) -> ExitCode {
+    use fs_platform::Stop;
+
+    let mut firmware = "firmware/fw_jump.bin";
+    let mut dtb = "firmware/fuzzsoft-smp.dtb";
+    let mut kernel = "firmware/Image";
+    let mut kernel_addr = 0x8040_0000u32;
+    let mut ram_mb = 128u32;
+    // Arbitrary for Phase 1 (`docs/smp-design.md` §2): a fixed quantum/deadline, not yet a seeded
+    // scheduler (that's Phase 3). With `stop_on_hypercall`, the run halts the instant the agent
+    // hits HC_SNAPSHOT (~1.6B insns/hart, ~3.2B combined ticks); the deadline is only a runaway
+    // guard, sized as a generous multiple of that so a genuine hang still terminates bounded.
+    let mut quantum = 10_000u64;
+    let mut deadline_ticks = 5_000_000_000u64;
+    let mut replay = false;
+    let ram_base = 0x8000_0000u32;
+
+    let mut i = 0;
+    while i < args.len() {
+        let key = args[i].as_str();
+        let val = |i: usize| args.get(i + 1).cloned().unwrap_or_default();
+        match key {
+            "--firmware" => firmware = Box::leak(val(i).into_boxed_str()),
+            "--dtb" => dtb = Box::leak(val(i).into_boxed_str()),
+            "--kernel" => kernel = Box::leak(val(i).into_boxed_str()),
+            "--kernel-addr" => {
+                kernel_addr = u32::from_str_radix(val(i).trim_start_matches("0x"), 16).unwrap_or(kernel_addr)
+            }
+            "--ram-mb" => ram_mb = val(i).parse().unwrap_or(128),
+            "--quantum" => quantum = val(i).parse().unwrap_or(quantum),
+            "--deadline-ticks" => deadline_ticks = val(i).parse().unwrap_or(deadline_ticks),
+            "--replay" => {
+                replay = true;
+                i += 1;
+                continue;
+            }
+            other => {
+                eprintln!("smp-boot: unexpected argument {other:?}");
+                return ExitCode::FAILURE;
+            }
+        }
+        i += 2;
+    }
+
+    let ram_size = ram_mb * 0x0010_0000;
+
+    let (cpus, machine, stops) = match smp_boot_run(firmware, dtb, kernel, ram_base, ram_size, kernel_addr, quantum, deadline_ticks) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("smp-boot: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    print!("{}", String::from_utf8_lossy(&machine.uart.out));
+    println!();
+    for (h, stop) in stops.iter().enumerate() {
+        let cpu = &cpus[h];
+        match stop {
+            Stop::Hypercall(HC_SNAPSHOT) => {
+                eprintln!(
+                    "[hart {h}: HC_SNAPSHOT hypercall reached, {} insns retired, pc={:#010x}]",
+                    cpu.insns_retired, cpu.pc
+                );
+            }
+            Stop::Hypercall(other) => {
+                eprintln!("[hart {h}: unexpected hypercall {other}, {} insns retired]", cpu.insns_retired);
+            }
+            Stop::Halt(c) => {
+                eprintln!("[hart {h}: halted (code {c}), {} insns retired]", cpu.insns_retired);
+            }
+            Stop::Budget => {
+                eprintln!(
+                    "[hart {h}: budget reached, {} insns retired, pc={:#010x}, priv={:?}]",
+                    cpu.insns_retired, cpu.pc, cpu.privilege
+                );
+                eprintln!(
+                    "  a0={:#x} a1={:#x} a2={:#x} mcause={:#x} mepc={:#010x} mtval={:#010x} mtvec={:#010x}",
+                    cpu.regs[10], cpu.regs[11], cpu.regs[12], cpu.csr.mcause, cpu.csr.mepc, cpu.csr.mtval, cpu.csr.mtvec
+                );
+            }
+        }
+    }
+
+    // The win is ANY hart reaching HC_SNAPSHOT: the guest agent is `/init`, a userspace process
+    // Linux's scheduler places on whichever CPU it likes (empirically CPU 1 here) — not a hart
+    // fs-cli chooses. With `stop_on_hypercall = true`, that first HC_SNAPSHOT freezes the whole
+    // machine, so exactly one hart shows `Hypercall(HC_SNAPSHOT)` and the peer shows `Budget`
+    // (frozen wherever its last turn left it — typically the kernel idle loop).
+    let snapshot_hart = stops.iter().position(|s| matches!(s, Stop::Hypercall(HC_SNAPSHOT)));
+    let Some(sh) = snapshot_hart else {
+        eprintln!("smp-boot: no hart reached HC_SNAPSHOT within the tick budget");
+        return ExitCode::FAILURE;
+    };
+    eprintln!("smp-boot: reached HC_SNAPSHOT on hart {sh} (secondary CPU brought online during boot)");
+
+    if replay {
+        eprintln!("smp-boot: --replay — re-running the full boot from scratch to check determinism...");
+        let (cpus2, machine2, stops2) =
+            match smp_boot_run(firmware, dtb, kernel, ram_base, ram_size, kernel_addr, quantum, deadline_ticks) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("smp-boot: replay run: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+        let fp1 = smp_state_fingerprint(&cpus, &machine);
+        let fp2 = smp_state_fingerprint(&cpus2, &machine2);
+        if stops == stops2 && fp1 == fp2 {
+            eprintln!("smp-boot: REPLAY MATCH — byte-identical final hart/RAM/CLINT/UART state across two independent runs");
+        } else {
+            eprintln!("smp-boot: REPLAY MISMATCH — determinism gate FAILED");
+            eprintln!("  run1: stops={stops:?}\n{fp1}");
+            eprintln!("  run2: stops={stops2:?}\n{fp2}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    ExitCode::SUCCESS
+}
+
+/// Build a fresh 2-hart `Vec<Cpu>` + `Machine` from firmware/dtb/kernel files and drive them
+/// through [`fs_platform::run_smp`] once. Factored out of [`cmd_smp_boot`] so `--replay` can call
+/// it twice from an identical starting state (a fresh load each time, not a clone) — the direct
+/// generalization of the single-hart reproducibility guarantee (decision #7) to N harts.
+#[allow(clippy::too_many_arguments)]
+fn smp_boot_run(
+    firmware: &str,
+    dtb: &str,
+    kernel: &str,
+    ram_base: u32,
+    ram_size: u32,
+    kernel_addr: u32,
+    quantum: u64,
+    deadline_ticks: u64,
+) -> Result<(Vec<Cpu>, fs_platform::Machine, fs_platform::SmpStop), String> {
+    use fs_mmu::{PERM_EXEC, PERM_READ, PERM_WRITE};
+    use fs_platform::{Machine, run_smp};
+
+    let mut m = Machine::new_smp(ram_base, ram_size, 2);
+    m.ram.protect(ram_base, ram_size, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+    for (path, addr) in [(firmware, ram_base), (kernel, kernel_addr)] {
+        let b = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+        m.ram.map(addr, &b, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+    }
+    let dtb_bytes = std::fs::read(dtb).map_err(|e| format!("cannot read {dtb}: {e}"))?;
+    let dtb_addr = ram_base + ram_size - 0x0020_0000;
+    m.ram.map(dtb_addr, &dtb_bytes, PERM_READ | PERM_WRITE).unwrap();
+
+    // Both harts start at the same firmware entry with a0=hartid, a1=dtb pointer — the standard
+    // RISC-V boot protocol (all harts reset into the same firmware image; OpenSBI's own coldboot
+    // lottery, not fs-cli, decides which one proceeds and which parks). Our deterministic
+    // round-robin always schedules hart 0 first each round, so hart 0 always wins the lottery —
+    // deterministic by construction, not a race against host timing.
+    let mut cpus = Vec::with_capacity(2);
+    for hart in 0..2u32 {
+        let mut cpu = Cpu::new_hart(ram_base, hart);
+        cpu.hypercall_eid = Some(HC_EID);
+        cpu.regs[10] = hart;
+        cpu.regs[11] = dtb_addr;
+        cpus.push(cpu);
+    }
+
+    // stop_on_hypercall = true: the guest agent's HC_SNAPSHOT (from whichever CPU Linux scheduled
+    // it on) freezes the WHOLE machine — the snapshot point — instead of parking only that hart
+    // and letting the peer spin into an RCU stall (the T5.1b first-boot failure mode).
+    let stops = run_smp(&mut cpus, &mut m, quantum, deadline_ticks, true);
+    Ok((cpus, m, stops))
+}
+
+/// A short, deterministic fingerprint of final SMP boot state for `--replay`'s determinism check:
+/// per-hart pc/insns_retired/regs/CSRs (small enough to embed verbatim) plus a hash of RAM
+/// contents+permissions and UART output (128 MiB is too large to embed verbatim, and a hash
+/// collision here would need to be an actual non-determinism to matter for this purpose).
+fn smp_state_fingerprint(cpus: &[Cpu], m: &fs_platform::Machine) -> String {
+    use std::fmt::Write;
+    use std::hash::{Hash, Hasher};
+    fn hash_bytes(b: &[u8]) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        b.hash(&mut h);
+        h.finish()
+    }
+    let mut s = String::new();
+    for (i, c) in cpus.iter().enumerate() {
+        let _ = writeln!(
+            s,
+            "hart{i}: pc={:#010x} insns={} priv={:?} regs={:?} csr={:?}",
+            c.pc, c.insns_retired, c.privilege, c.regs, c.csr
+        );
+    }
+    let (mem, perms) = m.ram.planes();
+    let _ = writeln!(s, "ram_mem_hash={:#x} ram_perms_hash={:#x}", hash_bytes(mem), hash_bytes(perms));
+    let _ = writeln!(s, "clint={:?}", m.clint);
+    let _ = writeln!(s, "uart_len={} uart_hash={:#x}", m.uart.out.len(), hash_bytes(&m.uart.out));
+    s
+}
+
 fn usage() {
     eprintln!("fuzzsoft — vectorized RISC-V syscall fuzzer (M0)");
     eprintln!();
     eprintln!("USAGE:");
     eprintln!("  fuzzsoft run <elf> [--max-insns N] [--cov-out FILE]");
     eprintln!("  fuzzsoft gen-elf <out.elf>");
+    eprintln!("  fuzzsoft boot --firmware FW --dtb DTB [--kernel IMG] [--ram-mb N] [--max-insns N]");
+    eprintln!(
+        "  fuzzsoft smp-boot --firmware FW --dtb DTB --kernel IMG [--quantum N] [--deadline-ticks N] [--replay]"
+    );
 }
 
 fn cmd_run(args: &[String]) -> ExitCode {

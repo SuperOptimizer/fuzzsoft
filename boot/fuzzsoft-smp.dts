@@ -1,0 +1,100 @@
+/dts-v1/;
+
+/*
+ * 2-hart SMP device tree (SMP epic, docs/smp-design.md §2 Phase 1 / roadmap T5.1b).
+ *
+ * A deliberate SEPARATE source from the single-hart boot/fuzzsoft.dts (which stays the source of
+ * truth for the committed single-hart firmware/fuzzsoft.dtb the default fuzzer boots) so this SMP
+ * variant cannot regress the default path. The only differences from boot/fuzzsoft.dts are the
+ * three the design doc calls for (item 7):
+ *   1. a second cpu@1 node (+ its cpu1_intc interrupt-controller),
+ *   2. the clint@2000000 interrupts-extended array extended to cover hart 1's M-mode
+ *      software(3)/timer(7) lines, and
+ *   3. `nosmp` dropped from bootargs.
+ *
+ * OpenSBI's generic platform derives hart_count purely by walking cpu@N nodes in this FDT at
+ * coldboot (third_party/opensbi platform/generic/platform.c) and handles secondary-hart bring-up
+ * via its HSM extension when the kernel calls sbi_hsm_hart_start — so this DTB addition + the
+ * fs-cli run_smp driver is the whole of hart bring-up; no OpenSBI or kernel rebuild is needed
+ * (firmware/Image is already CONFIG_SMP=y / CONFIG_NR_CPUS=256).
+ *
+ * Build:  dtc -I dts -O dtb -o firmware/fuzzsoft-smp.dtb boot/fuzzsoft-smp.dts
+ */
+
+/ {
+	#address-cells = <2>;
+	#size-cells = <2>;
+	compatible = "fuzzsoft,rv32-virt";
+	model = "fuzzsoft rv32 virt";
+
+	chosen {
+		bootargs = "earlycon=sbi console=ttyS0 keep_bootcon";
+		stdout-path = "/soc/serial@10000000";
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		timebase-frequency = <10000000>;
+
+		cpu@0 {
+			device_type = "cpu";
+			reg = <0>;
+			status = "okay";
+			compatible = "riscv";
+			riscv,isa = "rv32ima";
+			mmu-type = "riscv,sv32";
+
+			cpu0_intc: interrupt-controller {
+				#interrupt-cells = <1>;
+				interrupt-controller;
+				compatible = "riscv,cpu-intc";
+			};
+		};
+
+		cpu@1 {
+			device_type = "cpu";
+			reg = <1>;
+			status = "okay";
+			compatible = "riscv";
+			riscv,isa = "rv32ima";
+			mmu-type = "riscv,sv32";
+
+			cpu1_intc: interrupt-controller {
+				#interrupt-cells = <1>;
+				interrupt-controller;
+				compatible = "riscv,cpu-intc";
+			};
+		};
+	};
+
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0x0 0x80000000 0x0 0x08000000>; /* 128 MiB */
+	};
+
+	soc {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		compatible = "simple-bus";
+		ranges;
+
+		serial@10000000 {
+			compatible = "ns16550a";
+			reg = <0x0 0x10000000 0x0 0x100>;
+			clock-frequency = <10000000>;
+			reg-shift = <0>;
+			reg-io-width = <1>;
+		};
+
+		clint@2000000 {
+			compatible = "sifive,clint0", "riscv,clint0";
+			reg = <0x0 0x2000000 0x0 0x10000>;
+			/* One (M-mode software=3, M-mode timer=7) interrupt pair per hart, same stride
+			 * fs-platform's Clint::msip_extra/mtimecmp_extra model
+			 * (crates/fs-platform/src/lib.rs). */
+			interrupts-extended = <&cpu0_intc 3 &cpu0_intc 7
+			                        &cpu1_intc 3 &cpu1_intc 7>;
+		};
+	};
+};

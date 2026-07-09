@@ -597,7 +597,26 @@ pub type SmpStop = Vec<Stop>;
 /// after each individual store) is equivalent to doing it immediately: no other hart executes
 /// anything in between two stores within the same hart's turn, so the observable result is
 /// identical either way.
-pub fn run_smp(cpus: &mut [Cpu], machine: &mut Machine, quantum: u64, deadline_ticks: u64) -> SmpStop {
+///
+/// `stop_on_hypercall` (`docs/smp-design.md` §2 Phase 1, T5.1b): if `true`, the FIRST hart to
+/// return a [`Stop::Hypercall`] halts the WHOLE scheduler (all other harts freeze wherever their
+/// last completed turn left them), rather than only that hart parking while the rest run on. This
+/// is the semantics a fuzzing/snapshot hypercall needs: the guest agent calls `HC_SNAPSHOT` from
+/// whichever CPU Linux happened to schedule it on, and that single call means "freeze the entire
+/// machine now" — not "this one hart is done, keep running the others" (which would leave the
+/// peer hart spinning in the kernel idle loop until it trips an RCU stall / the tick deadline,
+/// the exact failure T5.1b's first boot hit). `false` preserves the original T5.1a behavior
+/// (every hart runs independently until it halts/hypercalls or the deadline), which the bare-metal
+/// LR/SC/AMO cross-check tests rely on (both harts must reach their own hypercall). Determinism is
+/// unaffected either way: which hart hypercalls first, and where every other hart is frozen at that
+/// moment, are pure functions of the starting state and `quantum`/`deadline_ticks`.
+pub fn run_smp(
+    cpus: &mut [Cpu],
+    machine: &mut Machine,
+    quantum: u64,
+    deadline_ticks: u64,
+    stop_on_hypercall: bool,
+) -> SmpStop {
     let n = cpus.len();
     let mut stops: Vec<Option<Stop>> = vec![None; n];
     let mut tick: u64 = 0;
@@ -610,6 +629,7 @@ pub fn run_smp(cpus: &mut [Cpu], machine: &mut Machine, quantum: u64, deadline_t
                 continue;
             }
             let turn_deadline = cpus[h].insns_retired + quantum;
+            let mut hypercalled = false;
             // Reborrow (not move) `machine`: `&mut *machine` yields a fresh, shorter-lived
             // mutable borrow that expires at the end of this loop iteration, so the next hart's
             // turn can reborrow `machine` again.
@@ -624,6 +644,7 @@ pub fn run_smp(cpus: &mut [Cpu], machine: &mut Machine, quantum: u64, deadline_t
                     }
                     SysExit::Hypercall(c) => {
                         stops[h] = Some(Stop::Hypercall(c));
+                        hypercalled = true;
                     }
                 }
                 tick += 1;
@@ -640,7 +661,10 @@ pub fn run_smp(cpus: &mut [Cpu], machine: &mut Machine, quantum: u64, deadline_t
                     }
                 }
             }
-            if stops.iter().all(|s| s.is_some()) || tick >= deadline_ticks {
+            if (stop_on_hypercall && hypercalled)
+                || stops.iter().all(|s| s.is_some())
+                || tick >= deadline_ticks
+            {
                 break 'outer;
             }
         }
