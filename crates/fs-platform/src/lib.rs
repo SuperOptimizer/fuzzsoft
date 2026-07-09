@@ -179,6 +179,22 @@ impl Bus for Machine {
         }
         self.ram.fast_ptr(addr, len, need)
     }
+    // KMSAN (`docs/kmsan.md`): forward the taint-shadow gather/scatter to `self.ram` for RAM
+    // addresses, same MMIO-declines-explicitly shape as `fast_ptr` just above (CLINT/UART have no
+    // taint shadow — the trait's default `0`/no-op is correct for them). Without this override,
+    // `Bus`'s default impls silently make every `--kmsan` load-taint gather report clean
+    // regardless of `Mmu`'s actual `PERM_RAW`/`PERM_VTAINT` state — `Cpu::step_system`'s only real
+    // entry point is `&mut dyn Bus` = `&mut Machine`, never a bare `&mut Mmu`, so this forwarding
+    // is load-bearing, not cosmetic (a real gap this Stage 2 pass found and fixed, distinct from
+    // the allocator-seeding gap `docs/kmsan.md`'s T3.1 section documents).
+    fn read_raw_state(&self, addr: u32, len: u8) -> u32 {
+        if self.in_ram(addr) { self.ram.read_raw_state(addr, len) } else { 0 }
+    }
+    fn write_shadow(&mut self, addr: u32, len: u8, taint_mask: u32) {
+        if self.in_ram(addr) {
+            self.ram.write_shadow(addr, len, taint_mask);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -270,6 +286,19 @@ impl Bus for CowMachine {
             return None;
         }
         self.ram.fast_ptr(addr, len, need)
+    }
+    // KMSAN: same forwarding fix as `Machine`'s impl above, for the `CowRam`-backed path (`--jobs
+    // > 1` / `--jit-chain`'s parallel workers) — `--kmsan` itself is serial-only for now (see
+    // `docs/kmsan.md`/`docs/roadmap.md` T3.1), but this keeps `CowMachine` from being a silent
+    // taint sink if/when that changes, matching `docs/kmsan.md`'s "replicate across Mmu/Golden/
+    // CowRam" Stage 2 instruction.
+    fn read_raw_state(&self, addr: u32, len: u8) -> u32 {
+        if in_ram(addr, self.ram_base, self.ram_end) { self.ram.read_raw_state(addr, len) } else { 0 }
+    }
+    fn write_shadow(&mut self, addr: u32, len: u8, taint_mask: u32) {
+        if in_ram(addr, self.ram_base, self.ram_end) {
+            self.ram.write_shadow(addr, len, taint_mask);
+        }
     }
 }
 

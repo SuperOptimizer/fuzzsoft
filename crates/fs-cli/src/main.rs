@@ -120,6 +120,73 @@ impl SanCtx {
     }
 }
 
+/// KMSAN Stage 2 (`docs/kmsan.md`) independent taint-SOURCE context: watches the SAME kernel
+/// allocator PC-hooks `SanCtx` uses (kmalloc/kmem_cache_alloc return sites), but instead of feeding
+/// `Sanitizer`'s poison/quarantine bookkeeping, stamps a freshly-returned, not-yet-written payload
+/// `fs_mmu::PERM_VTAINT` — mirroring how real KMSAN treats fresh, uninitialized kmalloc memory as
+/// poisoned. This is `--kmsan`'s OWN seeding path, decoupled entirely from `--sanitize`'s
+/// `PERM_RAW`/allocator hooks (T3.1's finding: a live `--kmsan` run had zero taint sources without
+/// this). Skips tainting a `__GFP_ZERO` allocation (`kzalloc`/`kmalloc(..., __GFP_ZERO)`): that
+/// payload is genuinely initialized before return, so tainting it would be a pure false positive.
+///
+/// Deliberately much thinner than `SanCtx`: no `Sanitizer`/`PageSanitizer`, no double-alloc/free or
+/// quarantine bookkeeping, no redzones — KMSAN only cares about "is this byte's *value* still
+/// unknown," never "is this address still live." Mutually exclusive with `--sanitize` (checked at
+/// startup, same as T3.1's `--kmsan`/`--sanitize` gate).
+///
+/// Known, documented residual FP source (flagged rather than silently risked): a `kmem_cache_alloc`
+/// whose cache has a constructor (`ctor`) is *also* effectively pre-initialized on every fresh
+/// (never-before-used) handout — real KMSAN special-cases ctor-having caches; this first cut does
+/// not (reading `cachep->ctor` would need another kernel-version-specific struct-offset guess, the
+/// same class of risk `fs_san::linux::KMEM_CACHE_OBJECT_SIZE_OFFSET`'s doc comment already flags).
+/// If the false-positive measurement below shows this dominates, that is exactly the signal to add
+/// it next.
+///
+/// `golden_perms`/`dirtied`/`restore_dirtied_perms`: identical workaround to `SanCtx`'s (see that
+/// struct's doc comment) — `Mmu::set_vtaint` is a permission-only mutation `Mmu`'s dirty-block
+/// reset never tracks, so it would otherwise leak permanently across cases.
+struct KmsanCtx {
+    hooks: fs_san::PcHooks,
+    lm: fs_san::LinearMap,
+    golden_perms: Vec<u8>,
+    ram_base: u32,
+    dirtied: Vec<(u32, u32)>,
+    /// Allocations seeded VTAINT (kmalloc-family + kmem_cache_alloc-family combined).
+    tainted_allocs: u64,
+    tainted_bytes: u64,
+    /// Allocations observed but skipped because `__GFP_ZERO` was set.
+    zeroed_skipped: u64,
+    /// `kmem_cache_alloc` hits whose `cachep->object_size` guest-memory read failed the sanity
+    /// self-check (mirrors `SanCtx::cache_alloc_size_unavailable`).
+    cache_size_unavailable: u64,
+}
+
+impl KmsanCtx {
+    /// Record that `--kmsan`'s seeding touched `[addr, addr+len)` this case (mirrors
+    /// `SanCtx::mark_dirtied` — see `KmsanCtx`'s doc comment for why this bookkeeping exists).
+    fn mark_dirtied(&mut self, addr: u32, len: u32) {
+        if len > 0 {
+            self.dirtied.push((addr, len));
+        }
+    }
+
+    /// Restore every range recorded in `dirtied` back to its golden permission byte, then clear
+    /// the list — mirrors `SanCtx::restore_dirtied_perms` exactly (see that method's doc comment).
+    fn restore_dirtied_perms(&mut self, mmu: &mut fs_mmu::Mmu) {
+        for (addr, len) in self.dirtied.drain(..) {
+            for off in 0..len {
+                let a = addr.wrapping_add(off);
+                let Some(idx) = a.checked_sub(self.ram_base).map(|d| d as usize) else {
+                    continue;
+                };
+                if let Some(&p) = self.golden_perms.get(idx) {
+                    let _ = mmu.protect(a, 1, p);
+                }
+            }
+        }
+    }
+}
+
 /// Run one fuzz case, recording non-fall-through control-flow edges into an AFL-style bitmap.
 /// When `san` is set, drives the kernel-allocator PC-hooks each retired instruction.
 fn run_case(
@@ -128,6 +195,7 @@ fn run_case(
     cov: &mut fs_cov::CovBitmap,
     deadline: u64,
     mut san: Option<&mut SanCtx>,
+    mut kmsan: Option<&mut KmsanCtx>,
 ) -> fs_platform::Stop {
     use fs_platform::Stop;
     use fs_riscv::SysExit;
@@ -286,6 +354,57 @@ fn run_case(
                             }
                             if ctx.page_san.free_pages(&mut m.ram, pa, order).is_err() {
                                 ctx.san_errors += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // --- KMSAN Stage 2 (`docs/kmsan.md`) taint-seeding block (T3.2; --kmsan only, mutually
+        // exclusive with the --sanitize block above — see `KmsanCtx`'s doc comment). Independent
+        // of `SanCtx`: reuses the SAME kernel allocator PC-hooks (`kmalloc`/`kmem_cache_alloc`
+        // return sites), but seeds `fs_mmu::PERM_VTAINT` instead of feeding `Sanitizer`. ---
+        if let Some(ctx) = kmsan.as_deref_mut() {
+            let pc = cpu.pc;
+            if let Some(ev) = ctx.hooks.on_kmsan_alloc_pc(pc, &cpu.regs) {
+                match ev {
+                    fs_san::KmsanAllocEvent::Sized { addr, size, gfp_flags } => {
+                        if let Some(pa) = ctx.lm.va_to_pa(addr) {
+                            if gfp_flags & fs_san::GFP_ZERO != 0 {
+                                // Genuinely initialized (zeroed) before return -- tainting it would
+                                // be a pure v0-KMSAN false positive, not a real uninit-value bug.
+                                ctx.zeroed_skipped += 1;
+                            } else {
+                                ctx.mark_dirtied(pa, size);
+                                if m.ram.set_vtaint(pa, size, true).is_ok() {
+                                    ctx.tainted_allocs += 1;
+                                    ctx.tainted_bytes += size as u64;
+                                }
+                            }
+                        }
+                    }
+                    fs_san::KmsanAllocEvent::Cache { addr, cache_ptr, gfp_flags } => {
+                        if let Some(pa) = ctx.lm.va_to_pa(addr)
+                            && let Some(cache_pa) = ctx.lm.va_to_pa(cache_ptr)
+                        {
+                            match m.ram.read_u32(
+                                cache_pa.wrapping_add(fs_san::linux::KMEM_CACHE_OBJECT_SIZE_OFFSET),
+                            ) {
+                                Ok(object_size)
+                                    if object_size > 0
+                                        && object_size < fs_san::linux::KMEM_CACHE_OBJECT_SIZE_MAX =>
+                                {
+                                    if gfp_flags & fs_san::GFP_ZERO != 0 {
+                                        ctx.zeroed_skipped += 1;
+                                    } else {
+                                        ctx.mark_dirtied(pa, object_size);
+                                        if m.ram.set_vtaint(pa, object_size, true).is_ok() {
+                                            ctx.tainted_allocs += 1;
+                                            ctx.tainted_bytes += object_size as u64;
+                                        }
+                                    }
+                                }
+                                _ => ctx.cache_size_unavailable += 1,
                             }
                         }
                     }
@@ -1476,10 +1595,13 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     let mut jit_cache = jit.then(fs_jit::BlockCache::new);
     let mut jit_chain_cache = jit_chain.then(fs_jit::ChainCache::new);
     // Golden (post-boot) permission-plane copy, captured at the identical instant as `snap`'s own
-    // internal golden planes — feeds `SanCtx::restore_dirtied_perms`'s workaround for
-    // `Mmu::protect`/`poison` not being tracked by `Mmu`'s dirty-block reset (see `SanCtx`'s doc
-    // comment). Only allocated under --sanitize (an extra `ram_size`-byte copy otherwise unused).
-    let golden_perms: Vec<u8> = if sanitize { m.ram.planes().1.to_vec() } else { Vec::new() };
+    // internal golden planes — feeds `SanCtx`/`KmsanCtx`'s `restore_dirtied_perms` workaround for
+    // `Mmu::protect`/`set_vtaint` not being tracked by `Mmu`'s dirty-block reset (see those structs'
+    // doc comments). Only allocated under --sanitize/--kmsan (an extra `ram_size`-byte copy
+    // otherwise unused); `.clone()`d into whichever one of the two mutually-exclusive contexts
+    // below actually gets built, rather than moved, since the compiler cannot see that only one of
+    // `if sanitize`/`if kmsan` ever executes.
+    let golden_perms: Vec<u8> = if sanitize || kmsan { m.ram.planes().1.to_vec() } else { Vec::new() };
 
     // Optional emulator-native kernel-heap sanitizer (docs/emulator-sanitizers.md): slack-only
     // kmalloc OOB/UAF + page-granularity UAF/OOB, both zero-false-positive by construction, so
@@ -1514,7 +1636,7 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
                         san: fs_san::Sanitizer::new(fs_san::DEFAULT_REDZONE),
                         page_san: fs_san::PageSanitizer::new(),
                         lm,
-                        golden_perms,
+                        golden_perms: golden_perms.clone(),
                         ram_base,
                         dirtied: Vec::new(),
                         allocs: 0,
@@ -1531,6 +1653,53 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
             }
             Err(e) => {
                 eprintln!("fuzz: --sanitize requested but build/linux-src/System.map unreadable: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // KMSAN Stage 2 (`docs/kmsan.md` T3.2) independent taint-seeding context: mirrors `san_ctx`'s
+    // System.map-driven hook setup above (same self-check, same failure mode), but builds a much
+    // thinner `KmsanCtx` (see its doc comment) instead of a `Sanitizer`. Mutually exclusive with
+    // `--sanitize` (`kmsan && sanitize` was already rejected at startup).
+    let mut kmsan_ctx = if kmsan {
+        match std::fs::read_to_string("build/linux-src/System.map") {
+            Ok(text) => {
+                let syms = fs_san::parse_system_map(&text);
+                let mut hooks = fs_san::PcHooks::new();
+                fs_san::register_kernel_allocator_hooks(&mut hooks, &syms);
+                let lm = fs_san::LinearMap::new(kernel_addr, ram_base, ram_size);
+                let self_check = syms
+                    .get("_start")
+                    .map(|&va| lm.va_to_pa(va) == Some(kernel_addr))
+                    .unwrap_or(false);
+                if !self_check {
+                    eprintln!(
+                        "fuzz: kmsan VA->PA self-check FAILED — --kmsan taint-seeding disabled (would risk tainting unrelated memory; the live oracle itself stays armed)"
+                    );
+                    None
+                } else {
+                    eprintln!(
+                        "fuzz: kmsan taint-seeding ON — kmalloc/kmem_cache_alloc payload VTAINT (docs/kmsan.md Stage 2) — {} allocator symbols hooked",
+                        syms.len()
+                    );
+                    Some(KmsanCtx {
+                        hooks,
+                        lm,
+                        golden_perms: golden_perms.clone(),
+                        ram_base,
+                        dirtied: Vec::new(),
+                        tainted_allocs: 0,
+                        tainted_bytes: 0,
+                        zeroed_skipped: 0,
+                        cache_size_unavailable: 0,
+                    })
+                }
+            }
+            Err(e) => {
+                eprintln!("fuzz: --kmsan requested but build/linux-src/System.map unreadable: {e} — taint-seeding disabled (the live oracle itself stays armed, but with no source)");
                 None
             }
         }
@@ -1663,7 +1832,7 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
                 let mut trace_map = CovBitmap::new(); // scratch bitmap — this run's coverage is
                 // not fed back; only the cmp-operand log matters here.
                 let trace_deadline = cpu.insns_retired + case_insns;
-                let _ = run_case(&mut cpu, &mut m, &mut trace_map, trace_deadline, None);
+                let _ = run_case(&mut cpu, &mut m, &mut trace_map, trace_deadline, None, None);
                 let pairs = cpu.cmplog_take();
                 cpu.set_cmplog(false);
                 match fs_prog::mutate_cmplog(&mut rng, base, &pairs) {
@@ -1702,6 +1871,13 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
             ctx.page_san = fs_san::PageSanitizer::new();
             ctx.hooks.clear_pending();
         }
+        // Same reasoning as `san_ctx`'s reset just above, for `--kmsan`'s own VTAINT seeding
+        // (`Mmu::set_vtaint` is a permission-only mutation `snap.reset`'s dirty-block restore
+        // never reverts — see `KmsanCtx`'s doc comment).
+        if let Some(ctx) = kmsan_ctx.as_mut() {
+            ctx.restore_dirtied_perms(&mut m.ram);
+            ctx.hooks.clear_pending();
+        }
         let case_start = cpu.insns_retired;
         let case_start_fast_hits = cpu.fast_path_hits;
         let case_start_fast_bails = cpu.fast_path_bails;
@@ -1715,7 +1891,7 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
         } else if let Some(cache) = jit_cache.as_mut() {
             run_case_jit(&mut cpu, &mut m, cache, &mut run_map, deadline)
         } else {
-            run_case(&mut cpu, &mut m, &mut run_map, deadline, san_ctx.as_mut())
+            run_case(&mut cpu, &mut m, &mut run_map, deadline, san_ctx.as_mut(), kmsan_ctx.as_mut())
         };
         total_fast_path_hits += cpu.fast_path_hits - case_start_fast_hits;
         total_fast_path_bails += cpu.fast_path_bails - case_start_fast_bails;
@@ -1769,8 +1945,15 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
                     "fuzz: [KMSAN] branch on uninitialized value pc={:#010x} x{}={:#010x} x{}={:#010x} case {case} calls={names:?}",
                     report.pc, report.rs1, report.taint_a, report.rs2, report.taint_b
                 );
-                // (No `SanCtx` dirtied-perm restore needed here, unlike the kernel-crash oracle
-                // above: `--kmsan` and `--sanitize` are mutually exclusive, checked at startup.)
+                // T3.2: unlike T3.1 (when this comment was first written), `--kmsan` now HAS its
+                // own permission-only mutation to leak (`KmsanCtx`'s VTAINT seeding) — mirror the
+                // kernel-crash oracle's `san_ctx.restore_dirtied_perms` call just above, for the
+                // exact same reason (minimization replays via `run_case_bus`, which drives no
+                // allocator hooks at all, so any of THIS case's not-yet-restored VTAINT stamps
+                // would otherwise leak into every minimization re-run below).
+                if let Some(ctx) = kmsan_ctx.as_mut() {
+                    ctx.restore_dirtied_perms(&mut m.ram);
+                }
                 handle_new_kmsan_hit(
                     &mut cpu, &mut m, |cpu, m| snap.reset(cpu, m), &prog, report, scratch,
                     &prog_pas, &scratch_pas, case_insns,
@@ -1840,9 +2023,15 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     }
     if kmsan {
         println!(
-            "  kmsan         : {kmsan_hits} branch-on-uninitialized-value hit(s) ({} unique pc)  [Stage 1.5 live oracle, docs/kmsan.md T3.1]",
+            "  kmsan         : {kmsan_hits} branch-on-uninitialized-value hit(s) ({} unique pc)  [live oracle, docs/kmsan.md]",
             kmsan_pcs.len()
         );
+        if let Some(ctx) = &kmsan_ctx {
+            println!(
+                "  kmsan seeding : {} kmalloc/kmem_cache_alloc alloc(s) tainted ({} bytes)  |  {} __GFP_ZERO alloc(s) skipped  |  {} kmem_cache_alloc size-unavailable  [Stage 2, docs/kmsan.md]",
+                ctx.tainted_allocs, ctx.tainted_bytes, ctx.zeroed_skipped, ctx.cache_size_unavailable
+            );
+        }
     }
     if let Some(cache) = &jit_cache {
         let (hits, misses) = (cache.hits(), cache.misses());
@@ -2774,7 +2963,7 @@ mod tests {
             snap_i.reset(&mut cpu_i, &mut m_i);
             let mut cov_i = fs_cov::CovBitmap::new();
             let deadline_i = cpu_i.insns_retired + 1000;
-            let stop_i = run_case(&mut cpu_i, &mut m_i, &mut cov_i, deadline_i, None);
+            let stop_i = run_case(&mut cpu_i, &mut m_i, &mut cov_i, deadline_i, None, None);
 
             snap_j.reset(&mut cpu_j, &mut m_j);
             let mut cov_j = fs_cov::CovBitmap::new();

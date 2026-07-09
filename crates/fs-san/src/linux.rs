@@ -332,6 +332,17 @@ pub const KMEM_CACHE_OBJECT_SIZE_OFFSET: u32 = 16;
 /// fed to the sanitizer.
 pub const KMEM_CACHE_OBJECT_SIZE_MAX: u32 = 0x0010_0000; // 1 MiB
 
+/// The `__GFP_ZERO` bit (`include/linux/gfp_types.h`'s `___GFP_ZERO_BIT`), for KMSAN Stage 2's
+/// (`docs/kmsan.md`) allocator-hook taint seeding: a `kzalloc()`/`kmalloc(..., __GFP_ZERO)`
+/// allocation's payload is genuinely initialized (zeroed) before return, so it must never be
+/// tainted. Pinned against this project's own kernel build (`build/linux-src`) exactly like
+/// [`KMEM_CACHE_OBJECT_SIZE_OFFSET`] is: `gfp_types.h`'s anonymous bit-index enum is, in order,
+/// `DMA, HIGHMEM, DMA32, MOVABLE, RECLAIMABLE, HIGH, IO, FS, ZERO, ...` — `ZERO` is the 9th entry,
+/// 0-indexed bit 8, so `__GFP_ZERO = BIT(8) = 0x100`. Re-derive (re-read the enum, recount) for any
+/// other kernel version — like the `object_size` offset, a wrong value here doesn't crash, it just
+/// silently mis-taints (or fails to taint) an allocation.
+pub const GFP_ZERO: u32 = 0x100;
+
 /// Round a kmalloc request up to its SLUB bucket, so the trailing redzone lands at the object
 /// boundary (the kernel may legitimately access up to `ksize()` = the full bucket size).
 pub fn kmalloc_bucket(size: u32) -> u32 {
@@ -369,6 +380,12 @@ mod tests {
     fn kmem_cache_object_size_offset_matches_documented_derivation() {
         assert_eq!(KMEM_CACHE_OBJECT_SIZE_OFFSET, 16);
         assert_eq!(KMEM_CACHE_OBJECT_SIZE_MAX, 0x0010_0000);
+    }
+
+    /// Pins `GFP_ZERO`'s documented derivation (gfp_types.h bit-index enum position) the same way.
+    #[test]
+    fn gfp_zero_matches_documented_bit_position() {
+        assert_eq!(GFP_ZERO, 0x100);
     }
 
     /// A tiny excerpt in real `System.map` shape: two allocator symbols we care about, plus

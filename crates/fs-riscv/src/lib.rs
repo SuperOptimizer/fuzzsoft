@@ -1274,6 +1274,32 @@ impl Cpu {
         }
     }
 
+    /// KMSAN Stage 2 store-taint scatter (`docs/kmsan.md`): write the SAME span a same-shaped
+    /// [`Cpu::store`] call just touched's byte-taint into each byte's `PERM_VTAINT` via
+    /// [`Bus::write_shadow`] — an EXACT overwrite (not OR), mirroring real KMSAN's
+    /// shadow-copy-on-store semantics: the destination bytes' taint state becomes a copy of the
+    /// stored value's, whether that means newly tainted (storing a tainted register) or newly
+    /// clean (storing a fully-known value must clear any stale taint a byte carried from a prior
+    /// allocation, or a freed-and-reused tainted byte could spuriously stay "uninitialized"
+    /// forever). This is what makes store-then-reload-then-branch propagate (Stage 1's
+    /// documented no-op here is the one thing Stage 2 fixes). `mask`'s bit `8*i` means byte `i` of
+    /// the stored value is tainted; only bits `< size` are meaningful (mirrors
+    /// [`Cpu::load_taint`]'s mask encoding). Called only when [`Cpu::kmsan_enabled`], immediately
+    /// after the real store succeeded — never touches `PERM_READ`/`PERM_WRITE`/`PERM_EXEC`/
+    /// `PERM_RAW`.
+    fn store_taint(&mut self, bus: &mut dyn Bus, va: u32, size: u8, mask: u32) -> Result<(), Trap> {
+        if Self::misaligned(va, size) || Self::crosses_page(va, size) {
+            for i in 0..size as u32 {
+                let pa = self.xlate(bus, va.wrapping_add(i), Access::Write)?;
+                bus.write_shadow(pa, 1, (mask >> (8 * i)) & 1);
+            }
+        } else {
+            let pa = self.xlate(bus, va, Access::Write)?;
+            bus.write_shadow(pa, size, mask);
+        }
+        Ok(())
+    }
+
     /// Extend a loaded span's byte-taint mask (bits set only at `8*i` for `i < size`) to a full
     /// register-width taint, mirroring exactly how [`Cpu::load`] extends the VALUE: sign-extension
     /// replicates the top loaded byte's taint into the newly-filled high bytes (those bits really
@@ -1406,11 +1432,13 @@ impl Cpu {
                     LoadOp::Lw => (4, false),
                 };
                 let v = self.load(bus, addr, size, signed)?;
-                // KMSAN Stage 1 load-taint (`docs/kmsan.md`): shadow the destination register from
-                // the `PERM_RAW` state of the exact bytes just loaded, sign/zero-extended the same
-                // way the value itself was. RAW-only (no memory-taint plane until Stage 2), and
-                // read-only — `load` above already performed (and would have faulted on) the actual
-                // checked read; this just additionally consults `Bus::read_raw_state`.
+                // KMSAN load-taint (`docs/kmsan.md`): shadow the destination register from the
+                // exact bytes just loaded, sign/zero-extended the same way the value itself was.
+                // `Bus::read_raw_state` ORs together Stage 1's `PERM_RAW` (never-written) and
+                // Stage 2's `PERM_VTAINT` (explicitly seeded/propagated) in one gather — this is
+                // what makes it *value* taint rather than just "never written" taint. Read-only —
+                // `load` above already performed (and would have faulted on) the actual checked
+                // read; this just additionally consults the taint shadow.
                 if self.kmsan_enabled() {
                     let raw_mask = self.load_taint(bus, addr, size)?;
                     self.wr_taint(rd, Self::extend_load_taint(raw_mask, size, signed));
@@ -1425,19 +1453,29 @@ impl Cpu {
                     StoreOp::Sh => 2,
                     StoreOp::Sw => 4,
                 };
-                // KMSAN Stage 1 has no memory-taint plane yet (that's Stage 2's `PERM_VTAINT`), so
-                // a store of a tainted value into RAW-clear memory has nowhere to record taint —
-                // this is `docs/kmsan.md`'s documented Stage 1 limitation (store-then-reload won't
-                // propagate until Stage 2). Deliberately a taint no-op.
-                //
+                // KMSAN Stage 2 (`docs/kmsan.md`): scatter the stored value's byte-taint into
+                // `PERM_VTAINT` right after a successful store — this is the fix for Stage 1's
+                // documented store-was-a-no-op limitation (no memory-taint plane existed yet), and
+                // is what makes store-then-reload-then-branch propagate taint end to end.
+                let store_taint_mask = if self.kmsan_enabled() {
+                    Some(self.rd_taint(rs2))
+                } else {
+                    None
+                };
                 // HTIF: a word store to `tohost` with bit0 set is an exit request.
                 if op == StoreOp::Sw && self.htif_tohost == Some(addr) {
                     self.store(bus, addr, 4, val)?;
+                    if let Some(t) = store_taint_mask {
+                        self.store_taint(bus, addr, 4, t)?;
+                    }
                     if val & 1 != 0 {
                         exit = Exit::Halt(val >> 1);
                     }
                 } else {
                     self.store(bus, addr, size, val)?;
+                    if let Some(t) = store_taint_mask {
+                        self.store_taint(bus, addr, size, t)?;
+                    }
                 }
             }
             Inst::OpImm { op, rd, rs1, imm } => {
@@ -1537,6 +1575,14 @@ impl Cpu {
                 if self.kmsan_enabled() {
                     self.wr_taint(rd, bus.read_raw_state(pa, 4));
                 }
+                // KMSAN Stage 2 documented gap (mirrors Stage 1's original Store no-op): the
+                // read-modify-write `result` written back below does NOT scatter its own taint
+                // (a mix of `old`'s and `src`'s) into `PERM_VTAINT` — an AMO's memory word keeps
+                // whatever taint state it had before this instruction. Unlike a plain `Store`
+                // (Stage 2's primary fix), AMOs are comparatively rare in the specific
+                // uninitialized-value patterns KMSAN targets (refcounts/locks operate on
+                // already-initialized words in practice), so this is deferred rather than blocking
+                // Stage 2 — flagged here for Stage 3/4 rather than left silently ambiguous.
                 bus.store(pa, 4, result).map_err(Trap::Mem)?;
                 self.reservation = None;
                 self.wr_reg(rd, old);
@@ -1912,7 +1958,7 @@ fn mem_cause(f: Fault) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fs_mmu::{Mmu, PERM_EXEC, PERM_RAW, PERM_READ, PERM_WRITE};
+    use fs_mmu::{Mmu, PERM_EXEC, PERM_RAW, PERM_READ, PERM_VTAINT, PERM_WRITE};
 
     /// Assemble a program, run it in a fresh MMU, return (exit_code, cpu).
     fn run(program: &[u32]) -> (u32, Cpu) {
@@ -2396,6 +2442,162 @@ mod tests {
                     assert_eq!(cpu.regs[A7 as usize], 93);
                     assert_eq!(cpu.regs[30], 5); // *scratch (uninitialized bytes read as 0) + 5
                     assert!(cpu.regs_taint.is_none(), "KMSAN off must never allocate regs_taint");
+                    return;
+                }
+                other => panic!("unexpected exit {other:?}"),
+            }
+        }
+        panic!("program did not terminate");
+    }
+
+    // -- KMSAN Stage 2 (`docs/kmsan.md`): PERM_VTAINT memory shadow, store-scatter / load-gather --
+
+    /// POSITIVE control (`docs/kmsan.md` Stage 2): store a register tainted by a RAW-uninitialized
+    /// load into a SEPARATE, genuinely clean word, reload that word, and branch on it. Stage 1
+    /// documented the store as a taint no-op (no memory shadow existed yet); Stage 2's
+    /// `Cpu::store_taint` scatter must make the reload observe the taint and the `Branch` must
+    /// trap — the store-then-reload-then-branch round trip Stage 1 could not do. Uses a second
+    /// word (`scratch + 4`) reached only via an offset from `x29 = scratch` (not a second `lui`)
+    /// so the test never depends on `asm::lui`'s 4 KiB-aligned-immediate truncation.
+    #[test]
+    fn kmsan_stage2_store_scatter_then_reload_then_branch_fires() {
+        use asm::*;
+        let base = 0x8000_0000u32;
+        let scratch = 0x8000_1000u32;
+        let mut mmu = Mmu::new(base, 0x1_0000);
+        mmu.protect(base, 0x1_0000, PERM_READ | PERM_WRITE).unwrap();
+        mmu.protect(scratch, 4, PERM_READ | PERM_WRITE | PERM_RAW).unwrap();
+        // scratch+4 starts genuinely clean: READ|WRITE, no RAW, no VTAINT.
+        mmu.protect(scratch + 4, 4, PERM_READ | PERM_WRITE).unwrap();
+
+        let prog = [
+            addi(28, X0, 5),  // 0: x28 = 5 (clean)
+            lui(29, scratch), // 1: x29 = scratch
+            lw(30, 29, 0),    // 2: x30 = *scratch (RAW-tainted load)
+            sw(29, 30, 4),    // 3: *(scratch+4) = x30 (store-scatter -> VTAINT-taints scratch+4)
+            lw(31, 29, 4),    // 4: x31 = *(scratch+4) (reload: gathers VTAINT)
+            beq(31, 28, 4),   // 5: branch (KMSAN checkpoint on x31/x28)
+            addi(A7, X0, 93), // 6: reached only if the branch didn't trap
+            ecall(),          // 7
+        ];
+        let mut bytes = Vec::new();
+        for w in prog {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        mmu.map(base, &bytes, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+
+        let mut cpu = Cpu::new(base);
+        cpu.set_kmsan(true);
+        let branch_pc = base + 4 * 5;
+        for _ in 0..1000 {
+            match cpu.step(&mut mmu) {
+                Ok(Exit::Continue) => {}
+                Ok(other) => panic!("expected a KmsanTainted trap, got exit {other:?}"),
+                Err(Trap::KmsanTainted { pc, rs1, rs2, taint_a, taint_b }) => {
+                    assert_eq!(pc, branch_pc);
+                    assert_eq!(rs1, 31);
+                    assert_eq!(rs2, 28);
+                    assert_ne!(
+                        taint_a, 0,
+                        "x31 (reloaded from a stored-taint word) must be tainted"
+                    );
+                    assert_eq!(taint_b, 0, "x28 (a known constant) must not be tainted");
+                    return;
+                }
+                Err(other) => panic!("expected a KmsanTainted trap, got {other:?}"),
+            }
+        }
+        panic!("program did not terminate without trapping");
+    }
+
+    /// NEGATIVE control (`docs/kmsan.md` Stage 2): a word carrying STALE `PERM_VTAINT` (as if a
+    /// prior allocation seeded it and the byte was since reused) must be un-tainted by a normal
+    /// store of a fully-known value — `Bus::write_shadow`'s exact-overwrite semantics, not an OR.
+    /// Reload after the store must be clean and the `Branch` must NOT trap.
+    #[test]
+    fn kmsan_stage2_store_of_clean_value_clears_stale_vtaint() {
+        use asm::*;
+        let base = 0x8000_0000u32;
+        let scratch = 0x8000_1000u32;
+        let mut mmu = Mmu::new(base, 0x1_0000);
+        mmu.protect(base, 0x1_0000, PERM_READ | PERM_WRITE).unwrap();
+        mmu.protect(scratch, 4, PERM_READ | PERM_WRITE).unwrap();
+        // scratch+4 starts with STALE VTAINT (simulating a prior alloc-seeded, now-stale taint).
+        mmu.protect(scratch + 4, 4, PERM_READ | PERM_WRITE | PERM_VTAINT)
+            .unwrap();
+
+        let prog = [
+            addi(28, X0, 5),  // 0: x28 = 5 (clean)
+            lui(29, scratch), // 1: x29 = scratch
+            sw(29, 28, 4),    // 2: *(scratch+4) = x28 (a real, known store -- must clear VTAINT)
+            lw(30, 29, 4),    // 3: x30 = *(scratch+4) (reload)
+            beq(30, 28, 4),   // 4: branch (must NOT trap -- x30/x28 both clean)
+            addi(A7, X0, 93), // 5
+            ecall(),          // 6
+        ];
+        let mut bytes = Vec::new();
+        for w in prog {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        mmu.map(base, &bytes, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+
+        let mut cpu = Cpu::new(base);
+        cpu.set_kmsan(true);
+        for _ in 0..1000 {
+            match cpu.step(&mut mmu).unwrap() {
+                Exit::Continue => {}
+                Exit::Ecall => {
+                    assert_eq!(cpu.regs[A7 as usize], 93);
+                    assert_eq!(cpu.regs[30], 5);
+                    return;
+                }
+                other => panic!("unexpected exit {other:?}"),
+            }
+        }
+        panic!("program did not terminate without trapping");
+    }
+
+    /// KMSAN off (Stage 2 clean-regression, mirroring the Stage 1 equivalent above): a store
+    /// through `exec_one`'s `Store` arm must never call `Bus::write_shadow` (hence never allocate
+    /// or touch `PERM_VTAINT`) unless `kmsan_enabled()` — confirmed here by checking the mmu's own
+    /// perm byte directly after running the Stage 2 positive-control program with tracking off.
+    #[test]
+    fn kmsan_disabled_never_sets_vtaint() {
+        use asm::*;
+        let base = 0x8000_0000u32;
+        let scratch = 0x8000_1000u32;
+        let mut mmu = Mmu::new(base, 0x1_0000);
+        mmu.protect(base, 0x1_0000, PERM_READ | PERM_WRITE).unwrap();
+        mmu.protect(scratch, 4, PERM_READ | PERM_WRITE | PERM_RAW).unwrap();
+        mmu.protect(scratch + 4, 4, PERM_READ | PERM_WRITE).unwrap();
+
+        let prog = [
+            addi(28, X0, 5),
+            lui(29, scratch),
+            lw(30, 29, 0),
+            sw(29, 30, 4),
+            lw(31, 29, 4),
+            addi(A7, X0, 93),
+            ecall(),
+        ];
+        let mut bytes = Vec::new();
+        for w in prog {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        mmu.map(base, &bytes, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+
+        let mut cpu = Cpu::new(base);
+        assert!(!cpu.kmsan_enabled());
+        for _ in 0..1000 {
+            match cpu.step(&mut mmu).unwrap() {
+                Exit::Continue => {}
+                Exit::Ecall => {
+                    assert_eq!(cpu.regs[A7 as usize], 93);
+                    assert_eq!(
+                        mmu.perm_at(scratch + 4),
+                        Some(PERM_READ | PERM_WRITE),
+                        "KMSAN off must never set PERM_VTAINT"
+                    );
                     return;
                 }
                 other => panic!("unexpected exit {other:?}"),

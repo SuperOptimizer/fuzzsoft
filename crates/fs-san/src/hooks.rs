@@ -176,6 +176,36 @@ pub enum CacheAllocEvent {
     Alloc { addr: u32, cache_ptr: u32 },
 }
 
+/// Register index conventionally holding a `gfp_t flags` argument at entry, for every
+/// currently-hooked allocator convention in `linux.rs`'s `KNOWN_SYMBOLS`: `kmalloc(size, flags)`,
+/// `__kmalloc(size, flags)`, `kmalloc_trace(cachep, flags, size)`, `kmem_cache_alloc(cachep,
+/// flags)`, ... — in every one of these, `flags` is the SECOND argument, `a1` (x11), even though
+/// the FIRST argument varies (a byte size for the `kmalloc` family, a cache pointer for
+/// `kmem_cache_alloc`). This is a fixed assumption about the RISC-V calling convention applied to
+/// this project's specific `KNOWN_SYMBOLS` table, not a general property of any alloc-shaped
+/// function — revisit if a future hooked symbol doesn't follow this shape.
+pub const GFP_FLAGS_REG: usize = 11;
+
+/// KMSAN Stage 2 (`docs/kmsan.md`) independent taint-seeding query: an alloc-shaped or
+/// `kmem_cache_alloc`-shaped hook just returned, with the `gfp_t` flags value captured from
+/// [`GFP_FLAGS_REG`] at entry alongside it — so a caller can decide whether this is a `__GFP_ZERO`
+/// allocation (already-initialized payload; must NOT be tainted) before seeding
+/// `fs_mmu::PERM_VTAINT`. Deliberately its own independent query (mirrors [`CacheAllocEvent`]/
+/// [`PageHookEvent`]'s reasoning) rather than adding a `flags` field to [`HookEvent::Alloc`]/
+/// [`CacheAllocEvent::Alloc`], which are matched exhaustively by the `--sanitize` call sites this
+/// module must not disturb. Shares [`PcHooks`]'s existing [`AllocHook`]/[`CacheAllocHook`]
+/// registrations (`--kmsan` and `--sanitize` are mutually exclusive, so only one of `on_pc`/
+/// `on_cache_alloc_pc`/`on_kmsan_alloc_pc` is ever driven for a given run) — no separate hook
+/// registration call is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KmsanAllocEvent {
+    /// A `kmalloc`-family allocation just returned: `size` bytes at `addr`.
+    Sized { addr: u32, size: u32, gfp_flags: u32 },
+    /// A `kmem_cache_alloc`-family allocation just returned: the caller must still read
+    /// `cache_ptr`'s `object_size` field itself (mirrors [`CacheAllocEvent::Alloc`]).
+    Cache { addr: u32, cache_ptr: u32, gfp_flags: u32 },
+}
+
 /// Registry of PC hooks plus the small amount of state needed to bridge an alloc call's entry
 /// (where the size is known) to its return (where the pointer is known).
 #[derive(Default)]
@@ -205,6 +235,14 @@ pub struct PcHooks {
     /// analogue of `pending`, except the stashed payload is a cache pointer, not a size (see
     /// [`CacheAllocHook`]'s doc comment for why).
     cache_pending: HashMap<u32, Vec<u32>>,
+    /// KMSAN (`docs/kmsan.md` Stage 2) taint-seeding pending stash: `(size, gfp_flags)` per
+    /// in-flight `kmalloc`-family call, keyed by return address — independent of `pending` (which
+    /// only tracks `size`) so [`PcHooks::on_kmsan_alloc_pc`] can run instead of `on_pc`, never both,
+    /// per a given run (`--kmsan`/`--sanitize` are mutually exclusive).
+    kmsan_alloc_pending: HashMap<u32, Vec<(u32, u32)>>,
+    /// KMSAN taint-seeding pending stash for `kmem_cache_alloc`-shaped calls: `(cache_ptr,
+    /// gfp_flags)`, the `on_kmsan_alloc_pc` analogue of `cache_pending`.
+    kmsan_cache_pending: HashMap<u32, Vec<(u32, u32)>>,
 }
 
 impl PcHooks {
@@ -376,6 +414,57 @@ impl PcHooks {
         self.cache_pending.values().map(|v| v.len()).sum()
     }
 
+    /// KMSAN Stage 2 (`docs/kmsan.md`) independent taint-seeding query: mirrors [`PcHooks::on_pc`]'s
+    /// entry/return dance for [`AllocHook`] and [`PcHooks::on_cache_alloc_pc`]'s for
+    /// [`CacheAllocHook`], but ALSO captures the `gfp_t flags` value from [`GFP_FLAGS_REG`] at
+    /// entry, so the caller can skip tainting a `__GFP_ZERO` allocation (already-initialized,
+    /// tainting it would be a pure false positive). Uses its own pending stashes
+    /// (`kmsan_alloc_pending`/`kmsan_cache_pending`), so this never needs to be called alongside
+    /// `on_pc`/`on_cache_alloc_pc` — exactly one of these query families is driven per run
+    /// (`--kmsan` xor `--sanitize`).
+    pub fn on_kmsan_alloc_pc(&mut self, pc: u32, regs: &[u32; 32]) -> Option<KmsanAllocEvent> {
+        if let Some(hook) = self.allocs.get(&pc) {
+            let size = regs[hook.size_reg];
+            let flags = regs[GFP_FLAGS_REG];
+            let ret_pc = regs[REG_RETURN_ADDR];
+            self.kmsan_alloc_pending.entry(ret_pc).or_default().push((size, flags));
+            return None; // The pointer isn't known until the call returns.
+        }
+        if let Some(hook) = self.cache_allocs.get(&pc) {
+            let cache_ptr = regs[hook.cache_reg];
+            let flags = regs[GFP_FLAGS_REG];
+            let ret_pc = regs[REG_RETURN_ADDR];
+            self.kmsan_cache_pending.entry(ret_pc).or_default().push((cache_ptr, flags));
+            return None;
+        }
+        if let Some(v) = self.kmsan_alloc_pending.get_mut(&pc)
+            && let Some((size, gfp_flags)) = v.pop()
+        {
+            if v.is_empty() {
+                self.kmsan_alloc_pending.remove(&pc);
+            }
+            let addr = regs[REG_RETURN_VALUE];
+            return Some(KmsanAllocEvent::Sized { addr, size, gfp_flags });
+        }
+        if let Some(v) = self.kmsan_cache_pending.get_mut(&pc)
+            && let Some((cache_ptr, gfp_flags)) = v.pop()
+        {
+            if v.is_empty() {
+                self.kmsan_cache_pending.remove(&pc);
+            }
+            let addr = regs[REG_RETURN_VALUE];
+            return Some(KmsanAllocEvent::Cache { addr, cache_ptr, gfp_flags });
+        }
+        None
+    }
+
+    /// Number of KMSAN taint-seeding alloc-call returns currently awaited (both the `kmalloc`- and
+    /// `kmem_cache_alloc`-shaped families combined). Exposed mainly for tests/diagnostics.
+    pub fn kmsan_alloc_pending_returns(&self) -> usize {
+        self.kmsan_alloc_pending.values().map(|v| v.len()).sum::<usize>()
+            + self.kmsan_cache_pending.values().map(|v| v.len()).sum::<usize>()
+    }
+
     /// Drop all in-flight alloc/free calls awaiting a return. Call between snapshot-fuzzing cases
     /// so a call left mid-flight by one case's reset doesn't leak into the next.
     pub fn clear_pending(&mut self) {
@@ -383,6 +472,8 @@ impl PcHooks {
         self.pending_frees.clear();
         self.page_pending.clear();
         self.cache_pending.clear();
+        self.kmsan_alloc_pending.clear();
+        self.kmsan_cache_pending.clear();
     }
 }
 
@@ -769,5 +860,96 @@ mod tests {
         assert_eq!(hooks.cache_alloc_pending_returns(), 1);
         assert_eq!(hooks.pending_returns(), 0);
         assert_eq!(hooks.page_pending_returns(), 0);
+    }
+
+    // -- KMSAN Stage 2 taint-seeding query (on_kmsan_alloc_pc/KmsanAllocEvent) --
+
+    #[test]
+    fn kmsan_alloc_query_captures_gfp_flags_from_the_conventional_register() {
+        let mut hooks = PcHooks::new();
+        hooks.hook_alloc(AllocHook {
+            entry_pc: 0x1000,
+            size_reg: 10, // a0 = size
+        });
+        // kmalloc(64, GFP_KERNEL | __GFP_ZERO): a0 = size, a1 = flags (GFP_FLAGS_REG).
+        let entry = regs_with(|r| {
+            r[10] = 64;
+            r[GFP_FLAGS_REG] = 0x100; // __GFP_ZERO bit set
+            r[REG_RETURN_ADDR] = 0x2000;
+        });
+        assert_eq!(hooks.on_kmsan_alloc_pc(0x1000, &entry), None);
+        assert_eq!(hooks.kmsan_alloc_pending_returns(), 1);
+        // Not visible through the ordinary sanitizer query.
+        assert_eq!(hooks.on_pc(0x1000, &entry), None);
+        assert_eq!(hooks.pending_returns(), 1); // on_pc has its own independent stash
+
+        let ret = regs_with(|r| r[REG_RETURN_VALUE] = 0x8000_1000);
+        assert_eq!(
+            hooks.on_kmsan_alloc_pc(0x2000, &ret),
+            Some(KmsanAllocEvent::Sized { addr: 0x8000_1000, size: 64, gfp_flags: 0x100 })
+        );
+        assert_eq!(hooks.kmsan_alloc_pending_returns(), 0);
+    }
+
+    #[test]
+    fn kmsan_cache_alloc_query_captures_gfp_flags_and_cache_ptr() {
+        let mut hooks = PcHooks::new();
+        hooks.hook_cache_alloc(CacheAllocHook {
+            entry_pc: 0x8000,
+            cache_reg: 10, // a0 = cachep
+        });
+        let entry = regs_with(|r| {
+            r[10] = 0xc040_0000;
+            r[GFP_FLAGS_REG] = 0; // no __GFP_ZERO
+            r[REG_RETURN_ADDR] = 0x8100;
+        });
+        assert_eq!(hooks.on_kmsan_alloc_pc(0x8000, &entry), None);
+        let ret = regs_with(|r| r[REG_RETURN_VALUE] = 0x8030_0000);
+        assert_eq!(
+            hooks.on_kmsan_alloc_pc(0x8100, &ret),
+            Some(KmsanAllocEvent::Cache {
+                addr: 0x8030_0000,
+                cache_ptr: 0xc040_0000,
+                gfp_flags: 0
+            })
+        );
+        assert_eq!(hooks.kmsan_alloc_pending_returns(), 0);
+    }
+
+    #[test]
+    fn kmsan_alloc_query_independent_of_sanitizer_and_page_queries() {
+        let mut hooks = PcHooks::new();
+        hooks.hook_alloc(AllocHook { entry_pc: 0x1000, size_reg: 10 });
+        hooks.hook_page_alloc(PageAllocHook { entry_pc: 0x6000, order_reg: Some(11) });
+        let regs = regs_with(|r| {
+            r[10] = 32;
+            r[GFP_FLAGS_REG] = 0;
+            r[REG_RETURN_ADDR] = 0x2000;
+        });
+        // Driving `on_kmsan_alloc_pc` must not disturb `on_pc`'s or `on_page_pc`'s own state.
+        assert_eq!(hooks.on_kmsan_alloc_pc(0x1000, &regs), None);
+        assert_eq!(hooks.kmsan_alloc_pending_returns(), 1);
+        assert_eq!(hooks.pending_returns(), 0);
+        assert_eq!(hooks.page_pending_returns(), 0);
+        assert_eq!(hooks.on_kmsan_alloc_pc(0x6000, &regs), None); // unrelated pc, no-op
+        assert_eq!(hooks.kmsan_alloc_pending_returns(), 1);
+    }
+
+    #[test]
+    fn clear_pending_drops_in_flight_kmsan_allocs_too() {
+        let mut hooks = PcHooks::new();
+        hooks.hook_alloc(AllocHook { entry_pc: 0x1000, size_reg: 10 });
+        let regs = regs_with(|r| {
+            r[10] = 16;
+            r[REG_RETURN_ADDR] = 0x2000;
+        });
+        hooks.on_kmsan_alloc_pc(0x1000, &regs);
+        assert_eq!(hooks.kmsan_alloc_pending_returns(), 1);
+        hooks.clear_pending();
+        assert_eq!(hooks.kmsan_alloc_pending_returns(), 0);
+        assert_eq!(
+            hooks.on_kmsan_alloc_pc(0x2000, &regs_with(|r| r[REG_RETURN_VALUE] = 0x9000_0000)),
+            None
+        );
     }
 }

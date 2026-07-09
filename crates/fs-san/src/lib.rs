@@ -29,8 +29,11 @@ mod pages;
 
 pub use alloc::{DEFAULT_QUARANTINE_CAP, DEFAULT_REDZONE, SanError, Sanitizer};
 pub use hooks::{
-    AllocHook, CacheAllocEvent, CacheAllocHook, FreeHook, HookEvent, KsizeHook, PageAllocHook,
-    PageFreeHook, PageHookEvent, PcHooks, REG_RETURN_ADDR, REG_RETURN_VALUE,
+    AllocHook, CacheAllocEvent, CacheAllocHook, FreeHook, GFP_FLAGS_REG, HookEvent,
+    KmsanAllocEvent, KsizeHook, PageAllocHook, PageFreeHook, PageHookEvent, PcHooks,
+    REG_RETURN_ADDR, REG_RETURN_VALUE,
 };
-pub use linux::{LinearMap, kmalloc_bucket, parse_system_map, register_kernel_allocator_hooks};
+pub use linux::{
+    GFP_ZERO, LinearMap, kmalloc_bucket, parse_system_map, register_kernel_allocator_hooks,
+};
 pub use pages::{DEFAULT_PAGE_QUARANTINE_CAP, PAGE, PageSanitizer};

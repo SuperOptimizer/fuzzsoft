@@ -97,6 +97,82 @@ allocation, independent of `--sanitize`'s RAW/OOB bookkeeping) to give `--kmsan`
 all. Re-run this same false-positive measurement once Stage 2 lands — that is the first point at
 which "0 hits" or "hit storm" becomes a meaningful precision result rather than a tautology.
 
+## T3.2 outcome — Stage 2 landed, live source confirmed, ONE root-caused FP class dominates (2026-07-08)
+
+Stage 2 shipped exactly as scoped: `PERM_VTAINT` (fs-mmu), `Bus::write_shadow` (store-scatter,
+exact overwrite) + `read_raw_state` now ORs RAW|VTAINT (load-gather), `Cpu::store_taint` wired into
+`exec_one`'s `Store` arm, and a brand-new independent seeding path in `fs-cli`'s `KmsanCtx`: it
+reuses `fs-san`'s existing `kmalloc`/`kmem_cache_alloc` PC-hooks (a new `PcHooks::on_kmsan_alloc_pc`
+query, `fs-san/src/hooks.rs`, captures `gfp_flags` from the conventional `a1` register alongside the
+existing size/cache-pointer capture) and stamps the returned, not-yet-written payload `PERM_VTAINT`
+via a new `Mmu::set_vtaint` bulk primitive — skipping `__GFP_ZERO` allocations (`fs_san::GFP_ZERO =
+0x100`, pinned against this build's `gfp_types.h`). **A real, load-bearing bug was found and fixed
+along the way**: `fs_platform::Machine`/`CowMachine` (the actual `Bus` impls `run_case` drives)
+never overrode `Bus::read_raw_state`/`write_shadow`, so they silently fell back to the trait's
+default (always-clean/no-op) — meaning `--kmsan`'s load-taint gather was **structurally dead on any
+real kernel run, independent of T3.1's taint-source finding**. Fixed by forwarding both methods to
+`self.ram` (mirroring the existing `fast_ptr` forwarding pattern) — without this, Stage 2 would have
+measured "0 hits" for a THIRD, unrelated reason.
+
+**The false-positive measurement (the real deliverable): two independent clean-kernel runs, 8000
+cases total (`firmware/Image`, `seed 1 × 5000` + `seed 2 × 3000`), converge on exactly ONE
+root-caused finding, not a storm of distinct ones:**
+
+- Run 1 (seed 1, 5000 cases): 364 `KmsanTainted` halts, **1 unique pc**; 8825 allocations tainted
+  (2.98 MB), 1073 `__GFP_ZERO` allocations correctly skipped.
+- Run 2 (seed 2, 3000 cases): 548 halts, **the same 1 unique pc**; 7591 tainted (3.41 MB), 1018
+  skipped.
+- Combined: 912/8000 cases (~11%) halt on KMSAN — but every single one is the SAME faulting `pc`,
+  triggered by different socket-creating syscalls each time (`accept4`+`socketpair`+...,
+  `listen`+`socketpair`+`bind`, ...) — i.e. **one recurring code path, not many distinct bugs**, and
+  the corpus mutator naturally re-explores it once discovered (explaining the high recurrence rate
+  from a single cause).
+
+**Root-caused sample** (disassembled via `llvm-objdump --triple=riscv32` against
+`build/linux-src/vmlinux`, symbol-resolved via `build/linux-src/System.map`): the faulting pc
+(`0xc0b0581e`) is inside `_raw_spin_lock_irq`'s ticket-lock fast-path check —
+`amoadd.w.aqrl a3,a1,(a0)` reads the lock word (this becomes `old` in `Cpu`'s `AmoW` arm, shadowed
+from `Bus::read_raw_state` exactly like a plain load per Stage 1's existing rule); `a2 = a3 >> 16`
+(the ticket we just reserved) and `a3 &= 0xffff` (the current head) are then compared
+(`beq a2, a3`). Both registers are reported fully tainted (`0x0101_0101`) — and the *propagation
+itself is exact*: `Srl`/`And`'s v0 OR-of-masks rule is sound for these ops, so this is not a Stage 3
+carry/known-byte precision gap. **The bug is entirely in the SEED**: the lock lives inside a
+heap object (a `struct sock`-shaped allocation is the common case for the triggering syscalls, but
+the exact struct varies run to run — the class is the load-bearing fact, not one specific field) whose
+initializer follows a Linux convention this pass's `KmsanCtx` doesn't yet model — confirmed directly
+in `net/core/sock.c`: `sk_prot_alloc()` *always* strips `__GFP_ZERO` before calling the real
+`kmem_cache_alloc()` (so the hook legitimately observes "not zeroed" and taints it, per its own
+documented logic), then separately either zeroes non-lock fields via `sk_prot_clear_nulls()` or
+(`sk_clone`'s path) `memcpy`s everything **except** a compiler-enforced `sk_dontcopy_begin`/
+`sk_dontcopy_end` byte range that includes the lock — relying on a *later*, explicit
+`sock_lock_init()` call to re-establish it. This is the same general class this doc's own `KmsanCtx`
+doc comment pre-flagged before the measurement ran: **`kmem_cache` allocations whose lock/sync
+fields are established by a `ctor` (persists correctly across every *reused* allocation from that
+slab, never re-triggered by a plain `kmem_cache_alloc` return) or by an allocator-internal
+"don't-copy-this-region, a dedicated init call handles it" convention are invisible to a seeding
+model that only asks "was `__GFP_ZERO` set?"** — real Linux KMSAN's actual `kmsan_slab_alloc()` hook
+independently special-cases exactly this (`cache->ctor` -> skip poisoning), which this finding
+rediscovers empirically rather than by having read that code.
+
+**Positive control:** the fs-riscv unit tests (`kmsan_stage2_store_scatter_then_reload_then_branch_fires`
+/ `..._store_of_clean_value_clears_stale_vtaint` / `kmsan_disabled_never_sets_vtaint`) are the
+clean, deterministic positive/negative/off controls for the mechanism itself (store→reload→branch
+round trip Stage 1 could not do). The live-kernel finding above is the END-TO-END positive control
+for the full pipeline (independent alloc-hook seeding → real kernel code → store/load propagation →
+live oracle checkpoint) — it is a real, reproducible, root-caused signal, just one whose correct
+disposition is "known seeding gap," not "kernel bug."
+
+**Verdict: campaign-ready for the MECHANISM, not yet for unattended bug-hunting.** The shadow,
+propagation, and independent seed all work exactly as designed, and — unlike a storm of many
+distinct unexplained hits — this is ONE well-understood, tractable false-positive class with an
+identified fix (extend `KmsanCtx` to skip tainting `kmem_cache_alloc` returns whose cache has a
+ctor, mirroring the `__GFP_ZERO` check; needs a `kmem_cache::ctor` guest-memory read + sanity bound,
+the same shape as `KMEM_CACHE_OBJECT_SIZE_OFFSET`). Until that lands, a live campaign would spend a
+meaningful fraction of cases (~11% here) re-discovering this one class rather than finding new
+signal — usable for validating the mechanism, not yet for autonomous triage. This reframes Stage 3:
+the ALU precision refinements (carry-smear, known-byte clearing) are NOT what's blocking real usage
+— the seed's allocator-convention coverage is.
+
 ## Open questions (decide, don't assume)
 Byte-taint packing (bits 0-3 vs byte-aligned 0/8/16/24 — recommend byte-aligned for Stage-3 shift math);
 mode flag as runtime `Option` (start here, matches cmplog) vs const-generic (only if profiled);

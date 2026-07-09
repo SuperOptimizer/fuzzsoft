@@ -22,6 +22,19 @@ pub const PERM_EXEC: u8 = 1 << 2;
 pub const PERM_RAW: u8 = 1 << 3;
 /// Access/coverage bit (reserved; used by the emulator-native coverage layer later).
 pub const PERM_ACC: u8 = 1 << 4;
+/// KMSAN Stage 2 (`docs/kmsan.md`) value-taint shadow: a reused spare bit in the same perms byte,
+/// NOT a separate `Vec<u8>` plane. Decisive reasoning (from the design doc): `fs-loader::load_into`
+/// sets `perms[off] = perm` directly (bypassing `Mmu::write`, the only RAW-clearing path), so a
+/// *separate* shadow array would default to all-tainted for the whole loaded kernel image — a
+/// day-one false-positive storm. A reused bit is safe by construction: every existing caller
+/// (loader/`protect`/`poison`/normal `write`) never sets bit 5, so every byte's taint starts at 0
+/// for free, and is only ever set by the new KMSAN-gated paths below (`Bus::write_shadow`'s
+/// store-scatter, and `fs-cli`'s `--kmsan` allocator-hook seeding via `Mmu::set_vtaint`). Distinct
+/// from `PERM_RAW`: RAW is ASAN-strict (fault on first read of a never-written byte); VTAINT
+/// *permits* the read and only matters when `Bus::read_raw_state` (Stage 1/2's load-taint gather)
+/// or a KMSAN consumption checkpoint (`Branch`) inspects it. Never touched by the normal
+/// `read`/`write`/`read_bytewise`/`write_bytewise` paths — those remain byte-for-byte unchanged.
+pub const PERM_VTAINT: u8 = 1 << 5;
 
 /// Phase 3 (`docs/jit-scalar-design.md`) fast-path "danger" mask: any byte carrying one of these
 /// bits is, by definition, NOT the trivial case — [`Bus::fast_ptr`] bails on it regardless of
@@ -91,18 +104,31 @@ pub trait Bus {
     fn store(&mut self, addr: u32, size: u8, val: u32) -> Result<(), Fault>;
     fn ifetch16(&mut self, addr: u32) -> Result<u16, Fault>;
 
-    /// KMSAN Stage 1 load-taint source (`docs/kmsan.md`): gather byte-granular `PERM_RAW`
-    /// (never-written / uninitialized) state for up to 4 bytes at physical `addr`, bit `8*i` set
-    /// iff byte `i` of the span carries `PERM_RAW`. Purely additive and read-only — deliberately
-    /// separate from `load`/`read`/`read_bytewise` so it does NOT touch their RAW-clearing-on-write
-    /// semantics or ASAN-strict fault-on-first-read behavior (`docs/kmsan.md`'s KMSAN *permits*
-    /// reading uninitialized memory and reports only at consumption). Default (for `Bus` impls not
-    /// backed by an [`Mmu`], e.g. full-system `Machine`/`CowMachine`) conservatively reports every
-    /// byte clean (`0`) — KMSAN load-taint is a silent no-op there rather than a false positive
-    /// until a later increment wires those through.
+    /// KMSAN load-taint source (`docs/kmsan.md`): gather byte-granular taint state for up to 4
+    /// bytes at physical `addr`, bit `8*i` set iff byte `i` of the span carries EITHER `PERM_RAW`
+    /// (Stage 1: never-written/uninitialized) OR `PERM_VTAINT` (Stage 2: explicitly seeded/
+    /// propagated value-taint) — a `Load` gathers both sources with one call, which is what makes
+    /// this *value* taint rather than just "never written" taint. Purely additive and read-only —
+    /// deliberately separate from `load`/`read`/`read_bytewise` so it does NOT touch their
+    /// RAW-clearing-on-write semantics or ASAN-strict fault-on-first-read behavior (`docs/kmsan.md`'s
+    /// KMSAN *permits* reading uninitialized memory and reports only at consumption). Default (for
+    /// `Bus` impls not backed by an [`Mmu`]) conservatively reports every byte clean (`0`) — KMSAN
+    /// load-taint is a silent no-op there rather than a false positive until wired through.
     fn read_raw_state(&self, _addr: u32, _len: u8) -> u32 {
         0
     }
+
+    /// KMSAN Stage 2 store-taint sink (`docs/kmsan.md`): scatter a byte-taint mask (same `8*i`
+    /// encoding as [`Bus::read_raw_state`]) into up to 4 bytes' `PERM_VTAINT` bit at physical
+    /// `addr` — an EXACT overwrite per byte (tainted bit set -> `PERM_VTAINT` set; clear ->
+    /// `PERM_VTAINT` cleared), not an OR. This mirrors real KMSAN's shadow-copy-on-store semantics:
+    /// storing a fully-known value must un-taint the destination bytes (or a byte tainted by a
+    /// prior allocation could spuriously stay "uninitialized" forever after a legitimate write),
+    /// while storing a tainted register value must taint them. Only ever called when
+    /// [`crate`]-external KMSAN tracking is enabled (`fs_riscv::Cpu::kmsan_enabled`) — never
+    /// touches `PERM_READ`/`PERM_WRITE`/`PERM_EXEC`/`PERM_RAW`/`PERM_ACC`. Default (for `Bus` impls
+    /// with no taint shadow) is a silent no-op, matching `read_raw_state`'s default-clean stance.
+    fn write_shadow(&mut self, _addr: u32, _len: u8, _taint_mask: u32) {}
 
     /// Does a (just-completed, successful) store to physical `addr` of `size` bytes potentially
     /// newly assert an interrupt that a per-instruction driver loop must observe before continuing
@@ -300,6 +326,32 @@ impl Mmu {
     /// distinct from `protect`'s general "stamp arbitrary perm" use.
     pub fn poison(&mut self, addr: u32, len: u32) -> Result<(), Fault> {
         self.protect(addr, len, 0)
+    }
+
+    /// KMSAN Stage 2 (`docs/kmsan.md`) bulk taint-seeding primitive: OR (`tainted = true`) or clear
+    /// (`tainted = false`) `PERM_VTAINT` across `[addr, addr+len)`, leaving every other permission
+    /// bit (READ/WRITE/EXEC/RAW/ACC) exactly as it was. Unlike [`Mmu::protect`] (which overwrites
+    /// the whole perm byte), this flips only the one taint bit — the allocator hook seeding path
+    /// (`fs-cli`'s `--kmsan` context) calls this on a freshly-returned kmalloc/kmem_cache_alloc
+    /// payload whose R/W/X state was already established by the kernel's own memory map (or, under
+    /// `--sanitize`'s own alloc hooks — mutually exclusive with `--kmsan`, never combined — by
+    /// `Sanitizer`), and must not disturb it. Analogous to `Bus::write_shadow`, but unbounded in
+    /// length (an allocation can be far larger than 4 bytes) and called directly on `&mut Mmu`
+    /// rather than through the `Bus` trait, mirroring how `Sanitizer`/`PageSanitizer` already call
+    /// `protect`/`poison` directly rather than through `Bus`.
+    pub fn set_vtaint(&mut self, addr: u32, len: u32, tainted: bool) -> Result<(), Fault> {
+        for i in 0..len {
+            let a = addr.wrapping_add(i);
+            let off = self
+                .offset(a)
+                .ok_or_else(|| Self::fault(a, len, Access::Write, FaultKind::Unmapped))?;
+            if tainted {
+                self.perms[off] |= PERM_VTAINT;
+            } else {
+                self.perms[off] &= !PERM_VTAINT;
+            }
+        }
+        Ok(())
     }
 
     /// True if `[addr, addr+len)` lies entirely inside the mapped guest window, without
@@ -517,12 +569,24 @@ impl Bus for Mmu {
         let mut mask = 0u32;
         for i in 0..(len.min(4) as u32) {
             if let Some(off) = self.offset(addr.wrapping_add(i))
-                && self.perms[off] & PERM_RAW != 0
+                && self.perms[off] & (PERM_RAW | PERM_VTAINT) != 0
             {
                 mask |= 1 << (8 * i);
             }
         }
         mask
+    }
+
+    fn write_shadow(&mut self, addr: u32, len: u8, taint_mask: u32) {
+        for i in 0..(len.min(4) as u32) {
+            if let Some(off) = self.offset(addr.wrapping_add(i)) {
+                if (taint_mask >> (8 * i)) & 1 != 0 {
+                    self.perms[off] |= PERM_VTAINT;
+                } else {
+                    self.perms[off] &= !PERM_VTAINT;
+                }
+            }
+        }
     }
 
     fn fast_ptr(&mut self, addr: u32, len: u8, need: u8) -> Option<*mut u8> {
@@ -1019,6 +1083,48 @@ impl CowRam {
         }
     }
 
+    /// `fs_mmu::Bus::read_raw_state`'s twin for `CowRam` (mirrors [`CowRam::fast_ptr`]'s "`CowRam`
+    /// doesn't implement `Bus` itself, `fs_platform::CowMachine` forwards here" shape). Never
+    /// allocates an overlay — reading VTAINT/RAW state, like reading content, is safe straight
+    /// through golden for a page that has never diverged.
+    pub fn read_raw_state(&self, addr: u32, len: u8) -> u32 {
+        let mut mask = 0u32;
+        for i in 0..(len.min(4) as u32) {
+            let Some(off) = self.offset(addr.wrapping_add(i)) else { continue };
+            let pn = off / PAGE_SIZE;
+            let po = off % PAGE_SIZE;
+            if po >= PAGE_SIZE {
+                continue;
+            }
+            if self.resolve(pn).1[po] & (PERM_RAW | PERM_VTAINT) != 0 {
+                mask |= 1 << (8 * i);
+            }
+        }
+        mask
+    }
+
+    /// `fs_mmu::Bus::write_shadow`'s twin for `CowRam`. Copy-on-writes the containing page (exactly
+    /// like [`CowRam::write`]) before mutating `PERM_VTAINT` — mutating a still-golden page in
+    /// place would corrupt every other lane sharing the same `Arc<Golden>`.
+    pub fn write_shadow(&mut self, addr: u32, len: u8, taint_mask: u32) {
+        let Some(off) = self.offset(addr) else { return };
+        let pn = off / PAGE_SIZE;
+        let po = off % PAGE_SIZE;
+        let n = len.min(4) as usize;
+        if po + n > PAGE_SIZE {
+            return; // caller's alignment guarantee (see `Bus::write_shadow`'s doc) never crosses a page
+        }
+        let idx = self.ensure_page(pn);
+        let page = &mut self.pages[idx];
+        for i in 0..n {
+            if (taint_mask >> (8 * i)) & 1 != 0 {
+                page.perms[po + i] |= PERM_VTAINT;
+            } else {
+                page.perms[po + i] &= !PERM_VTAINT;
+            }
+        }
+    }
+
     /// Bus-shaped helpers, matching how `fs_platform::Machine` calls its `Mmu` (see PR2's
     /// `CowMachine`). `load`/`ifetch16` take `&self` (reads never allocate, safe to call
     /// speculatively); `store` takes `&mut self` since a write may copy-on-write a page.
@@ -1287,5 +1393,86 @@ mod tests {
         assert!(!sd.bit(63));
         assert!(sd.bit(64));
         assert!(!sd.bit(199));
+    }
+
+    // -- KMSAN Stage 2 (`docs/kmsan.md`): PERM_VTAINT shadow read/write --
+
+    #[test]
+    fn set_vtaint_bulk_seeding_preserves_other_perm_bits() {
+        let mut m = Mmu::new(0x8000_0000, 0x1000);
+        m.protect(0x8000_0000, 8, PERM_READ | PERM_WRITE).unwrap();
+        m.set_vtaint(0x8000_0000, 4, true).unwrap();
+        // Tainted bytes: VTAINT set, R/W untouched.
+        assert_eq!(
+            m.perm_at(0x8000_0000),
+            Some(PERM_READ | PERM_WRITE | PERM_VTAINT)
+        );
+        // Untouched tail (outside the seeded range) carries no VTAINT.
+        assert_eq!(m.perm_at(0x8000_0004), Some(PERM_READ | PERM_WRITE));
+        // Gather (the `Bus::read_raw_state` load-taint source) sees the seeded bytes as tainted,
+        // even though they carry no PERM_RAW (KMSAN *permits* the read, unlike RAW's fault).
+        assert_eq!(m.read_raw_state(0x8000_0000, 4), 0x0101_0101);
+        assert_eq!(m.read_u8(0x8000_0000).unwrap(), 0); // VTAINT alone never faults a read
+        // Clearing un-seeds without disturbing R/W.
+        m.set_vtaint(0x8000_0000, 4, false).unwrap();
+        assert_eq!(m.perm_at(0x8000_0000), Some(PERM_READ | PERM_WRITE));
+        assert_eq!(m.read_raw_state(0x8000_0000, 4), 0);
+    }
+
+    #[test]
+    fn read_raw_state_ors_raw_and_vtaint() {
+        let mut m = Mmu::new(0x8000_0000, 0x1000);
+        // Byte 0: RAW only. Byte 1: VTAINT only. Byte 2: both. Byte 3: neither.
+        m.protect(0x8000_0000, 1, PERM_READ | PERM_WRITE | PERM_RAW).unwrap();
+        m.protect(0x8000_0001, 1, PERM_READ | PERM_WRITE | PERM_VTAINT).unwrap();
+        m.protect(0x8000_0002, 1, PERM_READ | PERM_WRITE | PERM_RAW | PERM_VTAINT).unwrap();
+        m.protect(0x8000_0003, 1, PERM_READ | PERM_WRITE).unwrap();
+        assert_eq!(m.read_raw_state(0x8000_0000, 4), 0x0001_0101);
+    }
+
+    #[test]
+    fn write_shadow_is_an_exact_overwrite_not_an_or() {
+        let mut m = Mmu::new(0x8000_0000, 0x1000);
+        m.protect(0x8000_0000, 4, PERM_READ | PERM_WRITE | PERM_VTAINT).unwrap();
+        // Scatter taint=clean into bytes 0/1/3 (bits 0/8/24 clear), tainted into byte 2 (bit16 set).
+        m.write_shadow(0x8000_0000, 4, 0x0001_0000);
+        assert_eq!(m.perm_at(0x8000_0000), Some(PERM_READ | PERM_WRITE));
+        assert_eq!(m.perm_at(0x8000_0001), Some(PERM_READ | PERM_WRITE));
+        assert_eq!(m.perm_at(0x8000_0002), Some(PERM_READ | PERM_WRITE | PERM_VTAINT));
+        assert_eq!(m.perm_at(0x8000_0003), Some(PERM_READ | PERM_WRITE));
+        // Overwriting the whole span with all-tainted works too.
+        m.write_shadow(0x8000_0000, 4, 0xffff_ffff);
+        assert_eq!(m.read_raw_state(0x8000_0000, 4), 0x0101_0101);
+    }
+
+    #[test]
+    fn cow_ram_write_shadow_taints_overlay_not_golden() {
+        let mut m = Mmu::new(0x8000_0000, 0x4000);
+        m.protect(0x8000_0000, 0x4000, PERM_READ | PERM_WRITE).unwrap();
+        let golden = Arc::new(Golden::from_mmu(&m));
+        let mut cow = CowRam::new(golden);
+
+        assert_eq!(cow.read_raw_state(0x8000_0000, 4), 0);
+        assert!(!cow.is_overlaid(0));
+
+        cow.write_shadow(0x8000_0000, 4, 0x0000_0001); // taint byte 0 only
+        assert!(cow.is_overlaid(0)); // mutating VTAINT COWs the page
+        assert_eq!(cow.read_raw_state(0x8000_0000, 4), 0x0000_0001);
+        assert_eq!(cow.perm_at(0x8000_0000), Some(PERM_READ | PERM_WRITE | PERM_VTAINT));
+
+        // A second, independent `CowRam` over the same golden never observes the first's taint.
+        let cow2 = CowRam::new(cow_golden_of(&cow));
+        assert_eq!(cow2.read_raw_state(0x8000_0000, 4), 0);
+
+        cow.reset();
+        assert!(!cow.is_overlaid(0));
+        assert_eq!(cow.read_raw_state(0x8000_0000, 4), 0);
+    }
+
+    /// Test-only helper: hand back the same `Arc<Golden>` a `CowRam` was built over, so a second
+    /// independent lane over that identical golden image can be constructed for the isolation
+    /// check above (mirrors how multiple lanes/cores share one `Arc<Golden>` in the real COW design).
+    fn cow_golden_of(cow: &CowRam) -> Arc<Golden> {
+        Arc::clone(&cow.golden)
     }
 }
