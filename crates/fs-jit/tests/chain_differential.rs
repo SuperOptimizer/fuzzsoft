@@ -1257,4 +1257,81 @@ mod load_store {
             check_ls_program(&words, regs, 0);
         }
     }
+
+    // ---------------------------------------------------------------------------------------
+    // `fs_platform::CowMachine`: `fs-cli`'s `--jobs`-path parallel fuzzing drives `ChainCache`
+    // over a per-thread `CowMachine` (a copy-on-write overlay over a shared `Arc<Golden>` RAM
+    // image), not `Machine` — a genuinely different `Bus` impl every test above never exercises.
+    // Re-run the identical random ALU/Load/Store/terminal sweep with the chain side driven over a
+    // `CowMachine` instead, to catch any assumption in `sys.rs`'s fat-pointer decompose/recompose
+    // or the load/store call-out shims that happens to hold for `Machine`'s vtable but not
+    // `CowMachine`'s. The interpreter-side reference oracle stays on the already-proven `Machine`
+    // path; only the compiled-chain side changes bus type, isolating exactly what's new here.
+    fn fresh_cow_machine(bytes: &[u8]) -> fs_platform::CowMachine {
+        let mut m = fs_platform::Machine::new(RAM_BASE, RAM_SIZE);
+        m.ram.protect(RAM_BASE, CODE_LEN, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+        m.ram.protect(GOOD_DATA, GOOD_DATA_LEN, PERM_READ | PERM_WRITE).unwrap();
+        // BAD_DATA is deliberately left with perms=0 (unprotected): any access there faults.
+        m.ram.map(RAM_BASE, bytes, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+        let golden = std::sync::Arc::new(fs_mmu::Golden::from_mmu(&m.ram));
+        fs_platform::CowMachine::from_golden(golden, RAM_BASE, RAM_SIZE)
+    }
+
+    /// [`check_ls_program`]'s twin, but the compiled-chain side runs over a fresh `CowMachine`
+    /// (built from an identical golden image) instead of a fresh `Machine`.
+    fn check_ls_program_cow(words: &[u32], initial_regs: [u32; 32], regs0_garbage: u32) {
+        let bytes = assemble(words);
+
+        let mut m_i = fresh_machine(&bytes);
+        let mut cpu_i = Cpu::new(RAM_BASE);
+        cpu_i.regs = initial_regs;
+        cpu_i.regs[0] = regs0_garbage;
+        cpu_i.htif_tohost = Some(BAD_DATA + 0x800);
+        let exit_i = run_reference_once(&mut cpu_i, &mut m_i, words, RAM_BASE);
+
+        let mut m_j = fresh_cow_machine(&bytes);
+        let mut cpu_j = Cpu::new(RAM_BASE);
+        cpu_j.regs = initial_regs;
+        cpu_j.regs[0] = regs0_garbage;
+        cpu_j.htif_tohost = Some(BAD_DATA + 0x800);
+        let mut cache = ChainCache::with_capacity(256, 256);
+        let exit_j = cache.run_block(&mut cpu_j, &mut m_j, &mut |_| true);
+
+        assert_eq!(exit_i, exit_j, "SysExit mismatch (CowMachine)\nprogram={words:02x?}");
+        assert_eq!(cpu_i.regs, cpu_j.regs, "register mismatch (CowMachine)\nprogram={words:02x?}");
+        assert_eq!(cpu_i.pc, cpu_j.pc, "pc mismatch (CowMachine)\nprogram={words:02x?}");
+        assert_eq!(
+            cpu_i.insns_retired, cpu_j.insns_retired,
+            "insns_retired mismatch (CowMachine)\nprogram={words:02x?}"
+        );
+        assert!(
+            cpu_j.jit_pending_trap.is_none(),
+            "jit_pending_trap must be drained after run_block (CowMachine)"
+        );
+    }
+
+    #[test]
+    fn random_alu_load_store_chains_match_interpreter_over_cow_machine() {
+        let mut rng = Rng::new(0xC0DE_C0DE_FEED_9999);
+        const ITERATIONS: usize = 3_000;
+        for _ in 0..ITERATIONS {
+            let n = rng.range(10); // 0..=9 mixed ALU/Load/Store instructions
+            let mut words = Vec::new();
+            for _ in 0..n {
+                if rng.bool() {
+                    words.push(random_alu_insn(&mut rng));
+                } else {
+                    words.push(random_ls_insn(&mut rng));
+                }
+            }
+            if rng.bool() {
+                words.push(random_terminal_insn(&mut rng, words.len() as i32 * 4));
+            } else {
+                words.push(ecall());
+            }
+            let regs = seeded_regs(&mut rng);
+            let regs0_garbage = if rng.bool() { rng.next_u32() } else { 0 };
+            check_ls_program_cow(&words, regs, regs0_garbage);
+        }
+    }
 }

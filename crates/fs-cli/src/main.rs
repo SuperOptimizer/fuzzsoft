@@ -1062,10 +1062,11 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
                 i += 1;
                 continue;
             }
-            // Phase 1 chain-JIT (`docs/jit-scalar-design.md`): native x86-64 codegen for chained
-            // ALU/branch runs, admission-guarded against the CLINT timer, falling back to the
-            // interpreter for everything else (Load/Store/Mul/Ecall/CSR/...). Opt-in, off by
-            // default, serial-only (same footprint as `--jit`).
+            // Phase 1/2 chain-JIT (`docs/jit-scalar-design.md`): native x86-64 codegen for chained
+            // ALU/branch/Load/Store runs, admission-guarded against the CLINT timer, falling back
+            // to the interpreter for everything else (Mul/Ecall/CSR/...). Opt-in, off by default.
+            // Unlike `--jit`, this DOES compose with `--jobs > 1`: each worker builds its own
+            // per-thread `ChainCache` (see `run_parallel`'s doc comment).
             "--jit-chain" => {
                 jit_chain = true;
                 i += 1;
@@ -1189,10 +1190,9 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
             eprintln!("fuzz: --jobs > 1 is incompatible with --jit in this first cut (serial-only)");
             return ExitCode::FAILURE;
         }
-        if jit_chain {
-            eprintln!("fuzz: --jobs > 1 is incompatible with --jit-chain in this first cut (serial-only)");
-            return ExitCode::FAILURE;
-        }
+        // --jit-chain DOES compose with --jobs > 1 (unlike Stage 0's --jit, still serial-only
+        // above): each worker builds its own per-thread `ChainCache` (own W^X arena) right where it
+        // builds its `CowMachine`/`Cpu`/`Rng` below — see `run_parallel`'s per-worker setup.
         if ubsan {
             eprintln!("fuzz: --jobs > 1 is incompatible with --ubsan in this first cut (serial-only)");
             return ExitCode::FAILURE;
@@ -1253,7 +1253,7 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
         return run_parallel(
             golden, golden_cpu, golden_clint, golden_ram_base, golden_ram_size, scratch, prog_pas,
             scratch_pas, base_uart, case_insns, cases, seed, jobs, corpus_dir, seed_virgin,
-            seed_corpus, fail_inject,
+            seed_corpus, fail_inject, jit_chain,
         );
     }
 
@@ -1664,6 +1664,48 @@ fn reset_cow(
     m.uart.out.truncate(base_uart);
 }
 
+/// Run one fuzz case via the Phase 1/2 native chain-JIT (`fs_jit::ChainCache`) over any
+/// [`GuestBus`] — the `--jobs`-path analogue of `run_case_jit_chain` (which is `Machine`-only,
+/// serial). Identical loop shape and `take_last_edge` coverage bookkeeping as the serial version.
+///
+/// The golden-page predicate is `&mut |_| true` here too, exactly like the serial path
+/// (`run_case_jit`/`run_case_jit_chain` above) and Stage 0's own `BlockCache` — see `fs-jit`'s
+/// module doc: the cache is "never invalidated" once an entry is inserted, which is sound only
+/// because the boot+syscall-fuzz workload is assumed to never self-modify code, a workload
+/// property that doesn't depend on which backing store (`Machine`'s owned `Mmu` vs. a worker's
+/// per-thread `CowRam` overlay over the shared golden image) is driving it. Using the same
+/// predicate here (rather than a `CowRam::is_overlaid`-aware check) also sidesteps a real borrow
+/// conflict a `CowMachine`-aware predicate would hit: `ChainCache::run_block` takes `bus: &mut dyn
+/// Bus` and `is_golden_page: &mut dyn FnMut(u32) -> bool` as two separate arguments, so a closure
+/// that read `m.ram.is_overlaid(..)` would need a live immutable borrow of `m` at the same time
+/// `m` itself is passed as the mutable `bus` argument — not allowed. Keeping `|_| true` avoids that
+/// entirely AND keeps `--jit-chain`'s coverage/corpus behavior identical between the serial and
+/// `--jobs` paths (no new assumption introduced just for the parallel case).
+fn run_case_jit_chain_bus<B: GuestBus>(
+    cpu: &mut fs_riscv::Cpu,
+    m: &mut B,
+    cache: &mut fs_jit::ChainCache,
+    cov: &mut fs_cov::CovBitmap,
+    deadline: u64,
+) -> fs_platform::Stop {
+    use fs_platform::Stop;
+    use fs_riscv::SysExit;
+    while cpu.insns_retired < deadline {
+        m.clint_mtime_set(cpu.virtual_time());
+        m.sync_timer(cpu);
+        match cache.run_block(cpu, m, &mut |_| true) {
+            SysExit::Continue => {
+                if let Some((from, to)) = cache.take_last_edge() {
+                    cov.record_edge(from, to);
+                }
+            }
+            SysExit::Halt(c) => return Stop::Halt(c),
+            SysExit::Hypercall(c) => return Stop::Hypercall(c),
+        }
+    }
+    Stop::Budget
+}
+
 /// Multi-core coverage-guided fuzzing: boot/snapshot happened once on the caller's thread, which
 /// captured one immutable `Arc<Golden>` RAM image (`docs/cow-shared-ram.md`). Here `jobs` worker
 /// threads each build their OWN `CowMachine` — a small per-thread page directory + overlay pages —
@@ -1673,6 +1715,15 @@ fn reset_cow(
 /// sharing one [`Shared`] (coverage map + corpus + crash set). This is "fuzz many kernels at once"
 /// at *core* granularity — orthogonal to fs-vec's SIMD-lane vectorization (which packs many guests
 /// per core).
+///
+/// When `jit_chain` is set, each worker ALSO builds its own per-thread [`fs_jit::ChainCache`] (own
+/// W^X native-code arena, `sys::Arena`) right alongside its `CowMachine`/`Cpu`/`Rng` — no arena is
+/// ever shared across threads (the arena is written during compile, so sharing one mutably would
+/// need locking; per-thread is simpler and the compiled-code memory cost per worker is small). A
+/// compiled chain is keyed purely by physical address and reads/writes `Cpu` state through
+/// `rdi`-relative offsets, so it doesn't actually care which `Cpu` instance dispatches it — sharing
+/// the *decode* half read-only across threads would be a legitimate follow-up, but per-worker
+/// everything is the correct, simple first cut this composes `--jit-chain` with `--jobs` on.
 #[allow(clippy::too_many_arguments)]
 fn run_parallel(
     golden: Arc<fs_mmu::Golden>,
@@ -1692,6 +1743,7 @@ fn run_parallel(
     seed_virgin: fs_cov::VirginMap,
     seed_corpus: Vec<fs_prog::Prog>,
     fail_inject: Option<u32>,
+    jit_chain: bool,
 ) -> ExitCode {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
@@ -1713,13 +1765,20 @@ fn run_parallel(
         "fuzz: parallel mode — {jobs} worker threads, {cases} cases total (shared golden RAM, CoW overlays)"
     );
 
-    std::thread::scope(|s| {
+    // Aggregate chain-JIT diagnostics across every worker's own per-thread `ChainCache`
+    // (`(chain_hits, chain_misses, fallbacks)`, summed), `None` when `--jit-chain` wasn't
+    // requested — collected via the workers' `ScopedJoinHandle` return values after the scope
+    // below joins every thread.
+    let jit_agg: Option<(u64, u64, u64)> = std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(jobs as usize);
         for tid in 0..jobs {
             // Each worker builds its own CowMachine sharing `golden` (the memory dedup — one
             // golden RAM image behind every thread's small directory + overlay pages) and clones
             // the golden hart; a distinct RNG stream per thread. `golden_cpu`/`golden_clint`/
             // `prog_pas`/`scratch_pas`/`shared`/`counter`/`t0` are shared immutably by reference
-            // (thread::scope lets us borrow the stack).
+            // (thread::scope lets us borrow the stack). When `jit_chain` is set, each worker ALSO
+            // builds its own `ChainCache` here (own W^X arena — see `run_parallel`'s doc comment
+            // for why this stays per-thread rather than shared).
             let mut cpu_t = golden_cpu.clone();
             let mut m_t = fs_platform::CowMachine::from_golden(Arc::clone(&golden), ram_base, ram_size);
             let seed_t = seed.wrapping_add(tid.wrapping_mul(0x9E37_79B9)).max(1);
@@ -1730,9 +1789,10 @@ fn run_parallel(
             let prog_pas = &prog_pas;
             let scratch_pas = &scratch_pas;
             let t0 = &t0;
-            s.spawn(move || {
+            let handle = s.spawn(move || {
                 let mut rng = fs_prog::Rng::new(seed_t);
                 let mut run_map = fs_cov::CovBitmap::new();
+                let mut jit_chain_cache = jit_chain.then(fs_jit::ChainCache::new);
                 loop {
                     let case = counter.fetch_add(1, Ordering::Relaxed);
                     if case >= cases {
@@ -1768,7 +1828,11 @@ fn run_parallel(
 
                     run_map.clear();
                     let deadline = cpu_t.insns_retired + case_insns;
-                    let stop = run_case_bus(&mut cpu_t, &mut m_t, &mut run_map, deadline);
+                    let stop = if let Some(cache) = jit_chain_cache.as_mut() {
+                        run_case_jit_chain_bus(&mut cpu_t, &mut m_t, cache, &mut run_map, deadline)
+                    } else {
+                        run_case_bus(&mut cpu_t, &mut m_t, &mut run_map, deadline)
+                    };
                     let used = cpu_t.insns_retired - case_start;
                     let uart = m_t.uart_out();
                     let out = &uart[base_uart.min(uart.len())..];
@@ -1831,8 +1895,20 @@ fn run_parallel(
                         );
                     }
                 }
+                jit_chain_cache.as_ref().map(|c| (c.chain_hits(), c.chain_misses(), c.fallbacks()))
             });
+            handles.push(handle);
         }
+        let mut agg = (0u64, 0u64, 0u64);
+        for h in handles {
+            if let Some((hits, misses, fallbacks)) = h.join().expect("fuzz worker thread panicked")
+            {
+                agg.0 += hits;
+                agg.1 += misses;
+                agg.2 += fallbacks;
+            }
+        }
+        jit_chain.then_some(agg)
     });
 
     let elapsed = t0.elapsed().as_secs_f64();
@@ -1848,6 +1924,11 @@ fn run_parallel(
     println!("  coverage      : {} bitmap buckets", sh.virgin.covered_buckets());
     println!("  corpus        : {} programs", sh.corpus.len());
     println!("  kernel crashes: {}  ({} unique kernel PCs)", sh.crashes, sh.crash_sigs.len());
+    if let Some((hits, misses, fallbacks)) = jit_agg {
+        println!(
+            "  chain-jit     : {hits} native chains, {misses} compiles, {fallbacks} fallback single-steps (summed over {jobs} per-thread ChainCaches)  [Phase 1, docs/jit-scalar-design.md]"
+        );
+    }
     println!(
         "  guest speed   : {mips:.0} MIPS aggregate ({} insns/case avg)",
         sh.total_case_insns / sh.finished.max(1)
