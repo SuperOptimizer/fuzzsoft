@@ -1629,10 +1629,18 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Coverage + corpus + crash bookkeeping shared by all worker threads, behind one mutex. The
-/// expensive part (emulating a case) happens *outside* the lock; the lock is only taken to pick a
-/// mutation base and to fold a finished case's coverage/crash back in — cheap next to millions of
-/// guest instructions per case.
+/// Coverage + corpus + crash bookkeeping shared by all worker threads, behind one mutex — the
+/// single AUTHORITATIVE copy of each. The expensive part (emulating a case) always happens
+/// *outside* the lock. Unlike an earlier version of this fuzzer, the lock is no longer taken on
+/// every case either: each worker in [`run_parallel`] keeps its own thread-local snapshot of
+/// `virgin` (a `VirginMap` clone) and `corpus` (an append-only `Vec<Prog>` prefix copy), samples
+/// mutation bases and checks for "did this run find anything new" against that LOCAL snapshot with
+/// no lock at all, and only takes this mutex when (a) the local check says "maybe new" (rare — the
+/// whole point of coverage-guided fuzzing), (b) a case crashes (rare), or (c) a periodic
+/// `SYNC_INTERVAL`-case refresh is due (bounds snapshot staleness). See `run_parallel`'s doc comment
+/// and `docs/roadmap.md` T1.1 for the invariant that makes this sound (a thread-local snapshot only
+/// ever lags this shared copy, never leads it, so "not new locally" is a hard guarantee of "not new
+/// here" too).
 struct Shared {
     virgin: fs_cov::VirginMap,
     corpus: Vec<fs_prog::Prog>,
@@ -1790,24 +1798,45 @@ fn run_parallel(
             let scratch_pas = &scratch_pas;
             let t0 = &t0;
             let handle = s.spawn(move || {
+                // Refresh interval, in cases-per-thread: bounds how stale this worker's local
+                // corpus/virgin snapshots can get before it re-syncs with `shared` (see the
+                // `Shared` doc comment and this function's doc comment for the invariant this
+                // relies on). Small enough that a thread notices other threads' new coverage/
+                // corpus entries promptly; large enough that the shared mutex is touched a tiny
+                // fraction of per-case-frequency (docs/roadmap.md T1.1).
+                const SYNC_INTERVAL: u64 = 64;
+
                 let mut rng = fs_prog::Rng::new(seed_t);
                 let mut run_map = fs_cov::CovBitmap::new();
                 let mut jit_chain_cache = jit_chain.then(fs_jit::ChainCache::new);
+
+                // Thread-local snapshots, seeded from the real shared state once up front (rather
+                // than starting empty) so the first SYNC_INTERVAL cases don't spuriously look
+                // "new" against nothing, and do sample mutation bases from the real seed corpus.
+                let (mut local_virgin, mut local_corpus) = {
+                    let sh = shared.lock().unwrap();
+                    (sh.virgin.clone(), sh.corpus.clone())
+                };
+                // Local stat accumulators, flushed into `shared` only when the lock is actually
+                // taken (periodic sync / new coverage / crash) instead of every case.
+                let mut local_insns = 0u64;
+                let mut local_done = 0u32;
+                let mut local_budget = 0u32;
+                let mut local_finished = 0u64;
+                let mut cases_since_sync = 0u64;
+
                 loop {
                     let case = counter.fetch_add(1, Ordering::Relaxed);
                     if case >= cases {
                         break;
                     }
 
-                    // Pick a mutation base (or decide to generate) under the lock, then release it
-                    // before the expensive emulation.
-                    let base = {
-                        let sh = shared.lock().unwrap();
-                        if !sh.corpus.is_empty() && rng.chance(85) {
-                            Some(sh.corpus[rng.below(sh.corpus.len())].clone())
-                        } else {
-                            None
-                        }
+                    // Pick a mutation base (or decide to generate) from the LOCAL corpus
+                    // snapshot — no lock on the hot path.
+                    let base = if !local_corpus.is_empty() && rng.chance(85) {
+                        Some(local_corpus[rng.below(local_corpus.len())].clone())
+                    } else {
+                        None
                     };
                     let prog = match base {
                         Some(b) => fs_prog::mutate(&mut rng, &b),
@@ -1840,42 +1869,90 @@ fn run_parallel(
                     let crash_console =
                         crash.map(|sig| (sig, String::from_utf8_lossy(out).into_owned()));
 
-                    // Fold results back in under the lock.
-                    let mut sh = shared.lock().unwrap();
-                    sh.total_case_insns += used;
+                    // Fold into LOCAL accumulators — no lock.
+                    local_insns += used;
                     match stop {
-                        fs_platform::Stop::Hypercall(HC_DONE) => sh.done += 1,
-                        fs_platform::Stop::Budget => sh.budget_hit += 1,
+                        fs_platform::Stop::Hypercall(HC_DONE) => local_done += 1,
+                        fs_platform::Stop::Budget => local_budget += 1,
                         _ => {}
                     }
-                    if sh.virgin.has_new_bits(&run_map) {
-                        sh.corpus.push(prog.clone());
+                    local_finished += 1;
+                    cases_since_sync += 1;
+
+                    // Cheap, thread-local, unlocked pre-check: did this run light up a bucket/
+                    // class this thread's OWN snapshot hasn't seen? `local_virgin` is only ever a
+                    // clone of a past (or equal) `shared.virgin`, refreshed below, and otherwise
+                    // only advanced by this same thread's own run_maps — so it can never be ahead
+                    // of `shared.virgin`. That makes "no new bits vs local" a hard guarantee of
+                    // "no new bits vs shared" too (transitivity), so the overwhelming majority of
+                    // cases (new coverage is rare, by construction of coverage-guided fuzzing)
+                    // skip the shared lock entirely. "Yes" just means "go check the authoritative
+                    // map" — it can still turn out to be a false positive if another thread found
+                    // the same bits first, which the authoritative check below handles.
+                    let locally_new = local_virgin.has_new_bits(&run_map);
+                    let has_crash = crash_console.is_some();
+                    let due_for_sync = cases_since_sync >= SYNC_INTERVAL;
+
+                    if !locally_new && !has_crash && !due_for_sync {
+                        continue; // no lock this case
                     }
+
                     let mut new_crash: Option<u32> = None;
-                    if let Some((sig, console)) = crash_console {
-                        sh.crashes += 1;
-                        if sh.crash_sigs.insert(sig) {
-                            let names: Vec<&str> = prog.calls.iter().map(|c| c.desc.name).collect();
-                            eprintln!(
-                                "fuzz: [KERNEL CRASH] epc={sig:#010x} thread {tid} calls={names:?}"
-                            );
-                            eprintln!("{console}");
-                            new_crash = Some(sig); // minimize *after* dropping the lock
+                    {
+                        let mut sh = shared.lock().unwrap();
+                        // Flush this thread's local stat deltas into the authoritative counters.
+                        sh.total_case_insns += local_insns;
+                        sh.done += local_done;
+                        sh.budget_hit += local_budget;
+                        let finished_before = sh.finished;
+                        sh.finished += local_finished;
+                        local_insns = 0;
+                        local_done = 0;
+                        local_budget = 0;
+                        local_finished = 0;
+
+                        // Authoritative coverage merge — only actually consulted when the local
+                        // pre-check flagged something, so this stays rare.
+                        if locally_new && sh.virgin.has_new_bits(&run_map) {
+                            sh.corpus.push(prog.clone());
                         }
+                        if let Some((sig, console)) = &crash_console {
+                            sh.crashes += 1;
+                            if sh.crash_sigs.insert(*sig) {
+                                let names: Vec<&str> =
+                                    prog.calls.iter().map(|c| c.desc.name).collect();
+                                eprintln!(
+                                    "fuzz: [KERNEL CRASH] epc={sig:#010x} thread {tid} calls={names:?}"
+                                );
+                                eprintln!("{console}");
+                                new_crash = Some(*sig); // minimize *after* dropping the lock
+                            }
+                        }
+                        // Progress print on every 2000-case boundary crossed by this flush (a
+                        // batched flush can jump past an exact multiple, so check the crossing
+                        // rather than equality).
+                        if sh.finished / 2000 > finished_before / 2000 {
+                            eprintln!(
+                                "fuzz: {} cases | {} cov | corpus {} | {} kcrash ({} uniq) | {:.0} exec/s",
+                                sh.finished,
+                                sh.virgin.covered_buckets(),
+                                sh.corpus.len(),
+                                sh.crashes,
+                                sh.crash_sigs.len(),
+                                sh.finished as f64 / t0.elapsed().as_secs_f64(),
+                            );
+                        }
+
+                        // Refresh this thread's local snapshots from the now-authoritative shared
+                        // state, bounding staleness to SYNC_INTERVAL cases (or "found something
+                        // new" / "crashed", whichever is sooner) — so a thread eventually learns
+                        // about coverage/corpus other threads contributed too.
+                        local_virgin = sh.virgin.clone();
+                        if sh.corpus.len() > local_corpus.len() {
+                            local_corpus.extend_from_slice(&sh.corpus[local_corpus.len()..]);
+                        }
+                        cases_since_sync = 0;
                     }
-                    sh.finished += 1;
-                    if sh.finished.is_multiple_of(2000) {
-                        eprintln!(
-                            "fuzz: {} cases | {} cov | corpus {} | {} kcrash ({} uniq) | {:.0} exec/s",
-                            sh.finished,
-                            sh.virgin.covered_buckets(),
-                            sh.corpus.len(),
-                            sh.crashes,
-                            sh.crash_sigs.len(),
-                            sh.finished as f64 / t0.elapsed().as_secs_f64(),
-                        );
-                    }
-                    drop(sh);
 
                     // Minimize + write the reproducer outside the lock (it re-runs the guest ~n²
                     // times on this thread's own state, dropping overlays between candidates via
@@ -1894,6 +1971,15 @@ fn run_parallel(
                             base_uart,
                         );
                     }
+                }
+                // Final flush: any local stats accumulated since the last sync (< SYNC_INTERVAL
+                // cases) would otherwise be silently dropped when this thread exits.
+                {
+                    let mut sh = shared.lock().unwrap();
+                    sh.total_case_insns += local_insns;
+                    sh.done += local_done;
+                    sh.budget_hit += local_budget;
+                    sh.finished += local_finished;
                 }
                 jit_chain_cache.as_ref().map(|c| (c.chain_hits(), c.chain_misses(), c.fallbacks()))
             });

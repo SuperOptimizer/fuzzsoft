@@ -140,6 +140,7 @@ impl Default for CovBitmap {
 /// signal: true means this run reached a bucket that was never hit before, or hit an
 /// already-seen bucket enough more times to cross into a new class -- i.e. "add this input to
 /// the corpus".
+#[derive(Clone)]
 pub struct VirginMap {
     /// Highest class (0..=8, see `classify_count`) seen per bucket so far.
     classes: Box<[u8]>,
