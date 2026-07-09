@@ -11,7 +11,7 @@
 //! before `name_hi` — see `include/asm-generic/compat.h`), confirmed against each syscall's
 //! `COMPAT_SYSCALL_DEFINE*` in `fs/read_write.c` / `fs/open.c` / `fs/sync.c`.
 
-use crate::resource::{FD, KEY, SOCK, VMA};
+use crate::resource::{EPOLL, FD, KEY, SOCK, VMA};
 use crate::types::ArgType;
 use crate::types::ArgType::*;
 use crate::types::Dir::*;
@@ -1340,7 +1340,12 @@ pub static SYSCALLS: &[SyscallDesc] = &[
         ],
         produces: Produces::Ret(FD),
     },
-    // 21. epoll_create1(20): flags -> fd
+    // 21. epoll_create1(20): flags -> fd. Produces EPOLL (a distinct subtype of FD — see
+    //     resource::EPOLL's doc comment) rather than a bare FD: every existing Res(FD) consumer
+    //     (close, epoll_ctl's own target-fd slot below) still accepts it via kind_compat's
+    //     subtype chain, but the generator can now tell "this fd is specifically an epoll
+    //     instance" apart from every other fd producer — the tag T2.4's cross-referencing bias
+    //     keys off of.
     SyscallDesc {
         name: "epoll_create1",
         nr: 20,
@@ -1348,19 +1353,30 @@ pub static SYSCALLS: &[SyscallDesc] = &[
             vals: EPOLL_CREATE_FLAGS,
             bitmask: true,
         }],
-        produces: Produces::Ret(FD),
+        produces: Produces::Ret(EPOLL),
     },
     // 22. epoll_ctl(21): epfd, op, fd, event(in,nullable for EPOLL_CTL_DEL) -> int32
+    //     epfd is declared Res(EPOLL) (not the generic Res(FD)) on purpose: the kernel's
+    //     do_epoll_ctl() rejects any fd whose f_op != &eventpoll_fops before doing anything else,
+    //     so a bare unrelated fd here only ever exercises that one shallow early-return — the
+    //     interesting nesting/cycle-check code is reachable only when epfd genuinely is an epoll
+    //     instance. Requiring Res(EPOLL) means epfd is either a live epoll_create1 producer or one
+    //     of EPOLL's own (clearly-invalid) seed literals, so that shallow error path is still
+    //     reached via seeds, just no longer dilutes the interesting path's odds. The target `fd`
+    //     stays the broad Res(FD): it genuinely can be any fd kind, epoll included (EPOLL is a
+    //     subtype of FD, so this slot already accepts an epoll_create1 output) — that's what makes
+    //     epoll->epoll nesting (and, wired right, a containment cycle) expressible at all. See
+    //     docs/roadmap.md T2.4 / docs/bug-finding.md's epoll loop-check overflow.
     SyscallDesc {
         name: "epoll_ctl",
         nr: 21,
         args: &[
-            Res(FD), // epfd, ideally an epoll_create1 producer
+            Res(EPOLL), // epfd: must actually be an epoll instance to reach interesting code
             Flags {
                 vals: EPOLL_OP,
                 bitmask: false,
             },
-            Res(FD), // the fd being watched
+            Res(FD), // the fd being watched — any fd kind, including another epoll fd
             Ptr {
                 dir: In,
                 inner: &EPOLL_EVENT,
@@ -1371,12 +1387,14 @@ pub static SYSCALLS: &[SyscallDesc] = &[
     },
     // 23. epoll_pwait(22): REAL rv32 nr is epoll_pwait, not plain epoll_wait (no epoll_wait on
     //     rv32's asm-generic table). epfd, events(out), maxevents, timeout_ms, sigmask(in,
-    //     nullable), sigsetsize=len(sigmask) -> int32
+    //     nullable), sigsetsize=len(sigmask) -> int32. epfd is Res(EPOLL) for the same reason as
+    //     epoll_ctl's epfd above: a non-epoll fd here is rejected immediately, before anything
+    //     interesting happens.
     SyscallDesc {
         name: "epoll_pwait",
         nr: 22,
         args: &[
-            Res(FD),
+            Res(EPOLL),
             Ptr {
                 dir: Out,
                 inner: &EPOLL_EVENT,

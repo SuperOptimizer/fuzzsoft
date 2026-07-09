@@ -18,6 +18,21 @@ use crate::types::{ArgType, Field, LenSpec, SyscallDesc};
 /// subset.
 pub(crate) const DICT_BIAS_PCT: u32 = 15;
 
+/// Chance (out of 100) that, when generating/mutating a `Res`-typed arg in a call that has
+/// *already* bound an earlier `Res` arg to some specific live resource (an "anchor" — see
+/// [`same_call_anchors`]), this arg instead wires to a *different* live resource of that exact
+/// same specific kind (a "sibling"), when one exists — rather than falling through to
+/// [`pick_res`]'s undiscriminating whole-kind pool. This is the T2.4 same-kind cross-reference /
+/// cycle-building bias (`docs/roadmap.md` T2.4, `docs/bug-finding.md`'s epoll loop-check
+/// overflow): without it, a call shaped like `epoll_ctl(epfd, op, fd, event)` treats every fd
+/// producer in the pool as fungible, so an epoll_create1-produced epfd's *target* fd argument is
+/// diluted across every other unrelated fd producer (openat/socket/pipe2/...) instead of
+/// preferentially wiring to another live epoll instance — the shape needed for epoll->epoll
+/// nesting (and, wired right across several such calls, a genuine containment cycle). Kept a
+/// bias, not mandatory, so ordinary "wire to an unrelated fd" diversity is preserved. See
+/// [`pick_res_biased`].
+pub(crate) const CROSS_REF_BIAS_PCT: u32 = 55;
+
 /// One live resource in the program-under-construction: `desc.produces`' `slot`-th resource,
 /// produced by call `call_idx`. `pub(crate)` so `mutate` can share this exact pool
 /// representation instead of re-deriving it.
@@ -104,6 +119,23 @@ pub static RECIPES: &[&[&str]] = &[
     &["add_key", "keyctl$describe", "keyctl$read", "keyctl$revoke"],
     // T2.1 wave 15: cross-process memory access, both directions back to back.
     &["process_vm_writev", "process_vm_readv"],
+    // T2.4: three same-kind epoll instances back to back, then three epoll_ctl calls. This
+    // doesn't by itself force the exact A->B->C->A containment cycle (call *values* are still
+    // resolved organically by generate_args/pick_res_biased per the RECIPES doc comment above),
+    // but it puts >=2 sibling epoll instances in the pool *before* any epoll_ctl call generates,
+    // which is the precondition `pick_res_biased`'s cross-reference bias needs to have anything
+    // to wire epoll_ctl's target-fd toward. Without this shape, getting >=3 epoll_create1 calls
+    // into one organically-generated 8-call program is vanishingly rare (measured ~0 in T4.2's
+    // 300k-case campaign corpus) since epoll_create1 competes uniformly with 90+ other
+    // descriptions. See docs/roadmap.md T2.4 / docs/bug-finding.md's epoll loop-check overflow.
+    &[
+        "epoll_create1",
+        "epoll_create1",
+        "epoll_create1",
+        "epoll_ctl",
+        "epoll_ctl",
+        "epoll_ctl",
+    ],
 ];
 
 fn find_desc(name: &str) -> Option<&'static SyscallDesc> {
@@ -203,11 +235,83 @@ pub fn generate_args(
                 };
                 ArgValue::Imm(sz as u64)
             }
+            // Special-cased (rather than falling through to `gen_arg_value`) so the
+            // cross-reference bias can see what this same call has already bound to an earlier
+            // `Res` arg — see `CROSS_REF_BIAS_PCT`/`pick_res_biased`.
+            ArgType::Res(kind) => {
+                let anchors = same_call_anchors(&pool, &args, None);
+                ArgValue::Res(pick_res_biased(rng, *kind, &pool, &anchors))
+            }
             _ => gen_arg_value(rng, aty, &pool),
         };
         args.push(av);
     }
     args
+}
+
+/// The live resources this same call has already bound in an earlier `Res` arg (excluding
+/// `exclude_idx`, if given — used when re-rolling one arg of an already-fully-populated call
+/// during mutation, so the arg's own current/stale binding doesn't count as its own anchor).
+/// These are the "anchors" [`pick_res_biased`] tries to wire a *sibling* same-kind resource
+/// against — e.g. once `epoll_ctl`'s `epfd` arg (index 0) is bound to a live `epoll_create1`
+/// output, that becomes an anchor when generating/mutating the `fd` arg (index 2) right after.
+pub(crate) fn same_call_anchors(
+    pool: &[PoolEntry],
+    call_args: &[ArgValue],
+    exclude_idx: Option<usize>,
+) -> Vec<PoolEntry> {
+    call_args
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| exclude_idx != Some(*i))
+        .filter_map(|(_, av)| match av {
+            ArgValue::Res(ResRef::Produced { call_idx, slot }) => pool
+                .iter()
+                .find(|e| e.call_idx == *call_idx && e.slot == *slot)
+                .copied(),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Like [`pick_res`], but first tries the T2.4 same-kind cross-reference bias: if `anchors` is
+/// nonempty and the bias roll (`CROSS_REF_BIAS_PCT`) fires, look for a live resource in `pool`
+/// that shares an anchor's *exact* kind (not just `kind_compat`-compatible with `want` — the
+/// point is connecting two resources of the *same specific* kind, e.g. two epoll instances, not
+/// just two arbitrary fds) and isn't the anchor itself (so a call never wires an arg to the
+/// literal same resource its own sibling arg already used — e.g. `epoll_ctl(A, ADD, A)`, which
+/// the kernel rejects anyway). Falls back to plain `pick_res` whenever no anchor's kind is even
+/// `want`-compatible, no such sibling exists, or the bias roll doesn't fire — so ordinary
+/// resource threading is unaffected for the common case (calls with 0 or 1 `Res` arg, which is
+/// most of `SYSCALLS`).
+pub(crate) fn pick_res_biased(
+    rng: &mut Rng,
+    want: ResourceKind,
+    pool: &[PoolEntry],
+    anchors: &[PoolEntry],
+) -> ResRef {
+    if !anchors.is_empty() && rng.chance(CROSS_REF_BIAS_PCT) {
+        for anchor in anchors {
+            if !kind_compat(want, anchor.kind) {
+                continue;
+            }
+            let siblings: Vec<&PoolEntry> = pool
+                .iter()
+                .filter(|e| {
+                    e.kind == anchor.kind
+                        && !(e.call_idx == anchor.call_idx && e.slot == anchor.slot)
+                })
+                .collect();
+            if !siblings.is_empty() {
+                let e = **rng.pick(&siblings);
+                return ResRef::Produced {
+                    call_idx: e.call_idx,
+                    slot: e.slot,
+                };
+            }
+        }
+    }
+    pick_res(rng, want, pool)
 }
 
 /// The byte length `lower()` will actually give the value at `(aty, av)` — what a sibling
@@ -738,6 +842,263 @@ mod tests {
         assert!(
             saw_a_dict_only_bit,
             "never observed a dictionary-injected bit outside openat's own OPEN_FLAGS union"
+        );
+    }
+
+    /// Returns `true` iff `p` contains an `epoll_ctl` call whose target-fd arg (index 2) is a
+    /// `Produced` reference to a live `epoll_create1` call — i.e. a genuine epoll->epoll
+    /// cross-reference, the shape the epoll loop-check overflow (docs/bug-finding.md) needs.
+    fn has_epoll_into_epoll_link(p: &Prog) -> bool {
+        p.calls.iter().any(|c| {
+            c.desc.name == "epoll_ctl"
+                && matches!(
+                    c.args[2],
+                    ArgValue::Res(ResRef::Produced { call_idx, .. })
+                        if p.calls[call_idx as usize].desc.name == "epoll_create1"
+                )
+        })
+    }
+
+    /// T2.4 minimum deliverable, tier (a): the generator must be able to emit a genuine
+    /// epoll->epoll cross-reference (an `epoll_ctl` whose target-fd binds to a live
+    /// `epoll_create1` output) within a small, fixed seed budget — before this change, T4.2's
+    /// 300k-case corpus measurement found this shape *zero* times organically.
+    #[test]
+    fn generator_can_emit_an_epoll_into_epoll_epoll_ctl_within_n_seeds() {
+        const N: u32 = 200;
+        let mut found = false;
+        for seed in 1..=N {
+            let mut rng = Rng::new(seed);
+            let p = generate(&mut rng);
+            if has_epoll_into_epoll_link(&p) {
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "generate() never produced an epoll->epoll epoll_ctl link within {N} seeds"
+        );
+    }
+
+    /// T2.4 quantification: across a large generated sample, measure what fraction of programs
+    /// contain a genuine epoll->epoll link. T4.2's real-campaign corpus measured this at ~0/18646
+    /// (0%) before this change. This asserts a clearly-nonzero, measurable rate — the exact
+    /// number is reported (not hardcoded to a tight bound) since it depends on the RECIPES/bias
+    /// tuning constants and shouldn't be pinned brittlely.
+    #[test]
+    fn measurable_fraction_of_generated_programs_contain_an_epoll_into_epoll_link() {
+        const N: u32 = 5000;
+        let mut hits = 0u32;
+        let mut three_plus_epoll = 0u32;
+        for seed in 1..=N {
+            let mut rng = Rng::new(seed + 1_000_000); // disjoint seed space from other tests
+            let p = generate(&mut rng);
+            if has_epoll_into_epoll_link(&p) {
+                hits += 1;
+            }
+            let epoll_count = p
+                .calls
+                .iter()
+                .filter(|c| c.desc.name == "epoll_create1")
+                .count();
+            if epoll_count >= 3 {
+                three_plus_epoll += 1;
+            }
+        }
+        let rate = f64::from(hits) / f64::from(N);
+        eprintln!(
+            "T2.4: {hits}/{N} ({:.2}%) generated programs contain an epoll->epoll link; \
+             {three_plus_epoll}/{N} have >=3 live epoll_create1 calls",
+            rate * 100.0
+        );
+        assert!(
+            hits > 0,
+            "expected a measurably nonzero rate of epoll->epoll links, got 0/{N}"
+        );
+    }
+
+    /// The cross-reference bias's core claim, isolated from the epoll-specific recipe: given a
+    /// call-local anchor bound to one of several same-kind (`EPOLL`) pool entries, `pick_res_biased`
+    /// must noticeably prefer a *different* same-kind sibling over uniform `pick_res`'s
+    /// undiscriminating whole-`FD`-kind pool.
+    #[test]
+    fn pick_res_biased_prefers_a_same_kind_sibling_over_the_anchor_itself() {
+        use crate::resource::{EPOLL, FD};
+        // Pool: three EPOLL entries (calls 0,1,2) and one unrelated FD entry (call 3, e.g.
+        // openat) — mimics "epoll_create1 x3, openat" before an epoll_ctl call.
+        let pool = vec![
+            PoolEntry {
+                call_idx: 0,
+                slot: 0,
+                kind: EPOLL,
+            },
+            PoolEntry {
+                call_idx: 1,
+                slot: 0,
+                kind: EPOLL,
+            },
+            PoolEntry {
+                call_idx: 2,
+                slot: 0,
+                kind: EPOLL,
+            },
+            PoolEntry {
+                call_idx: 3,
+                slot: 0,
+                kind: FD,
+            },
+        ];
+        // Anchor: epfd already bound to call 0's epoll instance.
+        let anchors = vec![pool[0]];
+
+        let mut rng = Rng::new(4242);
+        let mut sibling_hits = 0u32;
+        let mut anchor_or_other_hits = 0u32;
+        const TRIES: u32 = 2000;
+        for _ in 0..TRIES {
+            match pick_res_biased(&mut rng, FD, &pool, &anchors) {
+                ResRef::Produced { call_idx, .. } if call_idx == 1 || call_idx == 2 => {
+                    sibling_hits += 1;
+                }
+                // Anchor (call 0) or the unrelated FD (call 3) or a seed literal: still possible
+                // via the plain `pick_res` fallback whenever the bias roll doesn't fire — the
+                // self-loop *avoidance* only applies within the biased branch itself, not the
+                // fallback, so this isn't a bug, just the complement of the bias.
+                _ => anchor_or_other_hits += 1,
+            }
+        }
+        assert!(
+            sibling_hits > anchor_or_other_hits,
+            "expected the same-kind sibling bias to dominate: {sibling_hits} sibling hits vs \
+             {anchor_or_other_hits} anchor/other/seed hits over {TRIES} tries"
+        );
+    }
+
+    /// Without an anchor (e.g. generating the *first* `Res` arg of a call), `pick_res_biased`
+    /// must behave exactly like plain `pick_res` — the bias only ever engages once a same-call
+    /// sibling binding exists.
+    #[test]
+    fn pick_res_biased_matches_plain_pick_res_with_no_anchors() {
+        use crate::resource::FD;
+        let pool = vec![PoolEntry {
+            call_idx: 0,
+            slot: 0,
+            kind: FD,
+        }];
+        let mut rng_a = Rng::new(9);
+        let mut rng_b = Rng::new(9);
+        for _ in 0..500 {
+            assert_eq!(
+                pick_res_biased(&mut rng_a, FD, &pool, &[]),
+                pick_res(&mut rng_b, FD, &pool)
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod t24_probe {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Builds a directed graph over `epoll_create1` call indices from every `epoll_ctl` call
+    /// whose epfd AND target fd both resolve to a live `epoll_create1` output (a genuine
+    /// epoll->epoll containment edge, `epfd contains fd`).
+    fn epoll_edges(p: &Prog) -> HashMap<u16, Vec<u16>> {
+        let mut edges: HashMap<u16, Vec<u16>> = HashMap::new();
+        for c in &p.calls {
+            if c.desc.name != "epoll_ctl" {
+                continue;
+            }
+            let ArgValue::Res(ResRef::Produced { call_idx: epfd_idx, .. }) = c.args[0] else {
+                continue;
+            };
+            if p.calls[epfd_idx as usize].desc.name != "epoll_create1" {
+                continue;
+            }
+            let ArgValue::Res(ResRef::Produced { call_idx: fd_idx, .. }) = c.args[2] else {
+                continue;
+            };
+            if p.calls[fd_idx as usize].desc.name != "epoll_create1" {
+                continue;
+            }
+            edges.entry(epfd_idx).or_default().push(fd_idx);
+        }
+        edges
+    }
+
+    /// Returns the shortest closed cycle's node count (>=2) in `edges`, if any — lets the probe
+    /// distinguish a 2-node mutual-nesting cycle from a >=3-node cycle (the CVE's documented
+    /// minimal trigger shape: `epoll_create1`x3 -> A,B,C; A contains B; B contains C; C contains
+    /// A). Exploratory probe only, not a committed correctness assertion (full closed cycles are
+    /// much rarer than a mere 2-node link, so this just measures the rate via simple DFS).
+    fn min_cycle_len(edges: &HashMap<u16, Vec<u16>>) -> Option<usize> {
+        fn dfs(node: u16, edges: &HashMap<u16, Vec<u16>>, visiting: &mut Vec<u16>) -> Option<usize> {
+            if let Some(pos) = visiting.iter().position(|&n| n == node) {
+                return Some(visiting.len() - pos);
+            }
+            visiting.push(node);
+            let mut best: Option<usize> = None;
+            if let Some(next) = edges.get(&node) {
+                for &n in next {
+                    if let Some(len) = dfs(n, edges, visiting) {
+                        best = Some(best.map_or(len, |b: usize| b.min(len)));
+                    }
+                }
+            }
+            visiting.pop();
+            best
+        }
+        let mut best: Option<usize> = None;
+        for &start in edges.keys() {
+            let mut visiting = Vec::new();
+            if let Some(len) = dfs(start, edges, &mut visiting) {
+                best = Some(best.map_or(len, |b: usize| b.min(len)));
+            }
+        }
+        best
+    }
+
+    /// Exploratory measurement (not a hard-pinned assertion, since the exact rate depends on
+    /// bias/recipe tuning constants): across a large generated sample, count programs with (a)
+    /// at least one epoll->epoll link, (b) *any* closed containment cycle (>=2 nodes), and (c)
+    /// specifically a >=3-node cycle — the CVE's documented minimal trigger shape
+    /// (`epoll_create1`x3 -> A,B,C; A contains B; B contains C; C contains A).
+    #[test]
+    fn probe_full_cycle_rate() {
+        const N: u32 = 200_000;
+        let mut link_hits = 0u32;
+        let mut cycle_hits = 0u32;
+        let mut cycle_ge3_hits = 0u32;
+        for seed in 1..=N {
+            let mut rng = Rng::new(seed.wrapping_mul(2_654_435_761).wrapping_add(7));
+            let p = generate(&mut rng);
+            let edges = epoll_edges(&p);
+            if !edges.is_empty() {
+                link_hits += 1;
+            }
+            if let Some(len) = min_cycle_len(&edges) {
+                cycle_hits += 1;
+                if len >= 3 {
+                    cycle_ge3_hits += 1;
+                }
+            }
+        }
+        eprintln!(
+            "T2.4 probe: {link_hits}/{N} programs contain an epoll->epoll link; \
+             {cycle_hits}/{N} contain a closed containment CYCLE (any length); \
+             {cycle_ge3_hits}/{N} contain a >=3-node cycle (the CVE's minimal trigger shape)"
+        );
+        // Hard gate: the generator must organically close *some* epoll containment cycle at a
+        // robust, non-flaky rate (measured ~0.7% — well above what a single unlucky seed offset
+        // could zero out). The >=3-node-specific count is reported but not gated on: it's real
+        // and nonzero at this N (measured 8/200000), but rare enough that pinning a hard minimum
+        // here would risk RNG-offset flakiness without adding meaningful signal beyond the
+        // any-length gate.
+        assert!(
+            cycle_hits > 0,
+            "generate() never closed an epoll containment cycle in {N} seeds"
         );
     }
 }

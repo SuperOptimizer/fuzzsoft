@@ -7,7 +7,7 @@
 use crate::dict::pick_dict_const;
 use crate::genr::{
     PoolEntry, build_pool, gen_arg_value, generate, generate_args, mask_to_bits, pick_desc_biased,
-    pick_interesting_int, pick_res,
+    pick_interesting_int, pick_res_biased, same_call_anchors,
 };
 use crate::lower::ptr_size_of;
 use crate::prog::{ArgValue, MAX_CALLS, Prog, ResRef, TypedCall};
@@ -88,7 +88,13 @@ fn remove_call(rng: &mut Rng, p: &mut Prog) {
 fn mutate_one_arg(rng: &mut Rng, call: &mut TypedCall, j: usize, pool: &[PoolEntry]) {
     match &call.desc.args[j] {
         ArgType::Res(kind) => {
-            call.args[j] = ArgValue::Res(pick_res(rng, *kind, pool));
+            // Same T2.4 cross-reference bias as fresh generation (see `pick_res_biased`'s doc
+            // comment): if this call's *other* args are already bound to a live resource, bias
+            // re-rolling this one toward a sibling of that exact same specific kind rather than
+            // the whole `kind`-compatible pool — e.g. re-rolling `epoll_ctl`'s target-fd arg in
+            // an existing program that already has its `epfd` wired to a live epoll instance.
+            let anchors = same_call_anchors(pool, &call.args, Some(j));
+            call.args[j] = ArgValue::Res(pick_res_biased(rng, *kind, pool, &anchors));
         }
         ArgType::Len { of } => {
             let of = *of as usize;
