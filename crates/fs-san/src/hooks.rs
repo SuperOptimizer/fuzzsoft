@@ -30,6 +30,17 @@
 //! `kmalloc`/`kfree` wiring as the worked example, and sketches the Windows
 //! `ExAllocatePoolWithTag`/`ExFreePool` case as the return-value-capture path this same code
 //! already implements, just with different register-index constants.
+//!
+//! **`kmem_cache_alloc` ([`CacheAllocHook`]):** one alloc-shaped kernel entry point does not fit
+//! "the size is an argument register" at all — `kmem_cache_alloc(cachep, flags)`'s size is
+//! `cachep->object_size`, a guest-*memory* field, not a register. Reading that would need an
+//! `Mmu` reference this framework deliberately does not carry (see above). So `CacheAllocHook`
+//! stashes the **cache pointer** at entry (a plain register value, exactly like [`AllocHook`]
+//! stashes a size) and [`PcHooks::on_cache_alloc_pc`] hands the caller both the returned object
+//! pointer and that cache pointer at return; the caller — which already owns an `Mmu` for every
+//! other sanitizer call — reads `object_size` itself. This keeps the "PC + register file only"
+//! property intact for `hooks.rs` while still closing the `kmem_cache_alloc` coverage gap
+//! `linux.rs`/`DESIGN.md` previously documented as permanently unavailable.
 
 use std::collections::HashMap;
 
@@ -136,6 +147,35 @@ pub enum PageHookEvent {
     Free { addr: u32, order: u32 },
 }
 
+/// A monitored `kmem_cache_alloc`-shaped entry function: `fn kmem_cache_alloc(cachep, flags) ->
+/// *mut u8`. Closes the gap `DESIGN.md`/`linux.rs` previously documented as
+/// `Convention::AllocSizeUnavailable`: the requested size is not an argument at all, it's
+/// `cachep->object_size` — a guest-memory field this register-file-only framework cannot read.
+/// Rather than break that "only a PC and a register file" property (this module's whole
+/// ISA-agnostic-design point), this hook only ever stashes the **cache pointer** here — a plain
+/// register value, exactly like [`AllocHook`] stashes a size — and leaves the guest-memory read of
+/// `object_size` to the caller (which already owns an `Mmu` reference for every other sanitizer
+/// call, so it's a natural, minimal place for it; see `docs/emulator-sanitizers.md`).
+#[derive(Debug, Clone, Copy)]
+pub struct CacheAllocHook {
+    /// Guest PC of the function's first instruction.
+    pub entry_pc: u32,
+    /// Register index holding the `struct kmem_cache *` argument at entry (e.g.
+    /// `kmem_cache_alloc(struct kmem_cache *cachep, gfp_t flags)` -> `a0`, index 10).
+    pub cache_reg: usize,
+}
+
+/// An event learned from watching [`CacheAllocHook`]-registered entries: the returned object
+/// pointer plus the cache pointer captured at entry, so the caller can read `cachep->object_size`
+/// itself and hand `(addr, object_size)` to [`crate::Sanitizer::alloc_with_slack`]. Kept as its own
+/// independent query ([`PcHooks::on_cache_alloc_pc`]) for the same reason [`PageHookEvent`] is:
+/// `HookEvent` is matched exhaustively elsewhere and must not gain a new required-to-handle
+/// variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheAllocEvent {
+    Alloc { addr: u32, cache_ptr: u32 },
+}
+
 /// Registry of PC hooks plus the small amount of state needed to bridge an alloc call's entry
 /// (where the size is known) to its return (where the pointer is known).
 #[derive(Default)]
@@ -159,6 +199,12 @@ pub struct PcHooks {
     /// Orders awaiting a return, keyed by the call's return address — the page-allocator analogue
     /// of `pending`.
     page_pending: HashMap<u32, Vec<u32>>,
+    /// `kmem_cache_alloc`-shaped hooks, queried independently via [`PcHooks::on_cache_alloc_pc`].
+    cache_allocs: HashMap<u32, CacheAllocHook>,
+    /// Cache pointers awaiting a return, keyed by return address — the `kmem_cache_alloc`
+    /// analogue of `pending`, except the stashed payload is a cache pointer, not a size (see
+    /// [`CacheAllocHook`]'s doc comment for why).
+    cache_pending: HashMap<u32, Vec<u32>>,
 }
 
 impl PcHooks {
@@ -189,6 +235,11 @@ impl PcHooks {
     /// Watch `entry_pc` as a page-deallocator function entry (`free_pages`-shaped).
     pub fn hook_page_free(&mut self, hook: PageFreeHook) {
         self.page_frees.insert(hook.entry_pc, hook);
+    }
+
+    /// Watch `entry_pc` as a `kmem_cache_alloc`-shaped function entry.
+    pub fn hook_cache_alloc(&mut self, hook: CacheAllocHook) {
+        self.cache_allocs.insert(hook.entry_pc, hook);
     }
 
     /// Independent query: is `pc` a registered `ksize()`-shaped entry, and if so, what pointer is
@@ -294,12 +345,44 @@ impl PcHooks {
         self.page_pending.values().map(|v| v.len()).sum()
     }
 
+    /// Independent `kmem_cache_alloc` query, mirroring [`PcHooks::on_pc`]'s alloc entry/return
+    /// dance but stashing a **cache pointer** at entry instead of a size (see [`CacheAllocHook`]'s
+    /// doc comment for why) — kept separate from `on_pc` so [`CacheAllocEvent`] never needs to
+    /// join `HookEvent`'s exhaustively-matched set, the same reasoning [`PageHookEvent`] and
+    /// [`PcHooks::ksize_hit`] already establish. Call this alongside `on_pc`/`ksize_hit`/
+    /// `on_page_pc`, once per PC, in addition to them, not instead of them.
+    pub fn on_cache_alloc_pc(&mut self, pc: u32, regs: &[u32; 32]) -> Option<CacheAllocEvent> {
+        if let Some(hook) = self.cache_allocs.get(&pc) {
+            let cache_ptr = regs[hook.cache_reg];
+            let ret_pc = regs[REG_RETURN_ADDR];
+            self.cache_pending.entry(ret_pc).or_default().push(cache_ptr);
+            return None; // The object pointer isn't known until the call returns.
+        }
+        if let Some(ptrs) = self.cache_pending.get_mut(&pc)
+            && let Some(cache_ptr) = ptrs.pop()
+        {
+            if ptrs.is_empty() {
+                self.cache_pending.remove(&pc);
+            }
+            let addr = regs[REG_RETURN_VALUE];
+            return Some(CacheAllocEvent::Alloc { addr, cache_ptr });
+        }
+        None
+    }
+
+    /// Number of `kmem_cache_alloc`-call returns currently awaited. Exposed mainly for
+    /// tests/diagnostics, mirroring [`PcHooks::pending_returns`]/[`PcHooks::page_pending_returns`].
+    pub fn cache_alloc_pending_returns(&self) -> usize {
+        self.cache_pending.values().map(|v| v.len()).sum()
+    }
+
     /// Drop all in-flight alloc/free calls awaiting a return. Call between snapshot-fuzzing cases
     /// so a call left mid-flight by one case's reset doesn't leak into the next.
     pub fn clear_pending(&mut self) {
         self.pending.clear();
         self.pending_frees.clear();
         self.page_pending.clear();
+        self.cache_pending.clear();
     }
 }
 
@@ -564,5 +647,127 @@ mod tests {
             hooks.on_page_pc(0x6100, &regs_with(|r| r[REG_RETURN_VALUE] = 0x8000_0000)),
             None
         );
+    }
+
+    // -- kmem_cache_alloc hook (CacheAllocHook/CacheAllocEvent/on_cache_alloc_pc) --
+
+    #[test]
+    fn cache_alloc_hook_waits_for_return_to_learn_pointer_and_carries_the_cache_ptr() {
+        let mut hooks = PcHooks::new();
+        hooks.hook_cache_alloc(CacheAllocHook {
+            entry_pc: 0x8000,
+            cache_reg: 10, // a0 = cachep at entry
+        });
+
+        let entry_regs = regs_with(|r| {
+            r[10] = 0xc040_0000; // cachep
+            r[REG_RETURN_ADDR] = 0x8100;
+        });
+        assert_eq!(hooks.on_cache_alloc_pc(0x8000, &entry_regs), None);
+        assert_eq!(hooks.cache_alloc_pending_returns(), 1);
+        // Not visible through any other query.
+        assert_eq!(hooks.on_pc(0x8000, &entry_regs), None);
+        assert_eq!(hooks.on_page_pc(0x8000, &entry_regs), None);
+
+        let ret_regs = regs_with(|r| r[REG_RETURN_VALUE] = 0x8030_0000);
+        assert_eq!(
+            hooks.on_cache_alloc_pc(0x8100, &ret_regs),
+            Some(CacheAllocEvent::Alloc {
+                addr: 0x8030_0000,
+                cache_ptr: 0xc040_0000
+            })
+        );
+        assert_eq!(hooks.cache_alloc_pending_returns(), 0);
+    }
+
+    #[test]
+    fn cache_alloc_recursive_calls_through_same_site_pair_lifo() {
+        let mut hooks = PcHooks::new();
+        hooks.hook_cache_alloc(CacheAllocHook {
+            entry_pc: 0x8000,
+            cache_reg: 10,
+        });
+
+        let outer = regs_with(|r| {
+            r[10] = 0xc040_0000;
+            r[REG_RETURN_ADDR] = 0x8100;
+        });
+        hooks.on_cache_alloc_pc(0x8000, &outer);
+        let inner = regs_with(|r| {
+            r[10] = 0xc050_0000;
+            r[REG_RETURN_ADDR] = 0x8100;
+        });
+        hooks.on_cache_alloc_pc(0x8000, &inner);
+        assert_eq!(hooks.cache_alloc_pending_returns(), 2);
+
+        let ret1 = regs_with(|r| r[REG_RETURN_VALUE] = 0x9000_0000);
+        assert_eq!(
+            hooks.on_cache_alloc_pc(0x8100, &ret1),
+            Some(CacheAllocEvent::Alloc {
+                addr: 0x9000_0000,
+                cache_ptr: 0xc050_0000
+            })
+        );
+        let ret2 = regs_with(|r| r[REG_RETURN_VALUE] = 0x9000_1000);
+        assert_eq!(
+            hooks.on_cache_alloc_pc(0x8100, &ret2),
+            Some(CacheAllocEvent::Alloc {
+                addr: 0x9000_1000,
+                cache_ptr: 0xc040_0000
+            })
+        );
+        assert_eq!(hooks.cache_alloc_pending_returns(), 0);
+    }
+
+    #[test]
+    fn clear_pending_drops_in_flight_cache_allocs_too() {
+        let mut hooks = PcHooks::new();
+        hooks.hook_cache_alloc(CacheAllocHook {
+            entry_pc: 0x8000,
+            cache_reg: 10,
+        });
+        let regs = regs_with(|r| {
+            r[10] = 0xc040_0000;
+            r[REG_RETURN_ADDR] = 0x8100;
+        });
+        hooks.on_cache_alloc_pc(0x8000, &regs);
+        assert_eq!(hooks.cache_alloc_pending_returns(), 1);
+        hooks.clear_pending();
+        assert_eq!(hooks.cache_alloc_pending_returns(), 0);
+        assert_eq!(
+            hooks.on_cache_alloc_pc(0x8100, &regs_with(|r| r[REG_RETURN_VALUE] = 0x9000_0000)),
+            None
+        );
+    }
+
+    #[test]
+    fn cache_alloc_hooks_do_not_leak_into_kmalloc_or_page_families() {
+        let mut hooks = PcHooks::new();
+        hooks.hook_alloc(AllocHook {
+            entry_pc: 0x1000,
+            size_reg: 10,
+        });
+        hooks.hook_page_alloc(PageAllocHook {
+            entry_pc: 0x6000,
+            order_reg: Some(11),
+        });
+        hooks.hook_cache_alloc(CacheAllocHook {
+            entry_pc: 0x8000,
+            cache_reg: 10,
+        });
+        let regs = regs_with(|r| {
+            r[10] = 64;
+            r[11] = 2;
+            r[REG_RETURN_ADDR] = 0x2000;
+        });
+        assert_eq!(hooks.on_cache_alloc_pc(0x1000, &regs), None);
+        assert_eq!(hooks.cache_alloc_pending_returns(), 0);
+        assert_eq!(hooks.on_cache_alloc_pc(0x6000, &regs), None);
+        assert_eq!(hooks.cache_alloc_pending_returns(), 0);
+
+        assert_eq!(hooks.on_cache_alloc_pc(0x8000, &regs), None);
+        assert_eq!(hooks.cache_alloc_pending_returns(), 1);
+        assert_eq!(hooks.pending_returns(), 0);
+        assert_eq!(hooks.page_pending_returns(), 0);
     }
 }

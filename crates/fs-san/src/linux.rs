@@ -23,7 +23,9 @@
 
 use std::collections::HashMap;
 
-use crate::hooks::{AllocHook, FreeHook, KsizeHook, PageAllocHook, PageFreeHook, PcHooks};
+use crate::hooks::{
+    AllocHook, CacheAllocHook, FreeHook, KsizeHook, PageAllocHook, PageFreeHook, PcHooks,
+};
 
 /// Parse a Linux `System.map` (or an equivalent `nm -n vmlinux`-style listing) into a
 /// symbol-name -> address table.
@@ -70,10 +72,13 @@ pub fn parse_system_map(text: &str) -> HashMap<String, u32> {
 enum Convention {
     /// Alloc-shaped: size argument lives in this register index (RISC-V `a0..a7` = x10..x17).
     AllocSizeReg(usize),
-    /// Alloc-shaped in principle, but the size is not among the function's arguments at all —
-    /// see the `kmem_cache_alloc*` entries below. We still list the symbol (so callers can see
-    /// it was considered) but never register a hook for it.
-    AllocSizeUnavailable,
+    /// `kmem_cache_alloc`-shaped: the size is not an argument at all (it's `cachep->object_size`,
+    /// a guest-memory field), but the *cache pointer* is — this register index. Handled by
+    /// [`crate::hooks::PcHooks::hook_cache_alloc`]/`on_cache_alloc_pc` (see
+    /// [`crate::hooks::CacheAllocHook`]'s doc comment for the full mechanism: the cache pointer
+    /// is stashed here and the actual `object_size` guest-memory read happens at the call site
+    /// that owns an `Mmu`, not in this register-file-only crate module).
+    CacheAllocCacheReg(usize),
     /// Free-shaped: pointer argument lives in this register index.
     FreePtrReg(usize),
     /// `ksize()`-shaped: the guest is reporting/re-opening the usable size of a live allocation.
@@ -97,13 +102,13 @@ enum Convention {
     /// Alloc- or free-shaped in principle (`alloc_pages`/`__alloc_pages`/`__free_pages`), but the
     /// function takes/returns a `struct page *`, not a linear-map virtual address — turning that
     /// into a physical page requires `page_to_pfn`/`mem_map` arithmetic (a guest-memory struct
-    /// walk at a kernel-version-specific offset) that this register-file-only PC-hook layer
-    /// deliberately does not do, exactly the same limitation already documented for
-    /// `kmem_cache_alloc` above (see [`Convention::AllocSizeUnavailable`]'s doc comment). Listed
-    /// here purely as documentation of a considered-but-deferred symbol, never hooked. This is the
-    /// honest gap `docs/emulator-sanitizers.md`'s KASAN section flags: `__get_free_pages`/
-    /// `free_pages` (the VA-returning family, handled by the two variants above) are the
-    /// tractable case; `alloc_pages`/`struct page*` is the harder follow-up.
+    /// walk at a kernel-version-specific offset, a *much* larger/riskier reverse-engineering task
+    /// than [`Convention::CacheAllocCacheReg`]'s single fixed-field-offset read — see that
+    /// variant's doc comment for the one this project *did* take on). Listed here purely as
+    /// documentation of a considered-but-deferred symbol, never hooked. This is the honest gap
+    /// `docs/emulator-sanitizers.md`'s KASAN section flags: `__get_free_pages`/`free_pages` (the
+    /// VA-returning family, handled by the two variants above) are the tractable case;
+    /// `alloc_pages`/`struct page*` is the harder follow-up.
     PageStructUnavailable,
 }
 
@@ -137,20 +142,16 @@ const KNOWN_SYMBOLS: &[(&str, Convention)] = &[
     // size is the *third* argument -> a2 (x12), not a0.
     ("kmalloc_trace", Convention::AllocSizeReg(12)),
     // `void *kmem_cache_alloc(struct kmem_cache *cachep, gfp_t flags)` -> the requested size is
-    // NOT an argument at all; it's an intrinsic property of `cachep` (its fixed object size,
-    // `cachep->size`), which isn't available at this PC-hook layer since we only read registers,
-    // not dereference guest structures. LIMITATION: to hook this precisely you would need to
-    // read `cachep->object_size` out of guest memory at entry (offset is
-    // kernel-version-specific) and stash *that* as the pending size instead of a register value.
-    // We deliberately do not implement that guest-memory read here (it would break the "only
-    // needs a PC and a register file" ISA-agnostic property `hooks.rs` is built on) — so this
-    // symbol is intentionally never registered as an alloc hook. It is still listed here as
-    // documentation of the limitation and so a caller scanning `KNOWN_SYMBOLS` sees it was
-    // considered, not forgotten.
-    ("kmem_cache_alloc", Convention::AllocSizeUnavailable),
-    // `void *kmem_cache_alloc_noprof(struct kmem_cache *cachep, gfp_t flags)` -> same limitation
-    // as `kmem_cache_alloc` (allocation-profiling build).
-    ("kmem_cache_alloc_noprof", Convention::AllocSizeUnavailable),
+    // NOT an argument at all; it's an intrinsic property of `cachep` (its
+    // `object_size` field), which this register-file-only PC-hook layer cannot dereference
+    // directly. Closed via `Convention::CacheAllocCacheReg`: the cache pointer (a0) is stashed
+    // instead of a size, and the call site that owns an `Mmu` (fs-cli's `run_case`) reads
+    // `cachep->object_size` itself — see `crate::hooks::CacheAllocHook`'s doc comment and
+    // `KMEM_CACHE_OBJECT_SIZE_OFFSET` below for the guest-memory offset this depends on.
+    ("kmem_cache_alloc", Convention::CacheAllocCacheReg(10)),
+    // `void *kmem_cache_alloc_noprof(struct kmem_cache *cachep, gfp_t flags)` -> same shape as
+    // `kmem_cache_alloc` (allocation-profiling build).
+    ("kmem_cache_alloc_noprof", Convention::CacheAllocCacheReg(10)),
     // --- Deallocators -----------------------------------------------------------------------
     // `void kfree(const void *objp)` -> the only argument is the pointer, a0.
     ("kfree", Convention::FreePtrReg(10)),
@@ -215,10 +216,12 @@ const KNOWN_SYMBOLS: &[(&str, Convention)] = &[
 /// drift across kernel versions/configs, so this tries each known name independently rather than
 /// requiring a fixed set — whichever a given kernel build actually has get hooked.
 ///
-/// `kmem_cache_alloc`/`kmem_cache_alloc_noprof` are never registered even if present, since their
-/// size is not available from the register file at entry — see the doc comment on
-/// [`Convention::AllocSizeUnavailable`]. Their frees (`kmem_cache_free`) are still hooked
-/// normally: `Sanitizer::free` only needs the pointer, not the original size.
+/// `kmem_cache_alloc`/`kmem_cache_alloc_noprof`, if present, are registered as
+/// [`crate::hooks::CacheAllocHook`]s (see [`Convention::CacheAllocCacheReg`]): the cache pointer is
+/// captured here, but the actual `object_size` guest-memory read (and the `Sanitizer::alloc_with_slack`
+/// call it feeds) is the caller's job, since this function only has a register file, not an `Mmu`.
+/// Their frees (`kmem_cache_free`) are hooked normally as before: `Sanitizer::free` only needs the
+/// pointer, not the original size.
 pub fn register_kernel_allocator_hooks(hooks: &mut PcHooks, syms: &HashMap<String, u32>) {
     for (name, convention) in KNOWN_SYMBOLS {
         let Some(&entry_pc) = syms.get(*name) else {
@@ -228,8 +231,11 @@ pub fn register_kernel_allocator_hooks(hooks: &mut PcHooks, syms: &HashMap<Strin
             Convention::AllocSizeReg(size_reg) => {
                 hooks.hook_alloc(AllocHook { entry_pc, size_reg });
             }
-            Convention::AllocSizeUnavailable => {
-                // Deliberately not hooked; see KNOWN_SYMBOLS doc comment.
+            Convention::CacheAllocCacheReg(cache_reg) => {
+                hooks.hook_cache_alloc(CacheAllocHook {
+                    entry_pc,
+                    cache_reg,
+                });
             }
             Convention::FreePtrReg(ptr_reg) => {
                 hooks.hook_free(FreeHook { entry_pc, ptr_reg });
@@ -292,6 +298,40 @@ impl LinearMap {
     }
 }
 
+/// Byte offset of `struct kmem_cache::object_size` (`mm/slab.h`) for **this project's own kernel
+/// build** (`build/linux-src`, confirmed against its `mm/slab.h` at the revision that build was
+/// compiled from). Unlike `PAGE_OFFSET` (an ABI constant fixed by the RISC-V port itself), this is
+/// a *struct layout* fact — it depends on the exact set of preceding fields and any
+/// `CONFIG_`-gated ones among them, so it must be re-derived (re-read `mm/slab.h`, recompute the
+/// RV32 field layout: 4-byte pointers/`unsigned int`/`unsigned long`, natural alignment, no
+/// padding needed since every field before `object_size` is exactly 4 bytes) for any other kernel
+/// version or `.config`. Field layout on this build's `struct kmem_cache` (RV32: 4-byte pointers,
+/// no gaps since each field below is a 4-byte-aligned 4-byte value):
+/// ```text
+/// struct kmem_cache {
+///     struct slub_percpu_sheaves __percpu *cpu_sheaves; // offset  0 (pointer, 4B)
+///     slab_flags_t flags;                               // offset  4 (`unsigned int`, 4B)
+///     unsigned long min_partial;                        // offset  8 (4B on RV32)
+///     unsigned int size;                                // offset 12
+///     unsigned int object_size;                          // offset 16  <-- this constant
+///     ...
+/// };
+/// ```
+/// Never trusted blindly at runtime: the call site that reads this (fs-cli's `run_case`) applies
+/// [`KMEM_CACHE_OBJECT_SIZE_MAX`] as a sanity bound and skips the hook for that one call (falling
+/// back to today's "invisible to the sanitizer" behavior, never a guessed/garbage size) if the
+/// read value fails it — the same "getting this wrong doesn't crash, it just silently mis-sizes an
+/// allocation" risk this module's own doc comment already calls out for symbol/convention drift,
+/// just here for a struct-layout fact instead of a calling convention.
+pub const KMEM_CACHE_OBJECT_SIZE_OFFSET: u32 = 16;
+
+/// Sanity bound for a guest-memory-read `object_size` (see [`KMEM_CACHE_OBJECT_SIZE_OFFSET`]'s
+/// doc comment): no real `kmem_cache` object is anywhere near this large, so a value at or above
+/// it is a strong signal of a wrong offset (wrong kernel build/version/config) or a garbage
+/// `cachep` pointer — not a real cache — and the read should be treated as unusable rather than
+/// fed to the sanitizer.
+pub const KMEM_CACHE_OBJECT_SIZE_MAX: u32 = 0x0010_0000; // 1 MiB
+
 /// Round a kmalloc request up to its SLUB bucket, so the trailing redzone lands at the object
 /// boundary (the kernel may legitimately access up to `ksize()` = the full bucket size).
 pub fn kmalloc_bucket(size: u32) -> u32 {
@@ -320,6 +360,15 @@ mod tests {
         assert_eq!(kmalloc_bucket(30), 32);
         assert_eq!(kmalloc_bucket(64), 64);
         assert_eq!(kmalloc_bucket(100), 128);
+    }
+
+    /// Pins `KMEM_CACHE_OBJECT_SIZE_OFFSET`'s documented derivation (mm/slab.h field layout) as a
+    /// regression guard — if this ever needs to change for a different kernel build, the change
+    /// should be a deliberate edit to the constant *and* this test, not a silent drift.
+    #[test]
+    fn kmem_cache_object_size_offset_matches_documented_derivation() {
+        assert_eq!(KMEM_CACHE_OBJECT_SIZE_OFFSET, 16);
+        assert_eq!(KMEM_CACHE_OBJECT_SIZE_MAX, 0x0010_0000);
     }
 
     /// A tiny excerpt in real `System.map` shape: two allocator symbols we care about, plus
@@ -392,7 +441,7 @@ c0160000 W weak_symbol
     }
 
     #[test]
-    fn kmem_cache_alloc_is_never_registered() {
+    fn kmem_cache_alloc_is_now_registered_as_a_cache_alloc_hook_not_on_pc() {
         let mut syms = HashMap::new();
         syms.insert("kmem_cache_alloc".to_string(), 0xc030_0000u32);
         syms.insert("kmem_cache_alloc_noprof".to_string(), 0xc030_1000u32);
@@ -401,14 +450,45 @@ c0160000 W weak_symbol
         let mut hooks = PcHooks::new();
         register_kernel_allocator_hooks(&mut hooks, &syms);
 
-        // Hitting the (unhooked) kmem_cache_alloc entry PC is simply a no-op, not a crash or a
-        // spuriously-sized alloc event.
-        let regs = [0u32; 32];
-        assert_eq!(hooks.on_pc(0xc030_0000, &regs), None);
-        assert_eq!(hooks.on_pc(0xc030_1000, &regs), None);
+        // kmem_cache_alloc(cachep, flags): a0 = cachep. Its size is not a register at all (see
+        // Convention::CacheAllocCacheReg), so it must surface only through on_cache_alloc_pc, not
+        // through the unrelated on_pc/HookEvent path.
+        let mut entry = [0u32; 32];
+        entry[10] = 0xc070_0000; // cachep
+        entry[crate::REG_RETURN_ADDR] = 0xc031_0000;
+        assert_eq!(hooks.on_pc(0xc030_0000, &entry), None);
+        assert_eq!(hooks.on_cache_alloc_pc(0xc030_0000, &entry), None);
+        assert_eq!(hooks.cache_alloc_pending_returns(), 1);
 
-        // But its matching free IS hooked, and the pointer is the *second* argument (a1), not
-        // a0, unlike every other free-shaped hook here.
+        let mut ret = [0u32; 32];
+        ret[crate::hooks::REG_RETURN_VALUE] = 0x8060_0000;
+        assert_eq!(
+            hooks.on_cache_alloc_pc(0xc031_0000, &ret),
+            Some(crate::hooks::CacheAllocEvent::Alloc {
+                addr: 0x8060_0000,
+                cache_ptr: 0xc070_0000
+            })
+        );
+        // Never surfaced through on_pc.
+        assert_eq!(hooks.on_pc(0xc031_0000, &ret), None);
+
+        // The _noprof variant behaves identically.
+        let mut entry2 = [0u32; 32];
+        entry2[10] = 0xc070_1000;
+        entry2[crate::REG_RETURN_ADDR] = 0xc031_1000;
+        assert_eq!(hooks.on_cache_alloc_pc(0xc030_1000, &entry2), None);
+        let mut ret2 = [0u32; 32];
+        ret2[crate::hooks::REG_RETURN_VALUE] = 0x8060_1000;
+        assert_eq!(
+            hooks.on_cache_alloc_pc(0xc031_1000, &ret2),
+            Some(crate::hooks::CacheAllocEvent::Alloc {
+                addr: 0x8060_1000,
+                cache_ptr: 0xc070_1000
+            })
+        );
+
+        // Its matching free IS (and always was) hooked via the ordinary free path, pointer is the
+        // *second* argument (a1), not a0, unlike every other free-shaped hook here.
         let mut free_regs = [0u32; 32];
         free_regs[11] = 0x8020_0000; // a1 = objp
         free_regs[crate::REG_RETURN_ADDR] = 0xc040_1000;
@@ -529,5 +609,103 @@ c0160000 W weak_symbol
         assert_eq!(hooks.on_pc(0xc050_0000, &regs), None);
         // Neither ksize hook stashes anything awaiting a return.
         assert_eq!(hooks.pending_returns(), 0);
+    }
+
+    /// End-to-end **positive control** for the `kmem_cache_alloc` coverage gap this module closes:
+    /// drives the full `System.map` -> `PcHooks` -> `Sanitizer` pipeline (mirroring fs-cli's
+    /// `run_case`, minus VA/PA translation, which is orthogonal to what this proves) for
+    /// `kmem_cache_alloc` -> `kmem_cache_free` -> `kmem_cache_free` (a double-free bug).
+    ///
+    /// Before this feature, `kmem_cache_alloc` was never hooked at all (`AllocSizeUnavailable`),
+    /// so the sanitizer never learned this address was live. That made a genuine double-free of a
+    /// `kmem_cache_alloc`-sourced object **indistinguishable from ordinary correct usage**: the
+    /// very first (legitimate) `kmem_cache_free` already reported `SanError::InvalidFree`, purely
+    /// because the matching alloc was invisible — exactly the noise this test's "before" half
+    /// reproduces directly against `Sanitizer` (no coverage gap to simulate; it's simply never
+    /// calling `alloc`, which is the truth of today's behavior). After this feature, the first
+    /// free is silently accepted (the object really was live) and only the second, genuinely
+    /// buggy free is flagged — the bug the current (pre-this-change) code missed.
+    #[test]
+    fn kmem_cache_alloc_hook_turns_a_noisy_invalid_free_into_a_real_double_free_signal() {
+        use crate::Sanitizer;
+
+        let mut syms = HashMap::new();
+        syms.insert("kmem_cache_alloc".to_string(), 0xc090_0000u32);
+        syms.insert("kmem_cache_free".to_string(), 0xc090_1000u32);
+
+        let mut hooks = PcHooks::new();
+        register_kernel_allocator_hooks(&mut hooks, &syms);
+
+        let cachep: u32 = 0xc0a0_0000;
+        let obj_addr: u32 = 0x8005_0000;
+        let ret_pc: u32 = 0xc091_0000;
+        let free_ret_pc: u32 = 0xc091_1000;
+
+        // --- "Before": kmem_cache_alloc invisible (today's behavior without this feature) ---
+        // No alloc() is ever recorded for `obj_addr` (that's the literal pre-existing gap this
+        // feature closes) -- so even a single, entirely legitimate free already reports
+        // InvalidFree, indistinguishable from a real double-free.
+        {
+            let mut mmu = fs_mmu::Mmu::new(0x8000_0000, 0x0010_0000);
+            let mut san = Sanitizer::new(crate::DEFAULT_REDZONE);
+            assert_eq!(
+                san.free(&mut mmu, obj_addr).unwrap_err(),
+                crate::SanError::InvalidFree { addr: obj_addr },
+                "today: kmem_cache_alloc is invisible, so even the FIRST, legitimate free \
+                 already looks like an error -- a real double-free would look identical"
+            );
+        }
+
+        // --- "After": this feature's full pipeline ---
+        let mut mmu = fs_mmu::Mmu::new(0x8000_0000, 0x0010_0000);
+        let mut san = Sanitizer::new(crate::DEFAULT_REDZONE);
+
+        // kmem_cache_alloc(cachep, flags) entry: a0 = cachep, ra = ret_pc.
+        let mut entry = [0u32; 32];
+        entry[10] = cachep;
+        entry[crate::hooks::REG_RETURN_ADDR] = ret_pc;
+        assert_eq!(hooks.on_cache_alloc_pc(syms["kmem_cache_alloc"], &entry), None);
+
+        // Return: a0 = the allocated pointer.
+        let mut ret = [0u32; 32];
+        ret[crate::hooks::REG_RETURN_VALUE] = obj_addr;
+        let ev = hooks.on_cache_alloc_pc(ret_pc, &ret);
+        let crate::hooks::CacheAllocEvent::Alloc {
+            addr,
+            cache_ptr: got_cachep,
+        } = ev.expect("cache alloc event must fire at the stashed return address");
+        assert_eq!(addr, obj_addr);
+        assert_eq!(got_cachep, cachep);
+
+        // fs-cli's real integration reads `cachep->object_size` out of guest memory here; this
+        // test isn't about that read (covered elsewhere), so it supplies the size directly, the
+        // same way a successful guest-memory read would.
+        san.alloc_exact_no_uaf_guard(&mut mmu, addr, 96).unwrap();
+        assert!(san.is_live(addr));
+
+        // kmem_cache_free(cachep, objp): a1 = objp (NOT a0 -- see KNOWN_SYMBOLS' own note on this).
+        let mut free1 = [0u32; 32];
+        free1[11] = addr;
+        free1[crate::hooks::REG_RETURN_ADDR] = free_ret_pc;
+        assert_eq!(hooks.on_pc(syms["kmem_cache_free"], &free1), None);
+        let HookEvent::Free { addr: freed_addr } = hooks
+            .on_pc(free_ret_pc, &[0u32; 32])
+            .expect("free event must fire at the stashed return address")
+        else {
+            panic!("expected a Free event");
+        };
+        assert_eq!(freed_addr, addr);
+
+        // The first, legitimate free succeeds silently now -- the bug this feature fixes.
+        san.free(&mut mmu, freed_addr).unwrap();
+        assert!(!san.is_live(freed_addr));
+
+        // A second free of the same pointer (the actual bug under test) is now the ONE thing
+        // that reports InvalidFree -- a genuine double-free signal, not noise.
+        assert_eq!(
+            san.free(&mut mmu, freed_addr).unwrap_err(),
+            crate::SanError::InvalidFree { addr: freed_addr },
+            "after: the sanitizer now distinguishes a real double-free from ordinary usage"
+        );
     }
 }

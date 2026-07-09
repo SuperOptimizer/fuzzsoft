@@ -76,6 +76,19 @@ struct SanCtx {
     page_allocs: u64,
     page_frees: u64,
     san_errors: u64,
+    /// `kmem_cache_alloc`-sourced allocations successfully sized and handed to `Sanitizer`
+    /// (docs/emulator-sanitizers.md's previously-documented `kmem_cache_alloc` coverage gap,
+    /// closed via `fs_san::hooks::CacheAllocEvent` + a guest-memory read of
+    /// `cachep->object_size`). Counted separately from `allocs`/`bytes` (the kmalloc family)
+    /// since they come from a structurally different hook family, even though both ultimately
+    /// call `Sanitizer::alloc_with_slack`.
+    cache_allocs: u64,
+    cache_bytes: u64,
+    /// `kmem_cache_alloc` hook fired but the guest-memory read of `cachep->object_size` failed
+    /// the sanity self-check (bad offset for this build, or a garbage `cachep`) — never fed to
+    /// the sanitizer, so this counts a coverage gap, not a false positive (see
+    /// `fs_san::linux::KMEM_CACHE_OBJECT_SIZE_OFFSET`'s doc comment for the self-check reasoning).
+    cache_alloc_size_unavailable: u64,
 }
 
 impl SanCtx {
@@ -197,6 +210,57 @@ fn run_case(
                         }
                     }
                     Err(_) => ctx.san_errors += 1,
+                }
+            }
+            // kmem_cache_alloc: closes the previously-documented "size unavailable" coverage gap
+            // (docs/emulator-sanitizers.md, `fs_san::linux`'s `KNOWN_SYMBOLS` doc comments). The
+            // hook only ever hands back a *cache pointer* (hooks.rs can't read guest memory), so
+            // the `object_size` read — and its sanity self-check — happen here, the one place
+            // that already owns `&mut m.ram`. A failed self-check is treated exactly like the
+            // pre-existing "never hooked" state: skip, never guess (see
+            // `fs_san::linux::KMEM_CACHE_OBJECT_SIZE_OFFSET`'s doc comment).
+            if let Some(fs_san::CacheAllocEvent::Alloc { addr, cache_ptr }) =
+                ctx.hooks.on_cache_alloc_pc(pc, &cpu.regs)
+                && let Some(pa) = ctx.lm.va_to_pa(addr)
+                && let Some(cache_pa) = ctx.lm.va_to_pa(cache_ptr)
+            {
+                match m
+                    .ram
+                    .read_u32(cache_pa.wrapping_add(fs_san::linux::KMEM_CACHE_OBJECT_SIZE_OFFSET))
+                {
+                    Ok(object_size)
+                        if object_size > 0
+                            && object_size < fs_san::linux::KMEM_CACHE_OBJECT_SIZE_MAX =>
+                    {
+                        ctx.cache_allocs += 1;
+                        ctx.cache_bytes += object_size as u64;
+                        ctx.mark_dirtied(pa, object_size);
+                        // alloc_exact_no_uaf_guard, NOT alloc_with_slack: kmem_cache_alloc's hook
+                        // only learns the pointer at return, and SLUB's own internal
+                        // GFP_ZERO/ctor zeroing can write into the object *during* the call —
+                        // before that return is observed. If this address were still poisoned
+                        // from a matching prior free (a real, confirmed scenario: copy_signal's
+                        // kmem_cache_alloc_noprof racing its own memset against a same-cache
+                        // reuse), a normal alloc_with_slack/free pair would fault that legitimate
+                        // in-call write — see alloc_exact_no_uaf_guard's doc comment for the full
+                        // story and the empirical repro. This trades UAF byte-poisoning for
+                        // zero-FP safety on this allocation family; double-alloc/double-free
+                        // bookkeeping stays exact either way.
+                        match ctx.san.alloc_exact_no_uaf_guard(&mut m.ram, pa, object_size) {
+                            Ok(()) => {
+                                // Same RAW-vs-legitimately-preinitialized reasoning as the
+                                // kmalloc alloc site above: a kmem_cache's `ctor` (if any) only
+                                // runs once when a slab page is first carved, not on every
+                                // (re)allocation, so a recycled object can carry over
+                                // already-"written" bytes this hook never itself wrote. Drop RAW
+                                // immediately rather than risk faulting a legitimate read of
+                                // ctor-initialized or otherwise-preexisting content.
+                                let _ = m.ram.protect(pa, object_size, PERM_WRITE | PERM_READ);
+                            }
+                            Err(_) => ctx.san_errors += 1,
+                        }
+                    }
+                    _ => ctx.cache_alloc_size_unavailable += 1,
                 }
             }
             // Page-granularity UAF/OOB: a separate, independent query and a separate sanitizer
@@ -1459,6 +1523,9 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
                         page_allocs: 0,
                         page_frees: 0,
                         san_errors: 0,
+                        cache_allocs: 0,
+                        cache_bytes: 0,
+                        cache_alloc_size_unavailable: 0,
                     })
                 }
             }
@@ -1748,8 +1815,16 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     println!("  kernel crashes: {crashes}  ({} unique kernel PCs)", crash_sigs.len());
     if let Some(ctx) = &san_ctx {
         println!(
-            "  sanitizer     : {} kmalloc ({} bytes) / {} kfree  |  {} page-alloc / {} page-free  |  {} SanError(s)  [zero-FP slack-only + page-granularity, docs/emulator-sanitizers.md]",
-            ctx.allocs, ctx.bytes, ctx.frees, ctx.page_allocs, ctx.page_frees, ctx.san_errors
+            "  sanitizer     : {} kmalloc ({} bytes) / {} kfree  |  {} kmem_cache_alloc ({} bytes, {} size-unavailable)  |  {} page-alloc / {} page-free  |  {} SanError(s)  [zero-FP slack-only + page-granularity, docs/emulator-sanitizers.md]",
+            ctx.allocs,
+            ctx.bytes,
+            ctx.frees,
+            ctx.cache_allocs,
+            ctx.cache_bytes,
+            ctx.cache_alloc_size_unavailable,
+            ctx.page_allocs,
+            ctx.page_frees,
+            ctx.san_errors
         );
     }
     if cmplog {

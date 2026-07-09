@@ -49,6 +49,11 @@ struct LiveAlloc {
     /// addr+bucket_size)`. `None` for a classic [`Sanitizer::alloc`] allocation, which has no
     /// slack concept.
     slack: Option<(u32, u32)>,
+    /// Whether [`Sanitizer::free`] should poison this allocation's payload and quarantine it.
+    /// `true` for every ordinary allocation ([`Sanitizer::alloc`]/[`Sanitizer::alloc_with_slack`]).
+    /// `false` only for [`Sanitizer::alloc_exact_no_uaf_guard`] — see that constructor's doc
+    /// comment for the return-fired-hook race it exists to avoid.
+    free_poisons: bool,
 }
 
 /// Something went wrong at the sanitizer policy level (as opposed to a plain MMU [`Fault`], which
@@ -203,6 +208,7 @@ impl Sanitizer {
                 size,
                 redzone: self.redzone,
                 slack: None,
+                free_poisons: true,
             },
         );
         Ok(())
@@ -257,6 +263,63 @@ impl Sanitizer {
                 size: bucket_size,
                 redzone: 0,
                 slack: Some((req_size, bucket_size)),
+                free_poisons: true,
+            },
+        );
+        Ok(())
+    }
+
+    /// Record a new **exact-fit, no-UAF-guard** allocation: `size` live payload bytes at `addr`,
+    /// stamped `WRITE | RAW` exactly like [`Sanitizer::alloc_with_slack`] with `req_size ==
+    /// bucket_size` (no slack, no cross-object redzone) — but [`Sanitizer::free`] on an address
+    /// allocated this way skips poisoning/quarantining entirely (see `free_poisons` on
+    /// [`LiveAlloc`]).
+    ///
+    /// **Why this constructor needs to exist, empirically confirmed, not just theorized:** this is
+    /// for allocation families whose PC-hook can only learn the returned pointer once the call has
+    /// *returned* (e.g. [`crate::hooks::CacheAllocEvent`] for `kmem_cache_alloc` — the size lives
+    /// in guest memory, not a register, so the hook can't even stash a size at entry the way
+    /// [`crate::hooks::AllocHook`] does) — and whose callee can write into the object's payload
+    /// *during* the call, before that return (SLUB's own `GFP_ZERO`/ctor-driven zeroing memset).
+    /// If this exact address is currently quarantined (poisoned) from a *previous* matching free —
+    /// entirely plausible under fuzzing-scale process churn, since the guest's own SLUB freelist
+    /// can and does hand a just-freed slot straight back out — that in-call write lands on a
+    /// still-poisoned byte and faults: a real, confirmed false positive (`copy_signal`'s
+    /// `kmem_cache_alloc_noprof(signal_cachep, ...)`, whose own internal `memset` raced exactly
+    /// this way against a same-cache free from a few instructions earlier in the same case, caught
+    /// during this feature's own negative-control run against `firmware/Image`). [`Sanitizer::alloc`]/
+    /// [`Sanitizer::alloc_with_slack`] don't have this problem because their hook family
+    /// ([`crate::hooks::AllocHook`]) stashes the size *at entry* and the *only* thing that can run
+    /// before the matching return is the callee's own body — same hazard in principle, just
+    /// apparently rare enough for kmalloc's call volume/patterns not to have surfaced it, whereas
+    /// `kmem_cache_alloc`'s heaviest callers (`copy_signal`/`copy_process`-style per-fork/exit
+    /// allocations) hit it constantly under fuzzing-scale process churn.
+    ///
+    /// The honest cost: allocations made through this constructor get **no UAF detection** (free
+    /// leaves the payload's permission bits untouched — see [`Sanitizer::free`]) and no OOB-tail
+    /// coverage (there is no separate bucket size to have slack in). What they keep: accurate
+    /// `is_live`/double-alloc/double-free bookkeeping — which is itself a real improvement over
+    /// this allocation family being entirely untracked (every legitimate free of a
+    /// `kmem_cache_alloc`-sourced object previously reported a spurious [`SanError::InvalidFree`],
+    /// indistinguishable from a genuine double-free; now only a genuine double-free does).
+    pub fn alloc_exact_no_uaf_guard(
+        &mut self,
+        mmu: &mut Mmu,
+        addr: u32,
+        size: u32,
+    ) -> Result<(), SanError> {
+        if self.live.contains_key(&addr) {
+            return Err(SanError::DoubleAlloc { addr });
+        }
+        mmu.protect(addr, size, PERM_WRITE | PERM_RAW)?;
+        self.evict_quarantine(&addr);
+        self.live.insert(
+            addr,
+            LiveAlloc {
+                size,
+                redzone: 0,
+                slack: None,
+                free_poisons: false,
             },
         );
         Ok(())
@@ -316,10 +379,18 @@ impl Sanitizer {
     /// Free the live allocation at `addr`: poison the payload (guards were already poisoned and
     /// stay that way) and move it into quarantine so a subsequent access — before the address is
     /// ever reused by `alloc` — faults as use-after-free instead of silently succeeding.
+    ///
+    /// Exception: an address allocated via [`Sanitizer::alloc_exact_no_uaf_guard`] is removed from
+    /// live tracking (so `is_live`/double-free bookkeeping stays accurate) but its payload is
+    /// deliberately left untouched — no poison, no quarantine — see that constructor's doc comment
+    /// for the return-fired-hook race this avoids.
     pub fn free(&mut self, mmu: &mut Mmu, addr: u32) -> Result<(), SanError> {
         let Some(a) = self.live.remove(&addr) else {
             return Err(SanError::InvalidFree { addr });
         };
+        if !a.free_poisons {
+            return Ok(());
+        }
 
         mmu.poison(addr, a.size)?;
 
@@ -725,5 +796,128 @@ mod tests {
             san.reopen_slack(&mut mmu, addr).unwrap_err(),
             SanError::UnknownPointer { addr }
         );
+    }
+
+    // -- alloc_exact_no_uaf_guard: kmem_cache_alloc's no-UAF-guard exact-fit allocation --
+
+    #[test]
+    fn no_uaf_guard_alloc_behaves_like_a_normal_exact_fit_allocation_while_live() {
+        let mut mmu = Mmu::new(0x8000_0000, 0x2_0000);
+        let mut san = Sanitizer::new(16);
+        let base = 0x8001_0000;
+        san.alloc_exact_no_uaf_guard(&mut mmu, base, 64).unwrap();
+
+        // RAW oracle still applies while live: unwritten bytes fault, then read back fine.
+        assert_eq!(mmu.read_u8(base).unwrap_err().kind, FaultKind::Permission);
+        mmu.write(base, &[0x55; 64]).unwrap();
+        let mut buf = [0u8; 64];
+        mmu.read(base, &mut buf).unwrap();
+        assert_eq!(buf, [0x55; 64]);
+        assert!(san.is_live(base));
+
+        // No cross-object guard and no slack: the byte immediately past the object is untouched.
+        assert_eq!(mmu.perm_at(base + 64), Some(0));
+    }
+
+    #[test]
+    fn no_uaf_guard_free_does_not_poison_but_does_clear_liveness() {
+        let mut mmu = Mmu::new(0x8000_0000, 0x2_0000);
+        let mut san = Sanitizer::new(16);
+        let base = 0x8001_1000;
+        san.alloc_exact_no_uaf_guard(&mut mmu, base, 32).unwrap();
+        mmu.write(base, &[1; 32]).unwrap();
+
+        san.free(&mut mmu, base).unwrap();
+        assert!(!san.is_live(base));
+        // Unlike a normal free(), this one never poisons or quarantines — a stale pointer access
+        // right after free is NOT flagged as UAF (the honest, documented cost of avoiding the
+        // return-fired-hook race; see the constructor's doc comment).
+        assert!(!san.is_quarantined(base));
+        let mut buf = [0u8; 32];
+        mmu.read(base, &mut buf).unwrap();
+        assert_eq!(buf, [1; 32]);
+    }
+
+    #[test]
+    fn no_uaf_guard_double_free_is_still_reported() {
+        let mut mmu = Mmu::new(0x8000_0000, 0x2_0000);
+        let mut san = Sanitizer::new(16);
+        let base = 0x8001_2000;
+        san.alloc_exact_no_uaf_guard(&mut mmu, base, 16).unwrap();
+        san.free(&mut mmu, base).unwrap();
+        assert_eq!(
+            san.free(&mut mmu, base).unwrap_err(),
+            SanError::InvalidFree { addr: base }
+        );
+    }
+
+    #[test]
+    fn no_uaf_guard_double_alloc_is_still_reported() {
+        let mut mmu = Mmu::new(0x8000_0000, 0x2_0000);
+        let mut san = Sanitizer::new(16);
+        let base = 0x8001_3000;
+        san.alloc_exact_no_uaf_guard(&mut mmu, base, 16).unwrap();
+        assert_eq!(
+            san.alloc_exact_no_uaf_guard(&mut mmu, base, 16).unwrap_err(),
+            SanError::DoubleAlloc { addr: base }
+        );
+    }
+
+    /// The positive/regression proof for why `alloc_exact_no_uaf_guard` exists at all: replays
+    /// the exact race this feature's own negative-control run against `firmware/Image` hit
+    /// (`copy_signal`'s `kmem_cache_alloc_noprof` racing its own internal `memset` against a
+    /// same-address reuse). With a *normal* `alloc_with_slack`/`free` pair, poisoning on free and
+    /// only re-opening at the (necessarily delayed-to-return) next alloc means an in-call write
+    /// that lands on the address before that next alloc call is observed would fault — a false
+    /// positive. `alloc_exact_no_uaf_guard`'s `free` doesn't poison, so the identical sequence of
+    /// operations succeeds.
+    #[test]
+    fn no_uaf_guard_survives_the_return_fired_hook_reuse_race_that_a_normal_alloc_would_not() {
+        let mut mmu = Mmu::new(0x8000_0000, 0x2_0000);
+        let base = 0x8001_4000;
+
+        // Control: a normal alloc_with_slack()/free() pair DOES fault on this exact sequence —
+        // proving the race is real, not hypothetical, and that alloc_exact_no_uaf_guard's
+        // behavior below is a deliberate trade-off, not a no-op change.
+        {
+            let mut san = Sanitizer::new(16);
+            san.alloc_with_slack(&mut mmu, base, 64, 64).unwrap();
+            san.free(&mut mmu, base).unwrap();
+            // The guest's own allocator hands the same address back out immediately (this is
+            // "entry" for the new call — our PC-hook cannot see the pointer yet, so no alloc()
+            // call has happened yet) and the callee's *own* internal zeroing write races ahead of
+            // our hook's return-fired alloc() call.
+            let err = mmu.write_u8(base, 0).unwrap_err();
+            assert_eq!(
+                err.kind,
+                FaultKind::Permission,
+                "sanity check: a normal alloc/free pair really does fault on immediate reuse \
+                 before the matching alloc() call is observed"
+            );
+        }
+
+        // Test subject: alloc_exact_no_uaf_guard()/free() on the identical sequence does not.
+        {
+            let mut san = Sanitizer::new(16);
+            san.alloc_exact_no_uaf_guard(&mut mmu, base, 64).unwrap();
+            mmu.write(base, &[1; 64]).unwrap();
+            san.free(&mut mmu, base).unwrap();
+
+            // The allocator hands the same address straight back out; its own in-call zeroing
+            // write (before our hook observes the return and calls alloc_exact_no_uaf_guard
+            // again) must succeed, exactly like the real kmem_cache_alloc_noprof/memset race.
+            mmu.write(base, &[0; 64]).unwrap();
+
+            // Our hook then observes the return and re-registers the allocation as usual. Like
+            // the real fs-cli integration, drop RAW immediately afterward: the in-call write
+            // above already legitimately initialized the payload before this hook could see it
+            // (see the alloc site's own comment in fs-cli's `run_case` for why).
+            san.alloc_exact_no_uaf_guard(&mut mmu, base, 64).unwrap();
+            mmu.protect(base, 64, PERM_WRITE | fs_mmu::PERM_READ).unwrap();
+            assert!(san.is_live(base));
+            let mut buf = [0u8; 64];
+            mmu.read(base, &mut buf).unwrap();
+            assert_eq!(buf, [0; 64]);
+        }
     }
 }

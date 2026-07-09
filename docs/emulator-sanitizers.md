@@ -88,7 +88,18 @@ work. Park it; its watchpoint idea ports over directly once/if SMP lands.
 2. **KASAN slack-only + `ksize` hook** — finish `docs/kernel-san.md`'s plan calling `alloc_with_slack`
    instead of the cross-object guard; re-run the 500-case smoke test expecting **0% FP** (was ~40%).
 3. **KASAN page-granularity UAF** — new page-allocator PC-hook table (medium).
-4. **KMSAN taint** — its own phase (shadow regs + propagation + checkpoints).
+4. **`kmem_cache_alloc` coverage** (T3.4, done) — closed the "size unavailable" gap via a
+   cache-pointer-stashing hook (`fs_san::hooks::CacheAllocHook`) plus a guest-memory read of
+   `cachep->object_size` at the caller (fs-cli owns the `Mmu`, `hooks.rs` stays register-file-only).
+   **A real "free quarantine / delayed free" (widen the poisoned-until-reuse window by N frees)
+   was investigated for this same increment and rejected**: it cannot be zero-false-positive by
+   construction — the sanitizer never controls *when* the guest's own allocator hands a freed
+   slot back out, so refusing to honor legitimate quick reuse faults the guest's own next
+   legitimate write. See `crates/fs-san/DESIGN.md` §7 for the full reasoning, and for a second,
+   real race the `kmem_cache_alloc` closure itself had to fix (SLUB's own internal `GFP_ZERO`
+   zeroing racing a return-fired hook) — confirmed via an actual false positive against
+   `firmware/Image`, then fixed with `Sanitizer::alloc_exact_no_uaf_guard`.
+5. **KMSAN taint** — its own phase (shadow regs + propagation + checkpoints).
 
 The emulator-native sanitizers are correct and uninstrumented (the Windows-path virtue), but narrow on
 packed-kernel-heap OOB — a real, honest limitation, not an effort gap. The kernel-cooperative oracles

@@ -196,7 +196,7 @@ every one present:
 |---|---|---|
 | `kmalloc`, `__kmalloc`, `__kmalloc_noprof`, `kmalloc_noprof`, `__kmalloc_node` | alloc | size is the first argument -> `a0` |
 | `kmalloc_trace` | alloc | `(cache, flags, size)` -> size is the **third** argument -> `a2`, not `a0` |
-| `kmem_cache_alloc`, `kmem_cache_alloc_noprof` | alloc | **not hooked** — size is not an argument at all, it's `cachep->object_size` (a guest-memory read of a version-specific struct offset, which `hooks.rs`'s register-only design deliberately does not do); documented in `linux.rs` and skipped rather than guessed |
+| `kmem_cache_alloc`, `kmem_cache_alloc_noprof` | alloc | size is not an argument, it's `cachep->object_size` — **closed** via [`crate::hooks::CacheAllocHook`]/`on_cache_alloc_pc`: the cache pointer (a0) is stashed instead, and the caller (which owns an `Mmu`) reads `object_size` at the fixed offset `linux::KMEM_CACHE_OBJECT_SIZE_OFFSET` this project's kernel build's `mm/slab.h` layout gives it — see that constant's doc comment and §7 below |
 | `kfree`, `kfree_sensitive` | free | pointer is the only argument -> `a0` |
 | `kmem_cache_free` | free | `(cache, objp)` -> pointer is the **second** argument -> `a1`, not `a0` |
 
@@ -205,13 +205,8 @@ Names vary by kernel version (e.g. the `_noprof` variants only exist under
 rather than assuming a fixed set exists, mirroring the closed-source case where you likewise don't
 get to assume which symbols a given binary happens to export.
 
-**The one open gap:** `kmem_cache_alloc` allocations are currently invisible to the sanitizer
-(no hook is registered for them), since their size lives in the cache object, not the call's
-arguments. In practice a large share of kernel heap traffic still goes through the plain
-`kmalloc`/`kfree` family covered above; closing the `kmem_cache_alloc` gap would mean extending
-`AllocHook` with an optional "read size from guest memory at this struct offset instead of a
-register" mode — a small, mechanical extension, but real guest-memory access rather than pure
-register-file inspection, so it's called out here rather than silently faked with a guessed size.
+**The `kmem_cache_alloc` gap this section used to describe as open is now closed** (T3.4) — see §7
+below for the mechanism, the false-positive it took to get right, and the fix.
 
 **Worked example config (RISC-V, matches `hooks.rs` test coverage):**
 
@@ -264,10 +259,11 @@ gained matching unit tests for the new `poison`/`in_bounds`/`perm_at` primitives
 assorted noise: blank lines, other symbol types, a malformed line) and assert: noise is ignored
 and only real symbol lines are captured; `register_kernel_allocator_hooks` wires up a found
 `kmalloc`/`kfree` pair end-to-end through `PcHooks::on_pc` exactly as `hooks.rs`'s own tests drive
-`PcHooks` directly; `kmem_cache_alloc`/`kmem_cache_alloc_noprof` are confirmed to never fire a
-hook (the documented size-unavailable gap) while `kmem_cache_free`'s pointer is confirmed to come
-from `a1`, not `a0`, unlike every other free-shaped hook; and registering against an empty symbol
-table is a safe no-op.
+`PcHooks` directly; `kmem_cache_alloc`/`kmem_cache_alloc_noprof` are confirmed to register as
+`CacheAllocHook`s and surface only through `on_cache_alloc_pc` (never `on_pc`) while
+`kmem_cache_free`'s pointer is confirmed to come from `a1`, not `a0`, unlike every other
+free-shaped hook; and registering against an empty symbol table is a safe no-op. See §7 for the
+`kmem_cache_alloc` feature's own dedicated positive/negative-control tests.
 
 `pages.rs`'s tests (§6) drive `PageSanitizer` directly against an `Mmu`: alloc is plain
 `READ | WRITE` with no RAW oracle; `free_pages` poisons *exactly* `[base_pa, base_pa + (PAGE <<
@@ -346,3 +342,70 @@ path `Sanitizer`'s errors should already feed. `PageSanitizer` derives `Clone`, 
 `Sanitizer` needs to (per §3's snapshot/reset lifecycle note in `docs/kernel-san.md`) — a future
 integration must clone-and-restore it every fuzzing case in lockstep with `Sanitizer` and `Mmu`'s
 own dirty-block reset, for the identical reason.
+
+## 7. T3.4: why the "free quarantine" doesn't exist, and what was built instead
+
+The obvious next increment (real KASAN's generic-mode quarantine: hold a freed object out of
+circulation for a while so a stale-pointer access has a wider poisoned window to land in before
+reuse) was investigated first, since it's the naturally-recommended next step on top of §2's
+existing free-quarantine. **It does not survive contact with the zero-false-positive gate, for a
+structural reason, not a tuning problem:**
+
+- The only way this sanitizer ever learns "an address is live again" is a *matching* `alloc()`/
+  `alloc_with_slack()` call — which fires no earlier than the guest's own PC-hooked allocator
+  entry/return. The guest's *real* allocator (SLUB) decides, entirely on its own, when a freed
+  slot is handed back out; this sanitizer never allocates address space itself (§1) and cannot
+  safely veto or redirect that decision — redirecting the returned pointer to a different address
+  is exactly the KFENCE-relocation idea `docs/emulator-sanitizers.md` already rejects (the
+  redirected address needs a real, kernel-version-correct `struct page` the sanitizer cannot
+  forge), and refusing to honor the reuse at the permission-check level means the guest's own
+  *legitimate* next write to that address — which the guest's allocator has already promised the
+  address to — faults. That fault is indistinguishable from a real bug to the fuzzer: a guaranteed
+  false positive on any workload that ever reuses a freed slot quickly, which stock SLUB does
+  constantly (LIFO per-CPU freelists are *designed* for fast reuse).
+- This isn't hypothetical: implementing exactly this ("hold quarantine for N frees before allowing
+  the matching `alloc()` to re-open it") was prototyped and reasoned through, and the failure mode
+  above is guaranteed by construction for any `N >= 1` — there is no tuning value that avoids it,
+  because the sanitizer has no way to distinguish "the guest's allocator legitimately reusing this
+  slot" from "an attacker-controlled UAF landing on the same address" until *after* the write
+  already either succeeded or (wrongly) faulted.
+
+**What T3.4 built instead — closing the `kmem_cache_alloc` coverage gap (§3c/§7):** a different,
+real, zero-FP-safe improvement: `kmem_cache_alloc`/`kmem_cache_alloc_noprof` were previously
+invisible to the sanitizer entirely (`Convention::AllocSizeUnavailable`, since the size is
+`cachep->object_size`, a guest-memory field, not a register argument). This is now hooked via
+[`crate::hooks::CacheAllocHook`]/`on_cache_alloc_pc`, which stashes the **cache pointer** (a plain
+register value, available at entry) rather than a size, keeping `hooks.rs` register-file-only; the
+`object_size` guest-memory read (at the RV32-layout-derived offset
+`linux::KMEM_CACHE_OBJECT_SIZE_OFFSET = 16`, self-checked against
+`linux::KMEM_CACHE_OBJECT_SIZE_MAX` before being trusted) happens at the one call site that already
+owns an `Mmu` (fs-cli's `run_case`).
+
+**A second, empirically-confirmed race this closure had to fix in turn:** `kmem_cache_alloc`'s
+pointer is only known at *return* — exactly like `AllocHook`'s existing kmalloc dance — but SLUB's
+*own* internal `GFP_ZERO`/ctor zeroing can write into the object *during* the call, before that
+return fires. A negative-control run (`fuzz --sanitize --cases 3000` against `firmware/Image`)
+caught this directly: `copy_signal`'s `kmem_cache_alloc_noprof(signal_cachep, ...)` raced its own
+internal `memset` against a same-cache free from earlier in the same case — a real false positive.
+The fix, [`crate::Sanitizer::alloc_exact_no_uaf_guard`]: allocations made through it are exempt
+from free-time poisoning/quarantine (an honest, deliberate cost — no UAF byte-detection for this
+allocation family) but keep exact live-tracking, so double-alloc/double-free bookkeeping is
+unaffected. This is itself a real improvement over the pre-existing invisibility: every
+`kmem_cache_free` of a `kmem_cache_alloc`-sourced object used to report a spurious
+`SanError::InvalidFree` (indistinguishable from a genuine double-free); now only a genuine
+double-free does (`linux.rs`'s
+`kmem_cache_alloc_hook_turns_a_noisy_invalid_free_into_a_real_double_free_signal` proves both
+halves of this directly). `alloc.rs`'s
+`no_uaf_guard_survives_the_return_fired_hook_reuse_race_that_a_normal_alloc_would_not` reproduces
+the exact race at the unit level: a control block using a normal `alloc_with_slack`/`free` pair on
+the identical sequence *does* fault (proving the race is real, not hypothetical), while
+`alloc_exact_no_uaf_guard`'s sequence does not.
+
+**Validation:** `cargo test -p fs-san` (59 tests, including the above); `cargo run -p fs-diff
+--release -- --mode all` still Spike 5/5 (this work never touches the execution path); three
+`fuzz --sanitize --cases 3000` runs (seeds 1/2/3, 9000 cases total) against `firmware/Image`
+post-fix report **zero kernel crashes** — a real regression run, since the pre-fix build reliably
+hit the `copy_signal` race within the first ~1400 of 3000 cases on seed 1 — while `kmem_cache_alloc`
+fired tens of thousands of times across the three runs with **zero** `object_size` self-check
+failures, confirming `KMEM_CACHE_OBJECT_SIZE_OFFSET`'s derivation holds for this kernel build in
+practice, not just on paper.
