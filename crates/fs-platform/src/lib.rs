@@ -22,8 +22,19 @@ const CLINT_MTIME: u32 = 0xbff8;
 pub struct Clint {
     pub msip: u32,
     pub mtimecmp: u64,
-    /// Snapshot of virtual time, refreshed by the driver each step so MMIO reads see it.
+    /// Snapshot of virtual time, refreshed by the driver each step so MMIO reads see it. On the
+    /// single-hart path this stays `cpu.virtual_time()` (an `insns_retired` identity) exactly as
+    /// before; the multi-hart scheduler (`run_smp`) instead drives it from its own scheduler-owned
+    /// global tick (`docs/smp-design.md` item 3) — no single hart's retired-instruction count
+    /// generalizes to N harts.
     pub mtime: u64,
+    /// SMP mechanical core (`docs/smp-design.md` item 3): hart 1..N's MSIP/mtimecmp, indexed by
+    /// `hart - 1`. `msip`/`mtimecmp` above stay hart 0's registers, UNCHANGED in type and meaning,
+    /// so every existing single-hart reader (`fs-cli`'s traced boot loop, the tests below) keeps
+    /// reading them exactly as before. Empty for a single-hart `Machine` (`Clint::default`) —
+    /// `run_smp` is the only thing that ever grows these.
+    pub msip_extra: Vec<u32>,
+    pub mtimecmp_extra: Vec<u64>,
 }
 
 impl Clint {
@@ -35,6 +46,20 @@ impl Clint {
             o if o == CLINT_MTIMECMP + 4 => (self.mtimecmp >> 32) as u32,
             o if o == CLINT_MTIME => self.mtime as u32,
             o if o == CLINT_MTIME + 4 => (self.mtime >> 32) as u32,
+            // SMP mechanical core: hart 1..N's MSIP window (4 bytes/hart, same stride as real
+            // SiFive/ACLINT CLINT). Never reached by a single-hart `Machine` (`msip_extra` is
+            // empty, `nharts == 1` never probes offset >= 4 here).
+            o if (CLINT_MSIP + 4..CLINT_MTIMECMP).contains(&o) && (o - CLINT_MSIP).is_multiple_of(4) => {
+                let hart = ((o - CLINT_MSIP) / 4) as usize;
+                self.msip_extra.get(hart - 1).copied().unwrap_or(0) & 1
+            }
+            // Hart 1..N's mtimecmp window (8 bytes/hart).
+            o if (CLINT_MTIMECMP + 8..CLINT_MTIME).contains(&o) => {
+                let rel = o - CLINT_MTIMECMP;
+                let hart = (rel / 8) as usize;
+                let v = self.mtimecmp_extra.get(hart - 1).copied().unwrap_or(u64::MAX);
+                if rel.is_multiple_of(8) { v as u32 } else { (v >> 32) as u32 }
+            }
             _ => 0,
         }
     }
@@ -46,6 +71,23 @@ impl Clint {
             }
             o if o == CLINT_MTIMECMP + 4 => {
                 self.mtimecmp = (self.mtimecmp & 0xffff_ffff) | ((val as u64) << 32)
+            }
+            o if (CLINT_MSIP + 4..CLINT_MTIMECMP).contains(&o) && (o - CLINT_MSIP).is_multiple_of(4) => {
+                let hart = ((o - CLINT_MSIP) / 4) as usize;
+                if let Some(slot) = self.msip_extra.get_mut(hart - 1) {
+                    *slot = val & 1;
+                }
+            }
+            o if (CLINT_MTIMECMP + 8..CLINT_MTIME).contains(&o) => {
+                let rel = o - CLINT_MTIMECMP;
+                let hart = (rel / 8) as usize;
+                if let Some(slot) = self.mtimecmp_extra.get_mut(hart - 1) {
+                    *slot = if rel.is_multiple_of(8) {
+                        (*slot & 0xffff_ffff_0000_0000) | val as u64
+                    } else {
+                        (*slot & 0xffff_ffff) | ((val as u64) << 32)
+                    };
+                }
             }
             _ => {} // mtime is read-only (driven by the CPU)
         }
@@ -118,6 +160,19 @@ impl Machine {
             clint: Clint::default(),
             uart: Uart::default(),
         }
+    }
+
+    /// SMP mechanical core (`docs/smp-design.md` items 2/3): same as [`Machine::new`], but with
+    /// `clint.msip_extra`/`clint.mtimecmp_extra` pre-sized for `nharts` harts (hart 0 still uses
+    /// the scalar `msip`/`mtimecmp` fields; this only grows the hart-1.. arrays). `mtimecmp_extra`
+    /// entries start at `u64::MAX` (disabled until programmed), mirroring `Csr::default`'s hart-0
+    /// convention. `nharts <= 1` is identical to `Machine::new` (empty extra arrays).
+    pub fn new_smp(ram_base: u32, ram_size: u32, nharts: usize) -> Self {
+        let mut m = Self::new(ram_base, ram_size);
+        let extra = nharts.saturating_sub(1);
+        m.clint.msip_extra = vec![0; extra];
+        m.clint.mtimecmp_extra = vec![u64::MAX; extra];
+        m
     }
 
     fn in_ram(&self, addr: u32) -> bool {
@@ -340,6 +395,47 @@ impl Snapshot {
     }
 }
 
+/// SMP mechanical core (`docs/smp-design.md` item 5): the same golden-snapshot/dirty-reset
+/// discipline as [`Snapshot`], generalized from one `cpu: Cpu` to `cpus: Vec<Cpu>` — mechanical,
+/// just iterate. A distinct type rather than a change to `Snapshot` itself: `Snapshot::capture`/
+/// `Snapshot::reset`'s existing single-`Cpu` signature is `fs-cli`'s fuzz-loop API and stays
+/// completely untouched, so the single-hart snapshot/reset path is byte-for-byte identical to
+/// before this change (same struct, same fields, same code — not just "behaves the same").
+#[derive(Clone)]
+pub struct SnapshotSmp {
+    gmem: Vec<u8>,
+    gperms: Vec<u8>,
+    cpus: Vec<Cpu>,
+    clint: Clint,
+    uart_len: usize,
+}
+
+impl SnapshotSmp {
+    /// Capture all harts plus RAM/CLINT/UART as golden and switch RAM into dirty-tracking mode.
+    pub fn capture(cpus: &[Cpu], machine: &mut Machine) -> Self {
+        let (m, p) = machine.ram.planes();
+        let gmem = m.to_vec();
+        let gperms = p.to_vec();
+        machine.ram.enable_dirty_tracking();
+        SnapshotSmp {
+            gmem,
+            gperms,
+            cpus: cpus.to_vec(),
+            clint: machine.clint.clone(),
+            uart_len: machine.uart.out.len(),
+        }
+    }
+
+    /// Restore every hart plus RAM/CLINT/UART to the golden state in O(bytes dirtied since the
+    /// last reset/capture) — same reset discipline as [`Snapshot::reset`], applied to all harts.
+    pub fn reset(&self, cpus: &mut Vec<Cpu>, machine: &mut Machine) {
+        machine.ram.reset_dirty(&self.gmem, &self.gperms);
+        cpus.clone_from(&self.cpus);
+        machine.clint = self.clint.clone();
+        machine.uart.out.truncate(self.uart_len);
+    }
+}
+
 /// Why a run stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stop {
@@ -400,6 +496,156 @@ pub fn run(cpu: &mut Cpu, machine: &mut Machine, max_insns: u64) -> Option<u32> 
         }
     }
     None
+}
+
+// -------------------------------------------------------------------------------------------
+// SMP mechanical core (`docs/smp-design.md`, T5.1a): a fixed-quantum round-robin scheduler
+// driving `N` harts over ONE shared `Machine`, still on a single host thread (never real OS
+// threads across harts — a permanent constraint, `docs/smp-design.md` §4 risk 7). This section
+// is purely additive: `run`/`run_until` above are untouched, so the single-hart path stays
+// byte-for-byte identical by construction, not merely "by behavior".
+// -------------------------------------------------------------------------------------------
+
+/// Same as [`apply_clint`], but indexed by hart (`docs/smp-design.md` item 3): hart 0 reads the
+/// scalar `msip`/`mtimecmp` (identical to `apply_clint`'s hart-0-only view), hart >= 1 reads
+/// `msip_extra`/`mtimecmp_extra`. A deliberate small duplication of `apply_clint` rather than a
+/// refactor of it, so `apply_clint`/`sync_timer`/`run`/`run_until` are literally untouched.
+#[inline]
+fn apply_clint_hart(cpu: &mut Cpu, clint: &Clint, hart: usize) {
+    let (msip, mtimecmp) = if hart == 0 {
+        (clint.msip, clint.mtimecmp)
+    } else {
+        (
+            clint.msip_extra.get(hart - 1).copied().unwrap_or(0),
+            clint.mtimecmp_extra.get(hart - 1).copied().unwrap_or(u64::MAX),
+        )
+    };
+    cpu.csr.mtimecmp = mtimecmp;
+    if msip & 1 != 0 {
+        cpu.csr.mip |= MIP_MSIP;
+    } else {
+        cpu.csr.mip &= !MIP_MSIP;
+    }
+}
+
+/// A `Bus` wrapper around `&mut Machine` used only by [`run_smp`]: forwards every call unchanged,
+/// but additionally records the physical `(addr, size)` of every successful `store()` — which
+/// covers a plain `Store`, a successful `sc.w`, and an AMO's read-modify-write alike, since all
+/// three funnel through `Bus::store` in `fs-riscv`'s `store_impl`/`exec_one` (`docs/smp-design.md`
+/// item 4). `run_smp` drains `writes` after each hart's turn and invalidates any OTHER hart's
+/// reservation that overlaps a recorded span via [`fs_riscv::Cpu::invalidate_reservation`].
+///
+/// Relies on `Bus::fast_ptr`'s trait default (`None`, declined) staying in effect here — a fast
+/// path returning a raw host pointer would let a JIT-compiled chain write memory without ever
+/// calling `store()`, silently bypassing recording and breaking cross-hart invalidation. This is
+/// exactly why `docs/smp-design.md` keeps fs-jit gated off for the SMP mechanical core: `run_smp`
+/// only ever calls the interpreter (`Cpu::step_system`), which never touches `fast_ptr`.
+struct RecordingBus<'a> {
+    machine: &'a mut Machine,
+    writes: Vec<(u32, u8)>,
+}
+
+impl<'a> Bus for RecordingBus<'a> {
+    fn load(&mut self, addr: u32, size: u8) -> Result<u32, Fault> {
+        self.machine.load(addr, size)
+    }
+    fn store(&mut self, addr: u32, size: u8, val: u32) -> Result<(), Fault> {
+        let r = self.machine.store(addr, size, val);
+        if r.is_ok() {
+            self.writes.push((addr, size));
+        }
+        r
+    }
+    fn ifetch16(&mut self, addr: u32) -> Result<u16, Fault> {
+        self.machine.ifetch16(addr)
+    }
+    fn store_may_assert_interrupt(&self, addr: u32, size: u8) -> bool {
+        self.machine.store_may_assert_interrupt(addr, size)
+    }
+    fn read_raw_state(&self, addr: u32, len: u8) -> u32 {
+        self.machine.read_raw_state(addr, len)
+    }
+    fn write_shadow(&mut self, addr: u32, len: u8, taint_mask: u32) {
+        self.machine.write_shadow(addr, len, taint_mask)
+    }
+}
+
+/// Per-hart outcome of [`run_smp`] — `stops[i]` is hart `i`'s reason for no longer being
+/// scheduled (`Stop::Budget` if the overall tick deadline hit before that hart itself stopped).
+pub type SmpStop = Vec<Stop>;
+
+/// Fixed-quantum round-robin multi-hart scheduler (`docs/smp-design.md` items 2-4, Phase 1/2's
+/// mechanical core): drives `cpus` (one [`Cpu`] per hart, in strict index order) over `machine`,
+/// `quantum` instructions per hart-turn (a hart's turn ends early if it halts/hypercalls first).
+/// Rounds repeat until every hart has stopped or the scheduler's own global tick — the sum of
+/// instructions retired across ALL harts so far, NOT any one hart's `insns_retired`/
+/// `virtual_time()` — reaches `deadline_ticks`. `machine.clint.mtime` is driven from this same
+/// global tick every step (`docs/smp-design.md` item 3): the single-hart identity
+/// `mtime = cpu.virtual_time()` does not generalize to N harts, so this is its scheduler-owned
+/// replacement.
+///
+/// Determinism (the whole point, `docs/smp-design.md` §0/§4 risk 3): hart order, quantum, and
+/// the global tick are pure functions of the starting `(cpus, machine)` state and `quantum`/
+/// `deadline_ticks` — no wall-clock, no real threads, no host-timing dependence anywhere. Two
+/// calls from byte-identical starting state produce byte-identical final `cpus`/`machine` state,
+/// exactly generalizing the single-hart reproducibility guarantee (decision #7) from 1 to N harts.
+///
+/// Cross-hart LR/SC invalidation (item 4, the most correctness-critical piece): each hart's turn
+/// runs over a [`RecordingBus`] that records every successful store's physical span; once a turn
+/// ends, every OTHER hart's reservation overlapping a recorded span is cleared via
+/// [`fs_riscv::Cpu::invalidate_reservation`]. Deferring invalidation to end-of-turn (rather than
+/// after each individual store) is equivalent to doing it immediately: no other hart executes
+/// anything in between two stores within the same hart's turn, so the observable result is
+/// identical either way.
+pub fn run_smp(cpus: &mut [Cpu], machine: &mut Machine, quantum: u64, deadline_ticks: u64) -> SmpStop {
+    let n = cpus.len();
+    let mut stops: Vec<Option<Stop>> = vec![None; n];
+    let mut tick: u64 = 0;
+    if n == 0 {
+        return Vec::new();
+    }
+    'outer: loop {
+        for h in 0..n {
+            if stops[h].is_some() {
+                continue;
+            }
+            let turn_deadline = cpus[h].insns_retired + quantum;
+            // Reborrow (not move) `machine`: `&mut *machine` yields a fresh, shorter-lived
+            // mutable borrow that expires at the end of this loop iteration, so the next hart's
+            // turn can reborrow `machine` again.
+            let mut rec = RecordingBus { machine: &mut *machine, writes: Vec::new() };
+            loop {
+                rec.machine.clint.mtime = tick;
+                apply_clint_hart(&mut cpus[h], &rec.machine.clint, h);
+                match cpus[h].step_system(&mut rec) {
+                    SysExit::Continue => {}
+                    SysExit::Halt(c) => {
+                        stops[h] = Some(Stop::Halt(c));
+                    }
+                    SysExit::Hypercall(c) => {
+                        stops[h] = Some(Stop::Hypercall(c));
+                    }
+                }
+                tick += 1;
+                if stops[h].is_some() || cpus[h].insns_retired >= turn_deadline || tick >= deadline_ticks {
+                    break;
+                }
+            }
+            // Cross-hart invalidation: any write this hart just made (a plain Store, a
+            // successful sc.w, or an AMO) may invalidate an OTHER hart's outstanding reservation.
+            for &(addr, len) in &rec.writes {
+                for (other, cpu_other) in cpus.iter_mut().enumerate() {
+                    if other != h {
+                        cpu_other.invalidate_reservation(addr, len as u32);
+                    }
+                }
+            }
+            if stops.iter().all(|s| s.is_some()) || tick >= deadline_ticks {
+                break 'outer;
+            }
+        }
+    }
+    stops.into_iter().map(|s| s.unwrap_or(Stop::Budget)).collect()
 }
 
 #[cfg(test)]

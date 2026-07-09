@@ -907,6 +907,41 @@ impl Cpu {
         }
     }
 
+    /// SMP mechanical core (`docs/smp-design.md` item 1): build a hart with `mhartid` set to
+    /// `hartid` instead of the hardcoded-0 [`Csr::default`]. Purely additive — [`Cpu::new`] above
+    /// is untouched and still yields `mhartid == 0`, so every existing single-hart caller across
+    /// the workspace keeps building hart 0 exactly as before with zero code changes on their end.
+    pub fn new_hart(entry: u32, hartid: u32) -> Self {
+        let mut cpu = Self::new(entry);
+        cpu.csr.mhartid = hartid;
+        cpu
+    }
+
+    /// SMP mechanical core (`docs/smp-design.md` item 4): read this hart's current LR/SC
+    /// reservation, if any. Used by a multi-hart scheduler (`fs-platform`) to decide whether a
+    /// sibling hart's store/AMO must invalidate it — never consulted on the single-hart path.
+    pub fn reservation(&self) -> Option<u32> {
+        self.reservation
+    }
+
+    /// SMP mechanical core (`docs/smp-design.md` item 4, the most correctness-critical piece):
+    /// clear this hart's reservation if it falls anywhere inside the just-written `[addr, addr+len)`
+    /// span. A hart's OWN `sc.w`/AMO already clears its own reservation inline in `exec_one` (that
+    /// path is untouched); this is the missing half — a plain store or AMO issued by ANY OTHER
+    /// hart to the same word must also invalidate it, or `sc.w` can spuriously succeed
+    /// concurrently with another hart's write, fabricating a "race" that never happened
+    /// architecturally. Only ever called by a multi-hart scheduler after a sibling hart's write;
+    /// single-hart callers never call this, so single-hart behavior is unaffected by construction.
+    pub fn invalidate_reservation(&mut self, addr: u32, len: u32) {
+        if let Some(r) = self.reservation {
+            let lo = addr as u64;
+            let hi = lo + len as u64;
+            if (lo..hi).contains(&(r as u64)) {
+                self.reservation = None;
+            }
+        }
+    }
+
     /// Enable or disable comparison-coverage recording. Enabling (re)starts from an empty log;
     /// disabling drops any log content and reverts `step` to zero-cost. Purely observational —
     /// toggling it never changes what a program computes, only what side-channel is recorded.
