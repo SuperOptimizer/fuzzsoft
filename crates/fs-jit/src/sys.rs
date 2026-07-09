@@ -1,39 +1,56 @@
 //! Isolated unsafe surface for `fs-jit`'s native chain codegen (Phase 1 of
-//! `docs/jit-scalar-design.md`): the W^X executable arena (`mmap(RW)` -> write machine code ->
-//! `mprotect(R-X)` before any execution) and the raw fn-pointer call into it. Mirrors
-//! `fs-hostmem`'s `sys.rs` convention: `unsafe` is confined to exactly this file. Every other
-//! module in this crate (`lib.rs`, `emit.rs`, `chain.rs`) keeps `#![forbid(unsafe_code)]`.
+//! `docs/jit-scalar-design.md`): the W^X executable arena and the raw fn-pointer call into it.
+//! Mirrors `fs-hostmem`'s `sys.rs` convention: `unsafe` is confined to exactly this file. Every
+//! other module in this crate (`lib.rs`, `emit.rs`, `chain.rs`) keeps `#![forbid(unsafe_code)]`.
 //!
-//! **W^X invariant.** No byte of the arena is ever simultaneously writable and executable: each
-//! [`Arena::write`] call `mprotect`s only the (page-aligned) range spanning the bytes it is about
-//! to append to `RW`, copies, then immediately `mprotect`s that SAME range back to `R-X` before
-//! returning — a page containing a previously-compiled, already-cached chain is never touched
-//! again (append-only bump allocator; Phase 1 never evicts or rewrites), so once a page goes `R-X`
-//! it stays `R-X` for the rest of the run. Nothing calls into the arena during a write's brief `RW`
-//! window (compilation and execution never interleave — `fs-jit` is single-threaded and
-//! `ChainCache::run_block` never calls a chain while mid-compile), so at every observable instant
-//! every byte of the mapping is either `r-x` (compiled, callable) or `rw-` (not yet compiled, or
-//! the one page currently being written), never `rwx` and never callable while writable. See
-//! `adversarial_wx_arena_is_never_simultaneously_writable_and_executable` below for a test that
-//! reads `/proc/self/maps` and asserts this.
+//! **Dual-mapping W^X (Stage: parallel-scaling fix).** An earlier version used a single `mmap`
+//! toggled `RW`->`R-X` via `mprotect` on every write. That's correct single-threaded, but
+//! `mprotect` takes the kernel's process-wide `mmap_lock` (a single lock shared by every thread
+//! in the process, regardless of which thread's arena is being touched) — under `--jobs N`, N
+//! worker threads each compiling their own chains into their own *separate* arenas nonetheless
+//! all serialize on that one lock. Measured via `strace -c -f --jit-chain --jobs 16`: `mprotect`
+//! was 89.6% of syscall time (~994k calls), and `--jit-chain --jobs 32` ran at 0.08x the plain
+//! interpreter — the JIT made parallel fuzzing drastically SLOWER, not faster.
 //!
-//! **Why per-write, not whole-arena, `mprotect`.** An earlier version `mprotect`'d the *entire*
-//! arena on every write. That measured as a severe, worsening-over-time cost on the boot+
-//! syscall-fuzz benchmark (`docs/jit-scalar-design.md`'s benchmark section): `mprotect`'s cost
-//! scales with how much of the target range has actually been faulted in, so re-protecting the
-//! whole (growing) already-populated prefix on every single new chain compile got progressively
-//! more expensive as the run went on, at one point costing more than the interpreter work it was
-//! supposed to save. `mprotect`ing only the newly-written page(s) bounds each call's cost to a
-//! small, constant number of pages regardless of how full the arena already is.
+//! The fix: back the arena with a `memfd_create` file and `mmap` it **twice** (`MAP_SHARED`, same
+//! fd, same offsets) into two disjoint virtual mappings of the SAME physical pages:
+//!   - `write_ptr`: `PROT_READ | PROT_WRITE` — never executable. All codegen writes go here.
+//!   - `exec_ptr`: `PROT_READ | PROT_EXEC` — never writable. Every [`JitFn`] returned by
+//!     [`Arena::write`]/dispatched by [`Arena::call`] is `exec_ptr + offset`.
+//!
+//! Both mappings are established ONCE, at [`Arena::new`] (i.e. once per worker thread, at
+//! per-thread arena construction) — never again for the rest of that thread's run. A compile
+//! ([`Arena::write`]) is then a plain `memcpy` into `write_ptr`, with NO syscall at all, let alone
+//! one that touches `mmap_lock`. This is the actual fix: the hot per-compile path no longer makes
+//! ANY syscall, so N worker threads compiling concurrently make zero contended kernel calls
+//! between them.
+//!
+//! **W^X invariant, restated for dual-mapping.** No single mapping is ever both writable and
+//! executable: `write_ptr`'s mapping is permanently `rw-` (never gains `x`) and `exec_ptr`'s
+//! mapping is permanently `r-x` (never gains `w`) for the entire lifetime of the `Arena` — neither
+//! mapping's protection ever changes after `new()` returns. This is strictly stronger than Phase
+//! 1's invariant (which allowed a page to be transiently `rw-` mid-write): here NEITHER view is
+//! ever writable-and-executable, and in fact the execute view is never writable at all, at any
+//! point in its existence. See `adversarial_wx_arena_is_never_simultaneously_writable_and_executable`
+//! below for a test that reads `/proc/self/maps` and asserts both mappings' permissions.
+//!
+//! **Why this is safe without an explicit icache flush (x86-64 only).** x86-64's instruction
+//! cache is coherent with the data cache via physical-address snooping: a store through
+//! `write_ptr` and a subsequent fetch through `exec_ptr` both resolve to the same physical page,
+//! and the CPU's cache-coherence protocol guarantees the fetch observes the store — no
+//! `clflush`/serializing instruction is required for correctness on this architecture. (An
+//! AArch64 port would NOT get this for free — ARM's icache is not automatically coherent with the
+//! dcache, so a port would need `__builtin___clear_cache`/`cacheflush` after every write, before
+//! the first call into freshly-written bytes.) [`Arena::write`] still issues a
+//! `compiler_fence(Ordering::SeqCst)` after the `copy_nonoverlapping` and before returning the
+//! offset, so the compiler itself cannot reorder the memcpy past the point callers (`chain.rs`)
+//! treat the offset as callable — the "finish writing the whole chain, then call it" sequencing
+//! the design doc calls for.
 
 use fs_mmu::Bus;
 use fs_riscv::{Cpu, LoadOp, StoreOp};
 use std::io;
-
-/// Standard x86-64 Linux page size. Hardcoded rather than queried via `sysconf` (this crate is
-/// already Linux/x86-64-specific — `sys.rs`'s raw codegen and `mmap`/`mprotect` usage don't
-/// pretend otherwise) — bounds every `mprotect` call to the smallest range that covers a write.
-const PAGE_SIZE: usize = 4096;
+use std::sync::atomic::{compiler_fence, Ordering};
 
 /// SAFETY-relevant ABI. `rdi`=cpu ptr, `rsi`/`rdx` = the two words of a decomposed `&mut dyn Bus`
 /// fat pointer (unused by any Phase 1-emitted code — Phase 1 compiles no `Load`/`Store` and never
@@ -224,38 +241,102 @@ pub(crate) fn store_shim_addr(op: StoreOp) -> u64 {
 /// utilization.
 const ARENA_CAPACITY: usize = 256 * 1024 * 1024;
 
-/// A single fixed-capacity, bump-allocated, W^X executable arena.
+/// `MFD_CLOEXEC` (memfd flag). Not exposed by the `libc` crate for the glibc/Linux target as of
+/// `libc = "0.2"` (only defined for its Android/FreeBSD/L4Re/Fuchsia targets) — the numeric value
+/// is stable uapi (`include/uapi/linux/memfd.h`) so it's hardcoded here rather than pulled in via
+/// a raw `libc::syscall`. Not load-bearing for correctness (this process never `exec`s, and the fd
+/// is closed immediately after both mappings are established — see [`Arena::new`]); set anyway as
+/// routine hygiene against some future code path that forks+execs while an `Arena` is alive.
+const MFD_CLOEXEC: libc::c_uint = 1;
+
+/// A single fixed-capacity, bump-allocated, dual-mapped W^X executable arena. Backed by one
+/// `memfd_create` file, mapped twice (see the module doc): `write_ptr` (`RW`, never executable)
+/// is where codegen writes; `exec_ptr` (`R-X`, never writable) is where compiled chains are
+/// called from. Both mappings alias the same physical pages, established once in [`Arena::new`]
+/// and never re-protected afterward — there is no per-compile `mprotect` (the entire point of
+/// this design; see the module doc's parallel-scaling rationale).
 pub struct Arena {
-    ptr: *mut u8,
+    write_ptr: *mut u8,
+    exec_ptr: *mut u8,
     len: usize,
 }
 
-// SAFETY: `Arena` owns an exclusively-mapped memory region; nothing aliases `ptr` outside this
-// type, and `ChainCache` (the sole owner) is used from a single thread in every caller in this
-// codebase. Not `Sync`; `Send` is fine (moving the mapping across threads, not sharing it, is safe).
+// SAFETY: `Arena` owns two exclusively-held mappings of a memfd it created itself; nothing
+// aliases `write_ptr`/`exec_ptr` outside this type, and `ChainCache` (the sole owner) is used
+// from a single thread in every caller in this codebase (one `Arena` per worker thread under
+// `--jobs`, never shared). Not `Sync`; `Send` is fine (moving the mappings across threads, not
+// sharing them, is safe).
 unsafe impl Send for Arena {}
 
 impl Arena {
-    /// `mmap` a fresh `ARENA_CAPACITY`-byte region, initially `PROT_READ | PROT_WRITE` (so the
-    /// first chain can be written before anything ever executes from it).
+    /// Create the arena's backing store (`memfd_create` + `ftruncate` to `ARENA_CAPACITY`) and
+    /// map it twice: once `PROT_READ | PROT_WRITE` (`write_ptr`, for codegen), once
+    /// `PROT_READ | PROT_EXEC` (`exec_ptr`, for calling compiled chains). Both `MAP_SHARED` over
+    /// the same fd/offset so they alias the same physical pages. The fd itself is closed right
+    /// after both mappings succeed — once mapped, a mapping keeps the underlying file object
+    /// alive on its own; the fd is not needed again (this arena never grows or re-maps).
     pub fn new() -> io::Result<Self> {
-        // SAFETY: standard anonymous-mapping mmap; args are all valid (null hint, positive
-        // length, private+anonymous flags, no fd/offset). The returned pointer is checked against
-        // MAP_FAILED before use.
-        let ptr = unsafe {
+        // SAFETY: `name` is a valid NUL-terminated C string literal; `flags` is a valid
+        // `memfd_create` flags value. Return value is checked for the `-1` error sentinel before
+        // use.
+        let fd = unsafe { libc::memfd_create(c"fs-jit-chain-arena".as_ptr(), MFD_CLOEXEC) };
+        if fd == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` was just created above and is a valid, open file descriptor; sizing it to
+        // `ARENA_CAPACITY` before mmap'ing that many bytes from it is required (a `memfd`, like
+        // any regular file, starts at length 0 — mmap'ing bytes past the file's length is valid
+        // to *map* but faults on first access without this). memfd pages are allocated lazily on
+        // write, same as `MAP_ANONYMOUS`, so this costs no resident memory up front.
+        let rc = unsafe { libc::ftruncate(fd, ARENA_CAPACITY as libc::off_t) };
+        if rc != 0 {
+            let err = io::Error::last_os_error();
+            // SAFETY: `fd` is open and owned exclusively by this function at this point.
+            unsafe { libc::close(fd) };
+            return Err(err);
+        }
+        // SAFETY: standard shared-file mmap; `fd` is open and sized to at least `ARENA_CAPACITY`
+        // bytes (just `ftruncate`'d above), `length`/`offset` are within that size, `addr` hint is
+        // null (kernel chooses), flags/prot are a valid combination. Return value is checked
+        // against `MAP_FAILED` before use.
+        let write_ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 ARENA_CAPACITY,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
+                libc::MAP_SHARED,
+                fd,
                 0,
             )
         };
-        if ptr == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
+        if write_ptr == libc::MAP_FAILED {
+            let err = io::Error::last_os_error();
+            // SAFETY: `fd` is still open and owned exclusively by this function.
+            unsafe { libc::close(fd) };
+            return Err(err);
         }
-        Ok(Arena { ptr: ptr as *mut u8, len: 0 })
+        // SAFETY: same fd, same offset/length as the mapping above, just a different `prot` — a
+        // second, independent mapping of the same underlying pages. `write_ptr` (checked above)
+        // proves the fd/size are valid; mapping it again with different permissions is exactly
+        // what dual-mapping W^X requires.
+        let exec_ptr = unsafe {
+            libc::mmap(std::ptr::null_mut(), ARENA_CAPACITY, libc::PROT_READ | libc::PROT_EXEC, libc::MAP_SHARED, fd, 0)
+        };
+        if exec_ptr == libc::MAP_FAILED {
+            let err = io::Error::last_os_error();
+            // SAFETY: unmapping exactly the mapping just established above; `fd` is still open
+            // and owned exclusively by this function.
+            unsafe {
+                libc::munmap(write_ptr, ARENA_CAPACITY);
+                libc::close(fd);
+            }
+            return Err(err);
+        }
+        // SAFETY: both mappings above now hold their own reference to the underlying file object;
+        // closing the fd does not unmap them and this arena never needs the fd again (fixed
+        // capacity, no growth/re-mapping).
+        unsafe { libc::close(fd) };
+        Ok(Arena { write_ptr: write_ptr as *mut u8, exec_ptr: exec_ptr as *mut u8, len: 0 })
     }
 
     /// Bytes already committed (used to size-check a would-be chain before writing it).
@@ -273,40 +354,29 @@ impl Arena {
         ARENA_CAPACITY - self.len
     }
 
-    /// `mprotect` exactly the page-aligned range covering `[off, off+len)` to `prot`. Every call
-    /// site passes a range that is either about to be written (`RW`) or was just written (`R-X`),
-    /// so this never touches a page outside the write currently in progress.
-    fn mprotect_range(&self, off: usize, len: usize, prot: libc::c_int) -> io::Result<()> {
-        let page_lo = off & !(PAGE_SIZE - 1);
-        let page_hi = (off + len).div_ceil(PAGE_SIZE) * PAGE_SIZE;
-        // SAFETY: `page_lo..page_hi` is a page-aligned sub-range of `self.ptr..self.ptr+
-        // ARENA_CAPACITY` (checked by `write`'s size guard before this is ever called), so this
-        // `mprotect` targets only already-mapped memory this `Arena` owns.
-        let rc = unsafe {
-            libc::mprotect(self.ptr.add(page_lo) as *mut libc::c_void, page_hi - page_lo, prot)
-        };
-        if rc != 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
-    }
-
-    /// Append `code` to the arena (toggling just the newly-written page range to `RW`, copying,
-    /// then immediately back to `R-X` — see the module doc's W^X invariant and its note on why
-    /// this is scoped to the write's own range, not the whole arena), returning the byte offset it
-    /// now lives at. `None` if the arena is full (Phase 1 has no growth/eviction: the caller should
-    /// just stop compiling new chains for the rest of the run, which is always still correct —
-    /// merely un-cached — since every fallback path re-derives its result from the plain
-    /// interpreter).
+    /// Append `code` to the arena — a plain `memcpy` into the `RW` `write_ptr` view, no syscall
+    /// at all (see the module doc: this is the entire point of dual-mapping — no per-compile
+    /// `mprotect`, hence no `mmap_lock` contention across parallel worker threads) — returning the
+    /// byte offset it now lives at (callable via [`Arena::call`], which reads it back through
+    /// `exec_ptr`, the same physical bytes just written). `None` if the arena is full (Phase 1
+    /// has no growth/eviction: the caller should just stop compiling new chains for the rest of
+    /// the run, which is always still correct — merely un-cached — since every fallback path
+    /// re-derives its result from the plain interpreter).
     pub fn write(&mut self, code: &[u8]) -> io::Result<Option<u32>> {
         if code.len() > self.remaining() {
             return Ok(None);
         }
         let off = self.len;
-        self.mprotect_range(off, code.len(), libc::PROT_READ | libc::PROT_WRITE)?;
-        // SAFETY: the range just made `RW` covers exactly `[off, off+code.len())`, which is within
-        // the mapped region (`off + code.len() <= len == ARENA_CAPACITY`, checked above).
+        // SAFETY: `write_ptr..write_ptr+ARENA_CAPACITY` is this `Arena`'s own `RW` mapping (never
+        // executable — see the module doc); `[off, off+code.len())` is within it (`off +
+        // code.len() <= ARENA_CAPACITY`, checked via `remaining()` above).
         unsafe {
-            std::ptr::copy_nonoverlapping(code.as_ptr(), self.ptr.add(off), code.len());
+            std::ptr::copy_nonoverlapping(code.as_ptr(), self.write_ptr.add(off), code.len());
         }
-        self.mprotect_range(off, code.len(), libc::PROT_READ | libc::PROT_EXEC)?;
+        // Ensure the compiler has not reordered the copy past this point before the offset is
+        // handed back as "callable" — see the module doc's note on x86-64 not needing an icache
+        // flush but still wanting the natural "finish writing, then call" sequencing enforced.
+        compiler_fence(Ordering::SeqCst);
         self.len += code.len();
         Ok(Some(off as u32))
     }
@@ -316,21 +386,23 @@ impl Arena {
     /// has been dropped). `cpu` is forwarded unchanged as `rdi`; `bus_data`/`bus_vtable` (Phase 2:
     /// [`decompose_bus`]'s output) are forwarded unchanged as `rsi`/`rdx`, kept live across the
     /// whole chain and forwarded again into every Load/Store call-out — see the `JitFn` doc
-    /// comment. Safe to call at any time (the arena is always `R-X` whenever this runs, by
-    /// construction — see the module doc) but relies on `off` addressing bytes this `Arena` itself
-    /// emitted via [`crate::chain`]'s emitter, which is the actual unsafety this function packages
-    /// up: a caller could in principle pass a bogus offset. `ChainCache` (the only caller) always
-    /// passes back exactly what `write` returned, immediately followed here.
+    /// comment. Safe to call at any time: `exec_ptr` is permanently `R-X` for the whole lifetime
+    /// of the arena (by construction — see the module doc), and the physical bytes at `off` were
+    /// written through `write_ptr` before this offset was ever handed out, so they're already
+    /// present by the time any call reaches them (x86-64 icache/dcache coherence — see the module
+    /// doc). Relies on `off` addressing bytes this `Arena` itself emitted via [`crate::chain`]'s
+    /// emitter, which is the actual unsafety this function packages up: a caller could in
+    /// principle pass a bogus offset. `ChainCache` (the only caller) always passes back exactly
+    /// what `write` returned, immediately followed here.
     pub fn call(&self, off: u32, cpu: *mut fs_riscv::Cpu, bus_data: *mut (), bus_vtable: *const ()) -> u64 {
-        // SAFETY: `self.ptr + off` lies within a range `write` already `mprotect`'d to `R-X` (and
-        // never touches again — see the module doc), so it is currently executable; the bytes
-        // there were emitted by `chain`'s codegen to exactly
+        // SAFETY: `self.exec_ptr + off` lies within this `Arena`'s `R-X` mapping (permanently so —
+        // see the module doc), and the bytes there were emitted by `chain`'s codegen to exactly
         // match `JitFn`'s calling convention (rdi=cpu, rsi/rdx=bus fat pointer, ret=u64, no other
         // register/stack preconditions on entry — see `chain.rs`'s codegen doc). Transmuting a
         // data pointer to a function pointer and calling it is exactly what an executable-arena
         // JIT is for.
         unsafe {
-            let f: JitFn = std::mem::transmute(self.ptr.add(off as usize));
+            let f: JitFn = std::mem::transmute(self.exec_ptr.add(off as usize));
             f(cpu, bus_data, bus_vtable)
         }
     }
@@ -338,9 +410,13 @@ impl Arena {
 
 impl Drop for Arena {
     fn drop(&mut self) {
-        // SAFETY: unmapping exactly the region `new` mapped, once, on drop.
+        // SAFETY: unmapping exactly the two regions `new` mapped, once, on drop. Each is an
+        // independent mapping (established via two separate `mmap` calls over the same fd); both
+        // must be unmapped since `munmap` only tears down the mapping named by its own address
+        // range, not other mappings that happen to alias the same underlying pages.
         unsafe {
-            libc::munmap(self.ptr as *mut libc::c_void, ARENA_CAPACITY);
+            libc::munmap(self.write_ptr as *mut libc::c_void, ARENA_CAPACITY);
+            libc::munmap(self.exec_ptr as *mut libc::c_void, ARENA_CAPACITY);
         }
     }
 }
@@ -349,10 +425,11 @@ impl Drop for Arena {
 mod tests {
     use super::*;
 
-    /// The arena's own mapping is never simultaneously `PROT_WRITE` and `PROT_EXEC`: parse
-    /// `/proc/self/maps` for the mapping containing `arena`'s pointer and check its permission
-    /// string, both right after construction (RW, not yet executable) and after writing a chain
-    /// (R-X). This is the adversarial W^X test the design doc's validation plan requires.
+    /// Neither of the arena's two mappings is ever simultaneously `PROT_WRITE` and `PROT_EXEC`
+    /// (nor, for dual-mapping, is either mapping EVER both at once, or ever changes protection at
+    /// all): parse `/proc/self/maps` for the mapping containing a given pointer and return its
+    /// permission string. This is the adversarial W^X test the design doc's validation plan
+    /// requires, updated for dual-mapping to check BOTH views explicitly.
     fn perms_of_mapping_containing(addr: usize) -> String {
         let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
         for line in maps.lines() {
@@ -373,21 +450,37 @@ mod tests {
     #[test]
     fn adversarial_wx_arena_is_never_simultaneously_writable_and_executable() {
         let mut arena = Arena::new().unwrap();
-        let perms = perms_of_mapping_containing(arena.ptr as usize);
-        assert!(perms.starts_with("rw-"), "fresh arena should be RW, not executable: {perms}");
-        assert!(!perms.contains('x'), "fresh arena must not be executable: {perms}");
+
+        // Fresh arena: write view is RW-not-X, execute view is R-X-not-W. Check both, before any
+        // write has happened.
+        let write_perms = perms_of_mapping_containing(arena.write_ptr as usize);
+        assert!(write_perms.starts_with("rw-"), "write view should be RW: {write_perms}");
+        assert!(!write_perms.contains('x'), "write view must never be executable: {write_perms}");
+        let exec_perms = perms_of_mapping_containing(arena.exec_ptr as usize);
+        assert!(exec_perms.starts_with("r-x"), "execute view should be R-X: {exec_perms}");
+        assert!(!exec_perms.contains('w'), "execute view must never be writable: {exec_perms}");
 
         let off = arena.write(&[0x31, 0xC0, 0xC3]).unwrap().unwrap(); // `xor eax,eax; ret`
-        let perms = perms_of_mapping_containing(arena.ptr as usize);
-        assert!(perms.starts_with("r-x"), "post-write arena should be R-X: {perms}");
-        assert!(!perms.contains('w'), "post-write arena must not be writable: {perms}");
 
-        // Calling it must be sound and leaves it R-X afterward.
+        // After a write (a plain memcpy, no mprotect at all in this design): both views' *
+        // protections must be byte-for-byte unchanged from before — dual-mapping's whole premise
+        // is that neither mapping's protection ever moves after `Arena::new`.
+        let write_perms = perms_of_mapping_containing(arena.write_ptr as usize);
+        assert!(write_perms.starts_with("rw-"), "write view should still be RW post-write: {write_perms}");
+        assert!(!write_perms.contains('x'), "write view must still not be executable post-write: {write_perms}");
+        let exec_perms = perms_of_mapping_containing(arena.exec_ptr as usize);
+        assert!(exec_perms.starts_with("r-x"), "execute view should still be R-X post-write: {exec_perms}");
+        assert!(!exec_perms.contains('w'), "execute view must still not be writable post-write: {exec_perms}");
+
+        // Calling it (through the execute view) must be sound, and both views' protections must
+        // remain exactly as above afterward.
         let mut cpu = fs_riscv::Cpu::new(0);
         let tag = arena.call(off, &mut cpu as *mut _, std::ptr::null_mut(), std::ptr::null());
         assert_eq!(tag, 0, "xor eax,eax; ret deterministically returns 0");
-        let perms = perms_of_mapping_containing(arena.ptr as usize);
-        assert!(!perms.contains('w'), "arena must still not be writable after a call: {perms}");
+        let write_perms = perms_of_mapping_containing(arena.write_ptr as usize);
+        assert!(!write_perms.contains('x'), "write view must not be executable after a call: {write_perms}");
+        let exec_perms = perms_of_mapping_containing(arena.exec_ptr as usize);
+        assert!(!exec_perms.contains('w'), "execute view must not be writable after a call: {exec_perms}");
     }
 
     #[test]

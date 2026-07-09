@@ -296,7 +296,7 @@ impl ChainCache {
                 .filter(|s| is_terminal(&s.inst))
                 .map(|s| (s.static_offset, s.ilen));
             let code = codegen(&steps);
-            match self.arena.write(&code).expect("mprotect failed") {
+            match self.arena.write(&code).expect("arena write failed") {
                 Some(off) => ChainSlot { tag: pa, code_off: off, static_len: steps.len() as u32, terminal },
                 None => {
                     // Arena full: cache a `static_len: 0` ("nothing compiled here") marker just
