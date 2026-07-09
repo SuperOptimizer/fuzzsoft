@@ -796,6 +796,13 @@ mod load_store {
     const GOOD_DATA_LEN: u32 = 0x2000;
     const GOOD_MID: u32 = GOOD_DATA + GOOD_DATA_LEN / 2; // the shared page boundary
     const BAD_DATA: u32 = RAM_BASE + 0x6000;
+    // Phase 3 (`docs/jit-scalar-design.md`) fast-path bail-condition regions: exactly-READ (no
+    // WRITE) and allocated-but-unwritten (WRITE|RAW, no READ) — neither perm byte equals the
+    // fast path's exact-match `need` mask for at least one of Load/Store, so these exercise the
+    // "byte carries a perm that isn't exactly the trivial case" bail path distinctly from
+    // `BAD_DATA`'s "no perms at all" case.
+    const RO_DATA: u32 = RAM_BASE + 0x8000;
+    const RAW_DATA: u32 = RAM_BASE + 0x9000;
     // Page-aligned so a bare `lui` can encode it exactly (low 12 bits must be 0 — `lui` masks
     // them off, so a non-page-aligned target silently truncates to the wrong address, which is
     // exactly the bug this constant's introduction fixed: an earlier version of these tests used
@@ -809,6 +816,8 @@ mod load_store {
         m.ram.protect(RAM_BASE, CODE_LEN, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
         m.ram.protect(GOOD_DATA, GOOD_DATA_LEN, PERM_READ | PERM_WRITE).unwrap();
         // BAD_DATA is deliberately left with perms=0 (unprotected): any access there faults.
+        m.ram.protect(RO_DATA, 0x1000, PERM_READ).unwrap();
+        m.ram.protect(RAW_DATA, 0x1000, fs_mmu::PERM_WRITE | fs_mmu::PERM_RAW).unwrap();
         m.ram.map(RAM_BASE, bytes, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
         m
     }
@@ -1272,6 +1281,8 @@ mod load_store {
         m.ram.protect(RAM_BASE, CODE_LEN, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
         m.ram.protect(GOOD_DATA, GOOD_DATA_LEN, PERM_READ | PERM_WRITE).unwrap();
         // BAD_DATA is deliberately left with perms=0 (unprotected): any access there faults.
+        m.ram.protect(RO_DATA, 0x1000, PERM_READ).unwrap();
+        m.ram.protect(RAW_DATA, 0x1000, fs_mmu::PERM_WRITE | fs_mmu::PERM_RAW).unwrap();
         m.ram.map(RAM_BASE, bytes, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
         let golden = std::sync::Arc::new(fs_mmu::Golden::from_mmu(&m.ram));
         fs_platform::CowMachine::from_golden(golden, RAM_BASE, RAM_SIZE)
@@ -1332,6 +1343,207 @@ mod load_store {
             let regs = seeded_regs(&mut rng);
             let regs0_garbage = if rng.bool() { rng.next_u32() } else { 0 };
             check_ls_program_cow(&words, regs, regs0_garbage);
+        }
+    }
+
+    // =============================================================================================
+    // Phase 3 (`docs/jit-scalar-design.md`): the inlined memory fast path. Every test above in this
+    // file already re-exercises the fast path incidentally (it's compiled into `emit_step` now, not
+    // a separate code path the old tests could skip) — the additions below specifically target the
+    // bail conditions the design doc calls out by name (TLB miss, RAW-poisoned bytes, a perm-fault
+    // byte, MMIO, the sv32 dirty-bit gate) and assert on `Cpu::fast_path_hits`/`fast_path_bails`
+    // (bumped by the compiled chain's own emitted code) to prove each scenario actually engaged the
+    // fast and/or slow path it's meant to, rather than passing vacuously.
+    // =============================================================================================
+    mod phase3_fast_path {
+        use super::*;
+
+        /// [`check_ls_program`]'s twin, returning `(cpu_j.fast_path_hits, cpu_j.fast_path_bails)`
+        /// alongside the same bit-identical assertions (trimmed to the fields most relevant to a
+        /// fault-attribution check here — `mcause`/`mepc`/`mtval` — the full CSR sweep is already
+        /// covered by `check_ls_program`'s many callers elsewhere in this file).
+        fn check_and_count(words: &[u32], initial_regs: [u32; 32]) -> (u64, u64) {
+            let bytes = assemble(words);
+
+            let mut m_i = fresh_machine(&bytes);
+            let mut cpu_i = Cpu::new(RAM_BASE);
+            cpu_i.regs = initial_regs;
+            cpu_i.htif_tohost = Some(BAD_DATA + 0x800);
+            let exit_i = run_reference_once(&mut cpu_i, &mut m_i, words, RAM_BASE);
+
+            let mut m_j = fresh_machine(&bytes);
+            let mut cpu_j = Cpu::new(RAM_BASE);
+            cpu_j.regs = initial_regs;
+            cpu_j.htif_tohost = Some(BAD_DATA + 0x800);
+            let mut cache = ChainCache::with_capacity(256, 256);
+            let exit_j = cache.run_block(&mut cpu_j, &mut m_j, &mut |_| true);
+
+            assert_eq!(exit_i, exit_j, "SysExit mismatch\nprogram={words:02x?}");
+            assert_eq!(cpu_i.regs, cpu_j.regs, "register mismatch\nprogram={words:02x?}");
+            assert_eq!(cpu_i.pc, cpu_j.pc, "pc mismatch\nprogram={words:02x?}");
+            assert_eq!(cpu_i.insns_retired, cpu_j.insns_retired, "insns_retired mismatch\nprogram={words:02x?}");
+            assert_eq!(cpu_i.csr.mcause, cpu_j.csr.mcause, "mcause mismatch\nprogram={words:02x?}");
+            assert_eq!(cpu_i.csr.mepc, cpu_j.csr.mepc, "mepc mismatch\nprogram={words:02x?}");
+            assert_eq!(cpu_i.csr.mtval, cpu_j.csr.mtval, "mtval mismatch\nprogram={words:02x?}");
+            (cpu_j.fast_path_hits, cpu_j.fast_path_bails)
+        }
+
+        /// A page carrying EXACTLY `PERM_READ` (no `PERM_WRITE`): a Load must fast-path (its perm
+        /// byte matches the fast path's `need` exactly), while a Store to the same bytes must bail
+        /// (perm lacks `PERM_WRITE`) and then fault `Permission` through the unchanged slow
+        /// call-out — exactly like the interpreter. This is the "perm-fault byte" case the task
+        /// requires distinctly from `BAD_DATA`'s "no perms at all".
+        #[test]
+        fn read_only_page_load_fast_paths_store_bails_then_faults() {
+            let words = vec![
+                load_insn(LoadOp::Lw, 4, 5, 0),
+                store_insn(StoreOp::Sw, 5, 6, 0),
+                ecall(),
+            ];
+            let mut regs = seeded_regs(&mut Rng::new(0xF00D_0001));
+            regs[5] = RO_DATA;
+            regs[6] = 0xAAAA_5555;
+            let (hits, bails) = check_and_count(&words, regs);
+            assert_eq!(hits, 1, "the read-only Load should have taken the fast path");
+            assert!(bails >= 1, "the Store to a read-only page must bail (no PERM_WRITE)");
+        }
+
+        /// A page carrying `PERM_WRITE | PERM_RAW` (allocated, never written): a Load must bail
+        /// (perm lacks `PERM_READ` outright — an even stronger bail than the perm-mismatch case
+        /// above) and fault `Permission`, preserving the RAW/uninitialized-read oracle through the
+        /// unchanged slow call-out — proving the fast path can never silently "unpoison" a RAW
+        /// byte by racing ahead of `load_impl`'s real check.
+        #[test]
+        fn raw_poisoned_byte_load_bails_and_preserves_raw_fault() {
+            let words = vec![load_insn(LoadOp::Lw, 4, 5, 0), ecall()];
+            let mut regs = seeded_regs(&mut Rng::new(0xF00D_0002));
+            regs[5] = RAW_DATA;
+            let (hits, bails) = check_and_count(&words, regs);
+            assert_eq!(hits, 0, "a RAW-poisoned Load must never take the fast path");
+            assert_eq!(bails, 1);
+        }
+
+        /// The same RAW-poisoned bytes, but a Store first (which legitimately clears RAW / sets
+        /// READ, exactly like `Mmu::write`) — the Store itself must bail (perm is `WRITE|RAW`, not
+        /// exactly `READ|WRITE`) and go through the slow call-out, which performs the real
+        /// RAW-clearing write. A subsequent Load's bail/hit outcome is then whatever the (now
+        /// `READ|WRITE`) perm byte implies under this fast path's exact-match rule — asserted here
+        /// only to document the honest, measured consequence, not to claim a specific ratio is
+        /// "correct": the point of this test is that regs/pc/insns_retired (compared bit-for-bit
+        /// against the interpreter above) are unaffected either way.
+        #[test]
+        fn raw_poisoned_byte_store_clears_raw_through_slow_path() {
+            let words = vec![
+                store_insn(StoreOp::Sw, 5, 6, 0),
+                load_insn(LoadOp::Lw, 4, 5, 0),
+                ecall(),
+            ];
+            let mut regs = seeded_regs(&mut Rng::new(0xF00D_0003));
+            regs[5] = RAW_DATA;
+            regs[6] = 0x1234_5678;
+            let (_hits, bails) = check_and_count(&words, regs);
+            assert!(bails >= 1, "the Store to a RAW-poisoned (WRITE|RAW, no READ) byte must bail");
+        }
+
+        /// A Load from the CLINT MMIO window must never take the fast path (there is no direct
+        /// host pointer for a device register) and must produce the identical CLINT-register value
+        /// as the interpreter through the unchanged slow call-out.
+        #[test]
+        fn clint_load_bails_and_matches_interpreter() {
+            let words = vec![load_insn(LoadOp::Lw, 4, 5, 0), ecall()];
+            let mut regs = seeded_regs(&mut Rng::new(0xF00D_0004));
+            regs[5] = fs_platform::CLINT_BASE;
+            let (hits, bails) = check_and_count(&words, regs);
+            assert_eq!(hits, 0, "a CLINT load must never take the fast path");
+            assert_eq!(bails, 1);
+        }
+
+        // -----------------------------------------------------------------------------------
+        // sv32: the software-TLB-hit fast path, and the dirty-bit gate on a Store, exercised for
+        // real (every test elsewhere in this file runs bare/M-mode, where `Cpu::fast_pa`'s
+        // identity-mapped shortcut is the ONLY branch ever taken — this is the one test that
+        // actually populates and consults the TLB-hit branch).
+        // -----------------------------------------------------------------------------------
+
+        /// Builds one 4 KiB non-leaf `l0` table (covering VA `0x0000_0000..0x0040_0000`) plus a
+        /// 4 MiB identity superpage (RWX, A|D preset) covering `base` itself so fetching the test's
+        /// own code works, and two extra leaf pages reached through `l0`: `load_va` (A|D both
+        /// preset — its first access, a Load, is a genuine TLB miss; its second is a TLB hit
+        /// regardless of access kind) and `store_va` (A only, D unset — a Load first refills the
+        /// TLB with `d_set=false`; a subsequent Store must then see a TLB HIT but bail because the
+        /// dirty bit isn't known-set, forcing the real walk that sets it).
+        fn build_sv32_machine(bytes: &[u8], base: u32, root: u32, l0: u32, load_leaf_pa: u32, store_leaf_pa: u32) -> fs_platform::Machine {
+            const V: u32 = 1;
+            const R: u32 = 2;
+            const W: u32 = 4;
+            const X: u32 = 8;
+            const A: u32 = 1 << 6;
+            const D: u32 = 1 << 7;
+            let leaf = |pa: u32, flags: u32| ((pa >> 12) << 10) | flags;
+
+            let mut m = fs_platform::Machine::new(base, 0x10_0000);
+            m.ram.protect(base, 0x10_0000, PERM_READ | PERM_WRITE).unwrap();
+            m.ram.map(base, bytes, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+            // Identity 4 MiB superpage for CODE (`base` is 4 MiB-aligned: 0x8000_0000).
+            let root_idx = (base >> 22) & 0x3ff;
+            m.ram.write_u32(root + root_idx * 4, leaf(base, V | R | W | X | A | D)).unwrap();
+            // root[0] -> l0 (non-leaf), covering the low VA range `load_va`/`store_va` live in.
+            m.ram.write_u32(root, ((l0 >> 12) << 10) | V).unwrap();
+            m.ram.write_u32(l0 + 5 * 4, leaf(load_leaf_pa, V | R | W | A | D)).unwrap();
+            m.ram.write_u32(l0 + 6 * 4, leaf(store_leaf_pa, V | R | W | A)).unwrap();
+            m
+        }
+
+        #[test]
+        fn sv32_tlb_miss_then_hit_and_dirty_bit_gates_store_fast_path() {
+            let base = 0x8000_0000u32;
+            let root = base + 0x1000;
+            let l0 = base + 0x2000;
+            let load_leaf_pa = base + 0x9000;
+            let store_leaf_pa = base + 0xa000;
+            let load_va = 0x0000_5000u32; // vpn1=0 (via l0), vpn0=5
+            let store_va = 0x0000_6000u32; // vpn1=0 (via l0), vpn0=6
+
+            let words = vec![
+                load_insn(LoadOp::Lw, 4, 10, 0),   // x10=load_va:  TLB MISS -> bail
+                load_insn(LoadOp::Lw, 6, 10, 0),   // TLB HIT -> fast-path hit
+                load_insn(LoadOp::Lw, 8, 11, 0),   // x11=store_va: TLB MISS -> bail (refills d_set=false)
+                opimm(AluOp::Add, 7, 0, 0x123),
+                store_insn(StoreOp::Sw, 11, 7, 0), // TLB HIT but d_set=false -> bail (walk sets D)
+                store_insn(StoreOp::Sw, 11, 7, 0), // TLB HIT, d_set=true -> fast-path hit
+                ecall(),
+            ];
+            let bytes = assemble(&words);
+            let mut regs = [0u32; 32];
+            regs[10] = load_va;
+            regs[11] = store_va;
+
+            let mut m_i = build_sv32_machine(&bytes, base, root, l0, load_leaf_pa, store_leaf_pa);
+            let mut cpu_i = Cpu::new(base);
+            cpu_i.privilege = Priv::S;
+            cpu_i.csr.satp = (1 << 31) | (root >> 12);
+            cpu_i.regs = regs;
+            let exit_i = run_reference_once(&mut cpu_i, &mut m_i, &words, base);
+
+            let mut m_j = build_sv32_machine(&bytes, base, root, l0, load_leaf_pa, store_leaf_pa);
+            let mut cpu_j = Cpu::new(base);
+            cpu_j.privilege = Priv::S;
+            cpu_j.csr.satp = (1 << 31) | (root >> 12);
+            cpu_j.regs = regs;
+            let mut cache = ChainCache::with_capacity(256, 256);
+            let exit_j = cache.run_block(&mut cpu_j, &mut m_j, &mut |_| true);
+
+            assert_eq!(exit_i, exit_j);
+            assert_eq!(cpu_i.regs, cpu_j.regs, "register mismatch");
+            assert_eq!(cpu_i.pc, cpu_j.pc, "pc mismatch");
+            assert_eq!(cpu_i.insns_retired, cpu_j.insns_retired, "insns_retired mismatch");
+
+            // Prove every branch of `Cpu::fast_pa` this scenario targets was actually exercised,
+            // not vacuously always-bail or always-hit: 2 fresh TLB misses (`load_va`/`store_va`'s
+            // first touch) + 1 TLB-hit-but-not-dirty bail on the Store = 3 bails; 2 TLB hits (the
+            // second Load, the second Store once dirty) = 2 hits.
+            assert_eq!(cpu_j.fast_path_bails, 3, "expected 2 TLB misses + 1 not-dirty-yet bail");
+            assert_eq!(cpu_j.fast_path_hits, 2, "expected the second Load hit + the now-dirty Store hit");
         }
     }
 }

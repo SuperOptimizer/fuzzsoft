@@ -170,6 +170,15 @@ impl Bus for Machine {
     fn store_may_assert_interrupt(&self, addr: u32, _size: u8) -> bool {
         self.in_clint(addr)
     }
+    fn fast_ptr(&mut self, addr: u32, len: u8, need: u8) -> Option<*mut u8> {
+        // MMIO (CLINT/UART) never has a direct host pointer — decline explicitly rather than
+        // relying solely on `self.ram`'s own bounds check, for defense in depth against a future
+        // memory map where a device window happened to overlap RAM's address range.
+        if self.in_clint(addr) || self.in_uart(addr) {
+            return None;
+        }
+        self.ram.fast_ptr(addr, len, need)
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -253,6 +262,14 @@ impl Bus for CowMachine {
     }
     fn store_may_assert_interrupt(&self, addr: u32, _size: u8) -> bool {
         in_clint(addr)
+    }
+    fn fast_ptr(&mut self, addr: u32, len: u8, need: u8) -> Option<*mut u8> {
+        // Same rationale as `Machine::fast_ptr` — decline MMIO explicitly rather than relying
+        // solely on `self.ram`'s bounds check.
+        if in_clint(addr) || in_uart(addr) {
+            return None;
+        }
+        self.ram.fast_ptr(addr, len, need)
     }
 }
 

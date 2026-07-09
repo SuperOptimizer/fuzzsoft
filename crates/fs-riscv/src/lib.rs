@@ -862,6 +862,19 @@ pub struct Cpu {
     /// `Err(trap)` from `exec_one`. `None` at every other time (interpreter path, ALU-only chains,
     /// between dispatches) — never read except right after a `TrapPending` return.
     pub jit_pending_trap: Option<Trap>,
+    /// Phase 3 (`docs/jit-scalar-design.md`) inlined memory fast-path instrumentation: bumped
+    /// directly by the compiled chain's own emitted code (one `add [cpu+off],1` per Load/Store,
+    /// mirroring how `insns_retired` itself is bumped — NOT a separate function call) every time
+    /// the fast-path pointer check ([`Cpu::fast_pa`] + `fs_mmu::Bus::fast_ptr`) succeeds
+    /// (`fast_path_hits`) or declines (`fast_path_bails`). Reset to 0 by `Cpu::new` like every
+    /// other counter and NOT specially preserved across a snapshot/case reset
+    /// (`fs_platform::Snapshot::reset` restores the whole `Cpu`, these fields included) — a caller
+    /// wanting a whole-run total reads the delta itself every case, exactly like `insns_retired`/
+    /// `fs-cli`'s `total_case_insns`. `pub` (not `pub(crate)`): `fs-jit` is a separate crate and
+    /// its emitted code addresses these fields via `offset_of!`, and `fs-cli` reads them directly
+    /// for the benchmark report.
+    pub fast_path_hits: u64,
+    pub fast_path_bails: u64,
     /// KMSAN (Stage 1.5, `docs/kmsan.md` T3.1) live-oracle hit: [`Cpu::finish_exit`] stashes a
     /// [`KmsanReport`] copy of a [`Trap::KmsanTainted`] here (instead of growing `SysExit` a new
     /// variant) just before returning; a fuzz runner `take()`s it once the case that hit it has
@@ -888,6 +901,8 @@ impl Cpu {
             ubsan: None,
             regs_taint: None,
             jit_pending_trap: None,
+            fast_path_hits: 0,
+            fast_path_bails: 0,
             kmsan_hit: None,
         }
     }
@@ -1165,6 +1180,47 @@ impl Cpu {
             a = ((pte >> 10) & 0x3f_ffff) << 12;
         }
         Err(XlateDeclined)
+    }
+
+    /// Phase 3 (`docs/jit-scalar-design.md`) fast-path translation check for `fs-jit`'s inlined
+    /// memory fast path: a side-effect-free (`&self`, not `&mut self`) subset of [`Cpu::xlate`]
+    /// that answers "would `xlate` compute this SAME `pa` right now, without touching anything at
+    /// all (no page-table read, no A/D-bit writeback, no TLB refill)?". Exactly two cases succeed:
+    /// - Untranslated access (M-mode, or paging off) — the identical condition and result as
+    ///   `xlate`'s own identity fast-exit.
+    /// - A software-TLB hit whose cached leaf permission/privilege bits — checked via the exact
+    ///   same [`leaf_perm_priv_ok`] helper `xlate`'s own TLB-hit path consults, so this is never a
+    ///   second, potentially-drifting copy of that decision — permit `access`, AND (for a `Write`)
+    ///   the cached PTE dirty bit is already known set (so `xlate` would not need to write
+    ///   anything back just to set it).
+    ///
+    /// Every other case (TLB miss; a not-yet-dirty page on a write) returns `None`: the caller
+    /// MUST fall back to the real, mutating `xlate` (via `load_impl`/`store_impl`), which remains
+    /// the sole source of truth for every non-trivial case. A `Some(pa)` here is thus provably
+    /// identical to what a real, fresh `xlate` call would compute — see `xlate`'s own TLB-hit
+    /// branch, which (on exactly these same conditions) also returns immediately without mutating
+    /// anything, so "declining to call it" and "calling it" are observably identical outcomes.
+    ///
+    /// Deliberately does NOT itself check the `fs-mmu` byte-permission plane (RWX/RAW) — that is
+    /// sv32's PTE-level R/W/X/U permission, a completely different layer from the byte-granular
+    /// perm/RAW oracle `fs_mmu::Bus::fast_ptr` (the sibling half of this same fast path) checks.
+    /// Both must independently agree before `fs-jit` trusts the fast path for a given access.
+    pub fn fast_pa(&self, va: u32, access: Access) -> Option<u32> {
+        let p = self.effective_priv(access);
+        if p == Priv::M || (self.csr.satp >> 31) == 0 {
+            return Some(va);
+        }
+        let sum = self.csr.mstatus & sys::MSTATUS_SUM != 0;
+        let mxr = self.csr.mstatus & sys::MSTATUS_MXR != 0;
+        let page_vpn = va >> 12;
+        let e = self.tlb.get(page_vpn)?;
+        if !leaf_perm_priv_ok(access, p, sum, mxr, LeafBits { r: e.r, w: e.w, x: e.x, u: e.u }) {
+            return None;
+        }
+        if access == Access::Write && !e.d_set {
+            return None;
+        }
+        Some((e.ppn << 12) | (va & 0xfff))
     }
 
     fn fetch16(&mut self, bus: &mut dyn Bus, va: u32) -> Result<u16, Trap> {

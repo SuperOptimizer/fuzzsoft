@@ -314,6 +314,79 @@ impl Asm {
         self.buf.push(0x80 + cc.code());
         self.buf.extend_from_slice(&rel.to_le_bytes());
     }
+
+    // -------------------------------------------------------------------------------------------
+    // Phase 3 additions (`docs/jit-scalar-design.md`): the inlined memory fast path needs an
+    // unconditional jump (the "skip the slow block entirely" arm of `chain.rs`'s `emit_if_else`)
+    // and sized/signed loads straight from a host pointer (`fs-jit`'s Load fast path never calls
+    // out at all on a hit, so the emitted code itself must do the correctly-sized, correctly-signed
+    // load/store that `load_impl`/`store_impl` would otherwise have done).
+    // -------------------------------------------------------------------------------------------
+
+    /// `jmp rel32` (near unconditional jump) — opcode `E9 id`. No REX (no register operand).
+    pub fn jmp_rel32(&mut self, rel: i32) {
+        self.buf.push(0xE9);
+        self.buf.extend_from_slice(&rel.to_le_bytes());
+    }
+
+    /// `movzx r32, byte [base+disp32]` — opcode `0F B6 /r`, mod=10 (disp32 memory form).
+    pub fn movzx_r32_mem8(&mut self, dst: Reg, base: Reg, disp: i32) {
+        self.push_rex(false, dst.needs_ext(), base.needs_ext());
+        self.buf.push(0x0F);
+        self.buf.push(0xB6);
+        self.buf.push(modrm(0b10, dst.low3(), base.low3()));
+        self.buf.extend_from_slice(&disp.to_le_bytes());
+    }
+
+    /// `movsx r32, byte [base+disp32]` — opcode `0F BE /r`.
+    pub fn movsx_r32_mem8(&mut self, dst: Reg, base: Reg, disp: i32) {
+        self.push_rex(false, dst.needs_ext(), base.needs_ext());
+        self.buf.push(0x0F);
+        self.buf.push(0xBE);
+        self.buf.push(modrm(0b10, dst.low3(), base.low3()));
+        self.buf.extend_from_slice(&disp.to_le_bytes());
+    }
+
+    /// `movzx r32, word [base+disp32]` — opcode `0F B7 /r`.
+    pub fn movzx_r32_mem16(&mut self, dst: Reg, base: Reg, disp: i32) {
+        self.push_rex(false, dst.needs_ext(), base.needs_ext());
+        self.buf.push(0x0F);
+        self.buf.push(0xB7);
+        self.buf.push(modrm(0b10, dst.low3(), base.low3()));
+        self.buf.extend_from_slice(&disp.to_le_bytes());
+    }
+
+    /// `movsx r32, word [base+disp32]` — opcode `0F BF /r`.
+    pub fn movsx_r32_mem16(&mut self, dst: Reg, base: Reg, disp: i32) {
+        self.push_rex(false, dst.needs_ext(), base.needs_ext());
+        self.buf.push(0x0F);
+        self.buf.push(0xBF);
+        self.buf.push(modrm(0b10, dst.low3(), base.low3()));
+        self.buf.extend_from_slice(&disp.to_le_bytes());
+    }
+
+    /// `mov byte [base+disp32], src8` — opcode `88 /r`. `src`'s low byte is stored; any REX-needing
+    /// source (`needs_ext()`, or a register whose byte form would otherwise alias
+    /// AH/CH/DH/BH — see `push_rex`'s doc) gets a REX prefix so the correct byte register is
+    /// addressed. Every call site in this crate uses `RCX`/`RAX` as `src` (never RSI/RDI/RBP/RSP,
+    /// which would need a REX purely to avoid the legacy high-byte aliasing) — see `chain.rs`'s
+    /// Store fast-path codegen.
+    pub fn mov_mem8_r8(&mut self, base: Reg, disp: i32, src: Reg) {
+        self.push_rex(false, src.needs_ext(), base.needs_ext());
+        self.buf.push(0x88);
+        self.buf.push(modrm(0b10, src.low3(), base.low3()));
+        self.buf.extend_from_slice(&disp.to_le_bytes());
+    }
+
+    /// `mov word [base+disp32], src16` — opcode `66 89 /r` (the operand-size override prefix
+    /// selects the 16-bit form of the same `MOV r/m, r` opcode `mov_mem_r32` uses for 32-bit).
+    pub fn mov_mem16_r16(&mut self, base: Reg, disp: i32, src: Reg) {
+        self.buf.push(0x66); // operand-size override: 16-bit
+        self.push_rex(false, src.needs_ext(), base.needs_ext());
+        self.buf.push(0x89);
+        self.buf.push(modrm(0b10, src.low3(), base.low3()));
+        self.buf.extend_from_slice(&disp.to_le_bytes());
+    }
 }
 
 #[cfg(test)]
@@ -649,5 +722,70 @@ mod tests {
         a.ret();
         let text = assert_disassembles_cleanly(&a.buf);
         assert!(text.contains("je") || text.contains("jz"), "{text}");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Phase 3 additions (`docs/jit-scalar-design.md`): inlined memory fast-path support.
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn jmp_rel32_is_e9() {
+        let mut a = Asm::new();
+        a.jmp_rel32(1);
+        a.ret();
+        assert_eq!(a.buf[0], 0xE9);
+        let text = assert_disassembles_cleanly(&a.buf);
+        assert!(text.contains("jmp"), "{text}");
+    }
+
+    #[test]
+    fn movzx_and_movsx_mem8_load_from_pointer() {
+        let mut a = Asm::new();
+        a.movzx_r32_mem8(Reg::RCX, Reg::RAX, 0);
+        let text = assert_disassembles_cleanly(&a.buf);
+        assert!(text.contains("movzx ecx,byte [rax") || text.contains("movzx ecx, byte [rax"), "{text}");
+
+        let mut a = Asm::new();
+        a.movsx_r32_mem8(Reg::RCX, Reg::RAX, 0);
+        let text = assert_disassembles_cleanly(&a.buf);
+        assert!(text.contains("movsx ecx,byte [rax") || text.contains("movsx ecx, byte [rax"), "{text}");
+    }
+
+    #[test]
+    fn movzx_and_movsx_mem16_load_from_pointer() {
+        let mut a = Asm::new();
+        a.movzx_r32_mem16(Reg::RCX, Reg::RAX, 0);
+        let text = assert_disassembles_cleanly(&a.buf);
+        assert!(text.contains("movzx ecx,word [rax") || text.contains("movzx ecx, word [rax"), "{text}");
+
+        let mut a = Asm::new();
+        a.movsx_r32_mem16(Reg::RCX, Reg::RAX, 0);
+        let text = assert_disassembles_cleanly(&a.buf);
+        assert!(text.contains("movsx ecx,word [rax") || text.contains("movsx ecx, word [rax"), "{text}");
+    }
+
+    #[test]
+    fn mov_mem8_r8_and_mem16_r16_store_to_pointer() {
+        let mut a = Asm::new();
+        a.mov_mem8_r8(Reg::RAX, 0, Reg::RCX);
+        let text = assert_disassembles_cleanly(&a.buf);
+        assert!(text.contains("mov [rax") && text.contains("cl"), "{text}");
+
+        let mut a = Asm::new();
+        a.mov_mem16_r16(Reg::RAX, 0, Reg::RCX);
+        let text = assert_disassembles_cleanly(&a.buf);
+        assert!(text.contains("mov [rax") && text.contains("cx"), "{text}");
+    }
+
+    /// A whole fast-path-shaped sequence: `movzx ecx, byte [rax]; ret` — plausible end-to-end
+    /// disassembly beyond the single-instruction unit tests above.
+    #[test]
+    fn fast_load_sequence_disassembles_as_expected() {
+        let mut a = Asm::new();
+        a.movzx_r32_mem8(Reg::RCX, Reg::RAX, 0);
+        a.ret();
+        let text = assert_disassembles_cleanly(&a.buf);
+        assert!(text.contains("movzx ecx,byte [rax") || text.contains("movzx ecx, byte [rax"), "{text}");
+        assert!(text.contains("ret"), "{text}");
     }
 }

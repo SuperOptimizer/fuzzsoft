@@ -23,6 +23,15 @@ pub const PERM_RAW: u8 = 1 << 3;
 /// Access/coverage bit (reserved; used by the emulator-native coverage layer later).
 pub const PERM_ACC: u8 = 1 << 4;
 
+/// Phase 3 (`docs/jit-scalar-design.md`) fast-path "danger" mask: any byte carrying one of these
+/// bits is, by definition, NOT the trivial case — [`Bus::fast_ptr`] bails on it regardless of
+/// whether the caller's required bits (`PERM_READ`/`PERM_WRITE`) are also present. `PERM_RAW`
+/// (uninitialized-read oracle) is the one that exists today; `PERM_ACC` is included pre-emptively
+/// since its doc comment reserves it for "the emulator-native coverage layer later" — a future
+/// sanitizer/coverage consumer of that bit gets the same "the fast path never silently races ahead
+/// of me" guarantee RAW gets today, with zero changes needed here when that bit starts being set.
+const FAST_PTR_FORBIDDEN: u8 = PERM_RAW | PERM_ACC;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
     Read,
@@ -110,6 +119,41 @@ pub trait Bus {
     /// can change interrupt-pending state" property would need the identical treatment.
     fn store_may_assert_interrupt(&self, _addr: u32, _size: u8) -> bool {
         false
+    }
+
+    /// Phase 3 inlined memory fast path (`docs/jit-scalar-design.md`): the ONE place the
+    /// byte-granular perm/RAW oracle is consulted for a chain-JIT's inline load/store. Returns a
+    /// raw host pointer to `len` (1/2/4) bytes at physical `addr` — safe for a direct load (when
+    /// `need == PERM_READ`) or store (when `need == PERM_READ | PERM_WRITE`) of exactly `len`
+    /// bytes — IFF every touched byte's permission byte has ALL of `need`'s bits set AND NONE of
+    /// [`FAST_PTR_FORBIDDEN`]'s (`PERM_RAW`/`PERM_ACC` — any of those means "not the trivial case,
+    /// a real sanitizer/oracle cares about this byte", so decline unconditionally regardless of
+    /// what else is set) and the whole span is backed by directly host-addressable RAM (never
+    /// MMIO). Note this is an "at least `need`, and none of the forbidden bits" check, NOT bitwise
+    /// equality to `need` — a byte legitimately carrying extra permitted bits alongside `need`
+    /// (e.g. `PERM_READ | PERM_WRITE | PERM_EXEC` on an RWX page, for a `need == PERM_READ` load)
+    /// is still the ordinary, safe, common case and must still fast-path; only `PERM_RAW`/
+    /// `PERM_ACC` are treated as disqualifying "something special is watching this byte" signals.
+    /// `addr`/`len` are assumed already checked naturally aligned by the caller — a `len` that
+    /// divides 4096 (RAM's page granularity) and an `addr` that is a multiple of `len` can never
+    /// straddle a page, so this function does not itself re-check page-crossing.
+    ///
+    /// Declining (`None`) is ALWAYS correct: it just means "no fast path here, use the ordinary
+    /// checked `load`/`store`", which remains the sole source of truth for every non-trivial case
+    /// (RAW-poisoned bytes, missing perms, MMIO, out of bounds — anything at all). Default impl
+    /// always declines, which is correct for any `Bus` with no direct host-addressable backing
+    /// (or one that simply chooses not to support this).
+    ///
+    /// For a store (`need` includes `PERM_WRITE`), a `Some` return has ALREADY performed every
+    /// side effect the ordinary checked `write` path would perform other than the byte content
+    /// write itself (dirty-block tracking; copy-on-write page materialization for a COW-backed
+    /// implementor) — the forbidden-bit check guarantees no RAW-clear/READ-upgrade is needed (no
+    /// `PERM_RAW`, and `need` for a store already requires `PERM_READ` present too), so the
+    /// caller's own direct store through the returned pointer is the ONLY remaining step, and is
+    /// bit-for-bit what `write()` would have done.
+    fn fast_ptr(&mut self, addr: u32, len: u8, need: u8) -> Option<*mut u8> {
+        let _ = (addr, len, need);
+        None
     }
 }
 
@@ -479,6 +523,31 @@ impl Bus for Mmu {
             }
         }
         mask
+    }
+
+    fn fast_ptr(&mut self, addr: u32, len: u8, need: u8) -> Option<*mut u8> {
+        let off = self.offset(addr)?;
+        let end = off.checked_add(len as usize)?;
+        if end > self.mem.len() {
+            return None;
+        }
+        if !self.perms[off..end].iter().all(|&p| (p & need) == need && (p & FAST_PTR_FORBIDDEN) == 0) {
+            return None;
+        }
+        if need & PERM_WRITE != 0 && self.track_dirty {
+            // Mirror `write`'s dirty-block bookkeeping exactly (the caller performs the actual
+            // content write through the returned pointer immediately after this returns) — one
+            // `mark_dirty` per touched byte, same as `write_bytewise`'s per-byte loop (`len` is at
+            // most 4, so this is cheap).
+            for i in off..end {
+                self.mark_dirty(i);
+            }
+        }
+        // Safe: slicing (bounds-checked above) then taking the slice's own pointer — no raw
+        // pointer arithmetic, so this needs no `unsafe` (this crate is `forbid(unsafe_code)`).
+        // The pointer is only ever *dereferenced* by `fs-jit`'s isolated unsafe surface, which
+        // does so from freshly emitted native code, not from Rust — see `fs-jit`'s `sys.rs`.
+        Some(self.mem[off..end].as_mut_ptr())
     }
 }
 
@@ -909,6 +978,45 @@ impl CowRam {
     pub fn fetch_u32(&self, addr: u32) -> Result<u32, Fault> {
         Self::check_align(addr, 4, Access::Exec)?;
         Ok(u32::from_le_bytes(self.fetch_bytes::<4>(addr)?))
+    }
+
+    /// `fs_mmu::Bus::fast_ptr`'s twin for `CowRam` (`CowRam` itself doesn't implement `Bus` — it's
+    /// wrapped by `fs_platform::CowMachine`, which forwards here). See that trait method's doc for
+    /// the full contract; the only `CowRam`-specific wrinkle is on a store (`need & PERM_WRITE !=
+    /// 0`): the containing page is copy-on-write materialized via [`CowRam::ensure_page`] — the
+    /// exact same call [`CowRam::write`] itself makes — so the dirty/overlay bookkeeping this
+    /// fast path must perform (mirroring the trait doc's "already performed every side effect
+    /// except the content write" contract) is identical to the checked path's, not a second copy
+    /// of it.
+    pub fn fast_ptr(&mut self, addr: u32, len: u8, need: u8) -> Option<*mut u8> {
+        let off = self.offset(addr)?;
+        let pn = off / PAGE_SIZE;
+        let po = off % PAGE_SIZE;
+        let end = off.checked_add(len as usize)?;
+        if end > self.golden.size() || po + len as usize > PAGE_SIZE {
+            return None;
+        }
+        {
+            let (_, perms) = self.resolve(pn);
+            if !perms[po..po + len as usize]
+                .iter()
+                .all(|&p| (p & need) == need && (p & FAST_PTR_FORBIDDEN) == 0)
+            {
+                return None;
+            }
+        }
+        if need & PERM_WRITE != 0 {
+            let idx = self.ensure_page(pn);
+            let page = &mut self.pages[idx];
+            Some(page.mem[po..po + len as usize].as_mut_ptr())
+        } else {
+            let (mem, _) = self.resolve(pn);
+            // Safe pointer-type cast (not a dereference) — turning the shared, read-only `&[u8]`
+            // this load will only ever be read through into a `*mut u8` so it has the same type
+            // as the write branch above; the caller (`fs-jit`) never writes through a pointer this
+            // function returned for a `need` that lacked `PERM_WRITE`.
+            Some(mem[po..po + len as usize].as_ptr() as *mut u8)
+        }
     }
 
     /// Bus-shaped helpers, matching how `fs_platform::Machine` calls its `Mmu` (see PR2's

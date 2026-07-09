@@ -47,7 +47,7 @@
 //! treat the offset as callable — the "finish writing the whole chain, then call it" sequencing
 //! the design doc calls for.
 
-use fs_mmu::Bus;
+use fs_mmu::{Access, Bus, PERM_READ, PERM_WRITE};
 use fs_riscv::{Cpu, LoadOp, StoreOp};
 use std::io;
 use std::sync::atomic::{compiler_fence, Ordering};
@@ -225,6 +225,129 @@ pub(crate) fn store_shim_addr(op: StoreOp) -> u64 {
         StoreOp::Sb => jit_store_sb,
         StoreOp::Sh => jit_store_sh,
         StoreOp::Sw => jit_store_sw,
+    };
+    f as usize as u64
+}
+
+// -------------------------------------------------------------------------------------------
+// Phase 3 (`docs/jit-scalar-design.md`): inlined memory fast-path pointer shims. Each is a MUCH
+// narrower check than `load_common`/`store_common` above — no full `xlate` walk, no generic `dyn
+// Bus` size/sign dispatch, no unaligned/page-crossing byte-loop — just [`Cpu::fast_pa`] (a
+// TLB-only, side-effect-free lookup) followed by [`fs_mmu::Bus::fast_ptr`] (the byte-perm-plane
+// exact-match check), returning either a real host pointer (as a nonzero `u64`) or `0` ("bail,
+// use the ordinary call-out"). `0` is an unambiguous sentinel: every pointer these functions can
+// return points into an actually-allocated, nonzero-size `Vec<u8>`/page buffer (Rust's allocator
+// never returns a null pointer for a successful nonzero-size allocation), so it can never
+// collide with a genuine fast-path hit. Monomorphized by `len` (1/2/4), not by `LoadOp`/`StoreOp`
+// variant — sign-extension is purely an emitted-code concern applied AFTER the pointer is
+// obtained (`chain.rs`'s `emit_sized_load_from_ptr`), so the shim itself doesn't need to know
+// `LoadOp`'s signedness.
+// -------------------------------------------------------------------------------------------
+
+/// Common fast Load-pointer body: alignment check (the caller's real guarantee that the whole
+/// `len`-byte span can never cross a page — see `fast_ptr`'s doc), then [`Cpu::fast_pa`] +
+/// [`fs_mmu::Bus::fast_ptr`]. `0` on ANY doubt. SAFETY: identical preconditions to
+/// [`load_common`] — `cpu` valid, `bus_data`/`bus_vtable` decompose a live `&mut dyn Bus` for the
+/// duration of this call. Read-only w.r.t. `cpu` (`fast_pa` takes `&self`), so a shared reborrow
+/// suffices — never constructs a `&mut Cpu` here.
+unsafe fn fast_load_ptr_common(cpu: *mut Cpu, bus_data: *mut (), bus_vtable: *const (), va: u32, len: u8) -> u64 {
+    if !va.is_multiple_of(len as u32) {
+        return 0;
+    }
+    // SAFETY: see this function's doc comment.
+    let cpu = unsafe { &*cpu };
+    // SAFETY: see `load_common`'s doc comment / `recompose_bus`'s.
+    let bus = unsafe { recompose_bus(bus_data, bus_vtable) };
+    let Some(pa) = cpu.fast_pa(va, Access::Read) else { return 0 };
+    match bus.fast_ptr(pa, len, PERM_READ) {
+        Some(p) => p as u64,
+        None => 0,
+    }
+}
+
+/// Common fast Store-pointer body: mirrors [`fast_load_ptr_common`], `Access::Write` +
+/// `PERM_READ | PERM_WRITE`, with ONE additional bail `store_common` needs and the pure
+/// pointer-check design otherwise wouldn't know about: `is_sw` (compile-time-known per monomorphized
+/// wrapper below, mirroring `store_common`'s own `is_sw` parameter) — if this is a word store AND
+/// `va` is the live HTIF `tohost` sentinel, this function bails UNCONDITIONALLY (regardless of
+/// what value will end up being stored, which isn't even known yet at this point — the value is
+/// only loaded by `chain.rs`'s emitted code AFTER a successful fast-path check), forcing the slow
+/// `store_common` call-out to run its halt-intercept logic for real. This is the ONE piece of
+/// non-byte-perm-oracle Store semantics `store_common` has that a pure "is this address+perms a
+/// safe direct write" check cannot see, so it must be special-cased here rather than folded into
+/// `fs_mmu::Bus::fast_ptr` (which knows nothing about HTIF).
+///
+/// A `Some` return (beyond the `is_sw`/HTIF case) has ALREADY performed every side effect
+/// `store_impl` would need beyond the actual byte write (see `fs_mmu::Bus::fast_ptr`'s doc) — in
+/// particular, since the fast path structurally only ever resolves to directly host-addressable
+/// RAM (never MMIO — `fast_ptr`'s own bounds check on `Machine`/`CowMachine` excludes the
+/// CLINT/UART windows), a store that reaches this path can never be a CLINT-range store, so the
+/// caller needs no `TAG_REPOLL`-equivalent check on this path at all (unlike `store_common`'s
+/// `store_may_assert_interrupt` call). SAFETY: see [`fast_load_ptr_common`].
+unsafe fn fast_store_ptr_common(
+    cpu: *mut Cpu,
+    bus_data: *mut (),
+    bus_vtable: *const (),
+    va: u32,
+    len: u8,
+    is_sw: bool,
+) -> u64 {
+    if !va.is_multiple_of(len as u32) {
+        return 0;
+    }
+    // SAFETY: see `fast_load_ptr_common`'s doc comment.
+    let cpu = unsafe { &*cpu };
+    if is_sw && cpu.htif_tohost == Some(va) {
+        return 0; // let the slow call-out's halt-intercept logic run, for real
+    }
+    // SAFETY: see `load_common`'s doc comment / `recompose_bus`'s.
+    let bus = unsafe { recompose_bus(bus_data, bus_vtable) };
+    let Some(pa) = cpu.fast_pa(va, Access::Write) else { return 0 };
+    match bus.fast_ptr(pa, len, PERM_READ | PERM_WRITE) {
+        Some(p) => p as u64,
+        None => 0,
+    }
+}
+
+unsafe extern "C" fn jit_fast_load_ptr_1(cpu: *mut Cpu, bus_data: *mut (), bus_vtable: *const (), va: u32) -> u64 {
+    unsafe { fast_load_ptr_common(cpu, bus_data, bus_vtable, va, 1) }
+}
+unsafe extern "C" fn jit_fast_load_ptr_2(cpu: *mut Cpu, bus_data: *mut (), bus_vtable: *const (), va: u32) -> u64 {
+    unsafe { fast_load_ptr_common(cpu, bus_data, bus_vtable, va, 2) }
+}
+unsafe extern "C" fn jit_fast_load_ptr_4(cpu: *mut Cpu, bus_data: *mut (), bus_vtable: *const (), va: u32) -> u64 {
+    unsafe { fast_load_ptr_common(cpu, bus_data, bus_vtable, va, 4) }
+}
+unsafe extern "C" fn jit_fast_store_ptr_sb(cpu: *mut Cpu, bus_data: *mut (), bus_vtable: *const (), va: u32) -> u64 {
+    unsafe { fast_store_ptr_common(cpu, bus_data, bus_vtable, va, 1, false) }
+}
+unsafe extern "C" fn jit_fast_store_ptr_sh(cpu: *mut Cpu, bus_data: *mut (), bus_vtable: *const (), va: u32) -> u64 {
+    unsafe { fast_store_ptr_common(cpu, bus_data, bus_vtable, va, 2, false) }
+}
+unsafe extern "C" fn jit_fast_store_ptr_sw(cpu: *mut Cpu, bus_data: *mut (), bus_vtable: *const (), va: u32) -> u64 {
+    unsafe { fast_store_ptr_common(cpu, bus_data, bus_vtable, va, 4, true) }
+}
+
+/// The fixed process-lifetime address `chain.rs`'s codegen `movabs`+`call`s for the fast Load
+/// pointer check, monomorphized by `LoadOp`'s byte width (Lb/Lbu share width 1, Lh/Lhu share width
+/// 2 — the fast path doesn't care about signedness, only the emitted code consuming the returned
+/// pointer does).
+pub(crate) fn fast_load_ptr_addr(op: LoadOp) -> u64 {
+    let f: unsafe extern "C" fn(*mut Cpu, *mut (), *const (), u32) -> u64 = match op {
+        LoadOp::Lb | LoadOp::Lbu => jit_fast_load_ptr_1,
+        LoadOp::Lh | LoadOp::Lhu => jit_fast_load_ptr_2,
+        LoadOp::Lw => jit_fast_load_ptr_4,
+    };
+    f as usize as u64
+}
+
+/// Same as [`fast_load_ptr_addr`], for `StoreOp` — monomorphized per-op (not just per-width, unlike
+/// loads) since `Sw` alone carries the HTIF-`tohost` bail (see [`fast_store_ptr_common`]'s doc).
+pub(crate) fn fast_store_ptr_addr(op: StoreOp) -> u64 {
+    let f: unsafe extern "C" fn(*mut Cpu, *mut (), *const (), u32) -> u64 = match op {
+        StoreOp::Sb => jit_fast_store_ptr_sb,
+        StoreOp::Sh => jit_fast_store_ptr_sh,
+        StoreOp::Sw => jit_fast_store_ptr_sw,
     };
     f as usize as u64
 }

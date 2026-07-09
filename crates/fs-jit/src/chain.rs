@@ -95,6 +95,10 @@ const EMPTY: u32 = u32::MAX;
 const REGS_OFF: i32 = std::mem::offset_of!(Cpu, regs) as i32;
 const PC_OFF: i32 = std::mem::offset_of!(Cpu, pc) as i32;
 const INSNS_RETIRED_OFF: i32 = std::mem::offset_of!(Cpu, insns_retired) as i32;
+/// Phase 3 (`docs/jit-scalar-design.md`) fast-path instrumentation counters — bumped directly by
+/// emitted code, mirroring `INSNS_RETIRED_OFF`'s bump (see `Cpu::fast_path_hits`'s doc comment).
+const FAST_PATH_HITS_OFF: i32 = std::mem::offset_of!(Cpu, fast_path_hits) as i32;
+const FAST_PATH_BAILS_OFF: i32 = std::mem::offset_of!(Cpu, fast_path_bails) as i32;
 
 #[inline]
 fn reg_off(i: u8) -> i32 {
@@ -709,64 +713,122 @@ fn emit_step(a: &mut Asm, step: &Step, is_last: bool) {
             a.mov_mem_r32(Reg::RDI, PC_OFF, Reg::R9);
         }
         Inst::Load { op, rd, rs1, imm } => {
-            // cpu.pc = this instruction's OWN address, BEFORE the call: `fs_riscv::take_trap`
-            // reads `self.pc` as the faulting epc, and (mirroring `exec_one`'s structure, where
-            // `self.pc` is never advanced until an instruction fully commits) that must be exactly
-            // this instruction's address if the call-out reports a trap. Cheap and paid only on
-            // Load/Store, exactly like `docs/jit-scalar-design.md` specifies.
-            a.lea_r32_mem(Reg::RAX, Reg::R8, step.static_offset as i32);
-            a.mov_mem_r32(Reg::RDI, PC_OFF, Reg::RAX);
             // va = rs1 + imm, into RCX (the shim's 4th SysV arg; RDI/RSI/RDX already hold
             // cpu/bus_data/bus_vtable, the shim's first three args, untouched).
             load_reg(a, Reg::RCX, rs1);
             a.alu_r32_imm32(Alu2::Add, Reg::RCX, imm as u32);
-            emit_call_preserving_regs(a, |a| {
-                a.mov_r64_imm64(Reg::R11, sys::load_shim_addr(op));
+
+            // Phase 3 fast path (`docs/jit-scalar-design.md`): ask for a direct host pointer first
+            // — a narrow, provably-safe check ([`fs_riscv::Cpu::fast_pa`] + [`fs_mmu::Bus::fast_ptr`],
+            // see their docs) that NEVER traps by construction (any doubt at all just returns 0,
+            // meaning "bail to the unchanged Phase 2 call-out below"). `RCX` (va) is preserved
+            // across this call by `emit_fast_path_call_preserving_va` since the slow branch needs
+            // it again unchanged.
+            emit_fast_path_call_preserving_va(a, |a| {
+                a.mov_r64_imm64(Reg::R11, sys::fast_load_ptr_addr(op));
                 a.call_r64(Reg::R11);
             });
             a.test_r64_r64(Reg::RAX, Reg::RAX);
-            // Bit 63 (sign) set => TAG_TRAP: stop the chain now, passing the shim's packed value
-            // straight through as this whole compiled chain's own return value (same bit layout —
-            // see `sys.rs`'s tag doc). `pc` is already correct (just set above); `insns_retired`
-            // must NOT be bumped (a faulting instruction never retires, matching `exec_one`).
-            emit_skip(a, Cc::Ns, |rare| rare.ret());
-            // No trap: this instruction retired. Bump `insns_retired` and store the loaded value
-            // (RAX's low 32 bits — always a clean `u32` in this path, see `sys.rs`'s tag doc) into
-            // `rd` (elided for `x0`).
-            a.add_qword_mem_imm8(Reg::RDI, INSNS_RETIRED_OFF, 1);
-            store_reg(a, rd, Reg::RAX);
+            emit_if_else(
+                a,
+                Cc::Ne, // RAX != 0 => a real host pointer (fast-path hit — never NULL, see sys.rs)
+                |a| {
+                    // FAST: direct sized/signed load from the host pointer (RAX) — no call-out.
+                    // `RCX` (va) is no longer needed, so it doubles as the load's destination.
+                    a.add_qword_mem_imm8(Reg::RDI, FAST_PATH_HITS_OFF, 1);
+                    emit_sized_load_from_ptr(a, op, Reg::RCX, Reg::RAX);
+                    a.add_qword_mem_imm8(Reg::RDI, INSNS_RETIRED_OFF, 1);
+                    store_reg(a, rd, Reg::RCX);
+                },
+                |a| {
+                    // SLOW (bail): Phase 2's existing call-out path, byte-for-byte unchanged —
+                    // `RCX` still holds `va` (restored by `emit_fast_path_call_preserving_va`'s pop).
+                    a.add_qword_mem_imm8(Reg::RDI, FAST_PATH_BAILS_OFF, 1);
+                    // cpu.pc = this instruction's OWN address, BEFORE the call: `fs_riscv::take_trap`
+                    // reads `self.pc` as the faulting epc, and (mirroring `exec_one`'s structure,
+                    // where `self.pc` is never advanced until an instruction fully commits) that
+                    // must be exactly this instruction's address if the call-out reports a trap.
+                    a.lea_r32_mem(Reg::RAX, Reg::R8, step.static_offset as i32);
+                    a.mov_mem_r32(Reg::RDI, PC_OFF, Reg::RAX);
+                    emit_call_preserving_regs(a, |a| {
+                        a.mov_r64_imm64(Reg::R11, sys::load_shim_addr(op));
+                        a.call_r64(Reg::R11);
+                    });
+                    a.test_r64_r64(Reg::RAX, Reg::RAX);
+                    // Bit 63 (sign) set => TAG_TRAP: stop the chain now, passing the shim's packed
+                    // value straight through as this whole compiled chain's own return value (same
+                    // bit layout — see `sys.rs`'s tag doc). `pc` is already correct (just set
+                    // above); `insns_retired` must NOT be bumped (a faulting instruction never
+                    // retires, matching `exec_one`).
+                    emit_skip(a, Cc::Ns, |rare| rare.ret());
+                    // No trap: this instruction retired. Bump `insns_retired` and store the loaded
+                    // value (RAX's low 32 bits — always a clean `u32` in this path, see `sys.rs`'s
+                    // tag doc) into `rd` (elided for `x0`).
+                    a.add_qword_mem_imm8(Reg::RDI, INSNS_RETIRED_OFF, 1);
+                    store_reg(a, rd, Reg::RAX);
+                },
+            );
         }
         Inst::Store { op, rs1, rs2, imm } => {
-            a.lea_r32_mem(Reg::RAX, Reg::R8, step.static_offset as i32);
-            a.mov_mem_r32(Reg::RDI, PC_OFF, Reg::RAX);
             load_reg(a, Reg::RCX, rs1);
-            a.alu_r32_imm32(Alu2::Add, Reg::RCX, imm as u32);
-            emit_call_preserving_regs(a, |a| {
-                // val (the shim's 5th SysV arg, R8) — safe: the real R8 is already saved by
-                // `emit_call_preserving_regs`, restored by its matching pop right after the call.
-                load_reg(a, Reg::R8, rs2);
-                a.mov_r64_imm64(Reg::R11, sys::store_shim_addr(op));
+            a.alu_r32_imm32(Alu2::Add, Reg::RCX, imm as u32); // va
+
+            // Phase 3 fast path: same shape as Load's, above.
+            emit_fast_path_call_preserving_va(a, |a| {
+                a.mov_r64_imm64(Reg::R11, sys::fast_store_ptr_addr(op));
                 a.call_r64(Reg::R11);
             });
             a.test_r64_r64(Reg::RAX, Reg::RAX);
-            // Bit 63 set => trap: identical early-`ret` to the Load case above.
-            emit_skip(a, Cc::Ns, |rare| rare.ret());
-            // Not a trap. `rax==0` => plain continue (fast path, falls through below); `rax!=0`
-            // (bit 62 halt | bit 61 repoll — the only two other TAG_* values a Store can produce)
-            // => this store STILL retired, so bump `insns_retired` and advance `pc` to this
-            // instruction's fallthrough (mirroring the interpreter's normal per-instruction commit)
-            // before returning the shim's tag unchanged — the SAME "retire, stop the chain" shape
-            // for both halt and repoll, since only the already-embedded tag value distinguishes
-            // them one level up (`ChainCache::run_block`), not anything computed here.
-            let next_off = (step.static_offset + step.ilen) as i32;
-            emit_skip(a, Cc::E, |rare| {
-                rare.add_qword_mem_imm8(Reg::RDI, INSNS_RETIRED_OFF, 1);
-                rare.lea_r32_mem(Reg::RCX, Reg::R8, next_off);
-                rare.mov_mem_r32(Reg::RDI, PC_OFF, Reg::RCX);
-                rare.ret();
-            });
-            // Plain continue: retired normally, nothing else to do (no `rd` for `Store`).
-            a.add_qword_mem_imm8(Reg::RDI, INSNS_RETIRED_OFF, 1);
+            emit_if_else(
+                a,
+                Cc::Ne,
+                |a| {
+                    // FAST: `fast_ptr`'s contract guarantees this can only ever resolve to plain
+                    // RAM (never CLINT/MMIO — see `sys.rs`'s `fast_store_ptr_common` doc), so no
+                    // `store_may_assert_interrupt`/`TAG_REPOLL`-equivalent check is needed here at
+                    // all: this Store structurally cannot newly assert an interrupt. `rs2`'s value
+                    // is loaded fresh here (cheap — a single `mov` from the register array) rather
+                    // than preserved across the fast-ptr call, since nothing needed it before now.
+                    a.add_qword_mem_imm8(Reg::RDI, FAST_PATH_HITS_OFF, 1);
+                    load_reg(a, Reg::RCX, rs2);
+                    emit_sized_store_to_ptr(a, op, Reg::RAX, Reg::RCX);
+                    a.add_qword_mem_imm8(Reg::RDI, INSNS_RETIRED_OFF, 1);
+                },
+                |a| {
+                    // SLOW (bail): Phase 2's existing call-out path, byte-for-byte unchanged.
+                    a.add_qword_mem_imm8(Reg::RDI, FAST_PATH_BAILS_OFF, 1);
+                    a.lea_r32_mem(Reg::RAX, Reg::R8, step.static_offset as i32);
+                    a.mov_mem_r32(Reg::RDI, PC_OFF, Reg::RAX);
+                    emit_call_preserving_regs(a, |a| {
+                        // val (the shim's 5th SysV arg, R8) — safe: the real R8 is already saved
+                        // by `emit_call_preserving_regs`, restored by its matching pop right after
+                        // the call.
+                        load_reg(a, Reg::R8, rs2);
+                        a.mov_r64_imm64(Reg::R11, sys::store_shim_addr(op));
+                        a.call_r64(Reg::R11);
+                    });
+                    a.test_r64_r64(Reg::RAX, Reg::RAX);
+                    // Bit 63 set => trap: identical early-`ret` to the Load case above.
+                    emit_skip(a, Cc::Ns, |rare| rare.ret());
+                    // Not a trap. `rax==0` => plain continue (fast path, falls through below);
+                    // `rax!=0` (bit 62 halt | bit 61 repoll — the only two other TAG_* values a
+                    // Store can produce) => this store STILL retired, so bump `insns_retired` and
+                    // advance `pc` to this instruction's fallthrough (mirroring the interpreter's
+                    // normal per-instruction commit) before returning the shim's tag unchanged —
+                    // the SAME "retire, stop the chain" shape for both halt and repoll, since only
+                    // the already-embedded tag value distinguishes them one level up
+                    // (`ChainCache::run_block`), not anything computed here.
+                    let next_off = (step.static_offset + step.ilen) as i32;
+                    emit_skip(a, Cc::E, |rare| {
+                        rare.add_qword_mem_imm8(Reg::RDI, INSNS_RETIRED_OFF, 1);
+                        rare.lea_r32_mem(Reg::RCX, Reg::R8, next_off);
+                        rare.mov_mem_r32(Reg::RDI, PC_OFF, Reg::RCX);
+                        rare.ret();
+                    });
+                    // Plain continue: retired normally, nothing else to do (no `rd` for `Store`).
+                    a.add_qword_mem_imm8(Reg::RDI, INSNS_RETIRED_OFF, 1);
+                },
+            );
         }
         _ => unreachable!("decode_chain never includes a non-ALU, non-terminal instruction"),
     }
@@ -783,6 +845,82 @@ fn emit_skip(a: &mut Asm, skip_if: Cc, build: impl FnOnce(&mut Asm)) {
     build(&mut inner);
     a.jcc_rel32(skip_if, inner.buf.len() as i32);
     a.buf.extend_from_slice(&inner.buf);
+}
+
+/// Phase 3 (`docs/jit-scalar-design.md`): an if/else with exactly one runtime branch decision,
+/// built the same "measure each block first" way [`emit_skip`] does (no label table, no
+/// backpatching) — but unlike `emit_skip`'s inner block (which always ends in its own `ret`),
+/// BOTH `then_` and `else_` here are expected to fall through to whatever `a` emits next: this is
+/// the mechanism the Phase 3 fast/slow Load/Store split needs, since either branch must continue
+/// into the REST of the chain (bump `insns_retired`, move on to the next `Step`), not return from
+/// it. Compiles to:
+/// ```text
+/// jcc  cc, else_len + 5      ; jump straight into `then_` when `cc` holds
+/// <else_ bytes>               ; falls straight through here when `cc` does NOT hold
+/// jmp  then_len               ; ...then jumps over `then_` to land after it
+/// <then_ bytes>
+/// ```
+fn emit_if_else(a: &mut Asm, cc: Cc, then_: impl FnOnce(&mut Asm), else_: impl FnOnce(&mut Asm)) {
+    let mut then_buf = Asm::new();
+    then_(&mut then_buf);
+    let mut else_buf = Asm::new();
+    else_(&mut else_buf);
+    // Jump straight to `then_` when `cc` holds, skipping `else_`'s block AND the `jmp` that
+    // immediately follows it (5 bytes: `E9 rel32`).
+    a.jcc_rel32(cc, else_buf.buf.len() as i32 + 5);
+    a.buf.extend_from_slice(&else_buf.buf);
+    a.jmp_rel32(then_buf.buf.len() as i32);
+    a.buf.extend_from_slice(&then_buf.buf);
+}
+
+/// Like [`emit_call_preserving_regs`], but preserves `RCX` (the freshly computed `va`, needed
+/// again by the slow-path call-out if the Phase 3 fast-path attempt bails) instead of the
+/// meaningless `R9` alignment padding — same push count (5, still odd — required for 16-byte
+/// `RSP` alignment immediately before the `call`, see `emit_call_preserving_regs`'s doc), just a
+/// padding register whose value the caller actually wants back this time. `RAX` (the fast-ptr
+/// shim's return value — 0 or a real pointer) is deliberately left unprotected, exactly like
+/// `emit_call_preserving_regs`'s `RAX`.
+fn emit_fast_path_call_preserving_va(a: &mut Asm, emit_call: impl FnOnce(&mut Asm)) {
+    a.push_r64(Reg::RCX);
+    a.push_r64(Reg::RDI);
+    a.push_r64(Reg::RSI);
+    a.push_r64(Reg::RDX);
+    a.push_r64(Reg::R8);
+    emit_call(a);
+    a.pop_r64(Reg::R8);
+    a.pop_r64(Reg::RDX);
+    a.pop_r64(Reg::RSI);
+    a.pop_r64(Reg::RDI);
+    a.pop_r64(Reg::RCX);
+}
+
+/// Phase 3: emit the correctly-sized, correctly-signed load `dst = *(ptr-sized-by-op)` straight
+/// from a host pointer already in `ptr_reg` — the ONE place a `LoadOp`'s signedness matters for
+/// the fast path (the shim that produced `ptr_reg` doesn't know or care about it, see
+/// `sys.rs`'s `fast_load_ptr_addr` doc). Mirrors exactly what `fs_riscv::load_impl`'s
+/// sign/zero-extension match does for each `LoadOp`, just performed by the CPU's own load
+/// instruction instead of Rust arithmetic.
+fn emit_sized_load_from_ptr(a: &mut Asm, op: fs_riscv::LoadOp, dst: Reg, ptr_reg: Reg) {
+    use fs_riscv::LoadOp;
+    match op {
+        LoadOp::Lb => a.movsx_r32_mem8(dst, ptr_reg, 0),
+        LoadOp::Lbu => a.movzx_r32_mem8(dst, ptr_reg, 0),
+        LoadOp::Lh => a.movsx_r32_mem16(dst, ptr_reg, 0),
+        LoadOp::Lhu => a.movzx_r32_mem16(dst, ptr_reg, 0),
+        LoadOp::Lw => a.mov_r32_mem(dst, ptr_reg, 0),
+    }
+}
+
+/// Phase 3: emit the correctly-sized store `*(ptr-sized-by-op) = src` straight to a host pointer
+/// already in `ptr_reg`. `src`'s low 1/2/4 bytes are stored, matching `fs_riscv::store_impl`'s
+/// truncating byte-wise write for `Sb`/`Sh` and the full word for `Sw`.
+fn emit_sized_store_to_ptr(a: &mut Asm, op: fs_riscv::StoreOp, ptr_reg: Reg, src: Reg) {
+    use fs_riscv::StoreOp;
+    match op {
+        StoreOp::Sb => a.mov_mem8_r8(ptr_reg, 0, src),
+        StoreOp::Sh => a.mov_mem16_r16(ptr_reg, 0, src),
+        StoreOp::Sw => a.mov_mem_r32(ptr_reg, 0, src),
+    }
 }
 
 /// Protect every register a Load/Store call-out's `call` is free to clobber (RDI/RSI/RDX/R8 are

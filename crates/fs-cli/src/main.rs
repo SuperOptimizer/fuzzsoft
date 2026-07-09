@@ -1555,6 +1555,12 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     let mut done = 0u32;
     let mut budget_hit = 0u32;
     let mut total_case_insns = 0u64;
+    // Phase 3 (`docs/jit-scalar-design.md`) fast-path instrumentation: `cpu.fast_path_hits`/
+    // `fast_path_bails` are bumped directly by the compiled chain's own emitted code, but (like
+    // `insns_retired`) get reset to whatever the golden snapshot held every `snap.reset` — so the
+    // whole-run total is accumulated as a delta each case, exactly mirroring `total_case_insns`.
+    let mut total_fast_path_hits = 0u64;
+    let mut total_fast_path_bails = 0u64;
     // CMPLOG bookkeeping (decision: --cmplog, serial path only — see the `--jobs > 1` guard
     // above): how many times we traced a corpus entry to learn its comparison operands, and how
     // many of those traces actually yielded a value-substitution mutation (vs. no match, falling
@@ -1630,6 +1636,8 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
             ctx.hooks.clear_pending();
         }
         let case_start = cpu.insns_retired;
+        let case_start_fast_hits = cpu.fast_path_hits;
+        let case_start_fast_bails = cpu.fast_path_bails;
         write_words(&mut m, &prog_pas, &fs_prog::to_wire(&lowered));
         write_scratch_bytes(&mut m, &scratch_pas, &lowered.scratch);
 
@@ -1642,6 +1650,8 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
         } else {
             run_case(&mut cpu, &mut m, &mut run_map, deadline, san_ctx.as_mut())
         };
+        total_fast_path_hits += cpu.fast_path_hits - case_start_fast_hits;
+        total_fast_path_bails += cpu.fast_path_bails - case_start_fast_bails;
         match stop {
             Stop::Hypercall(HC_DONE) => done += 1,
             Stop::Budget => budget_hit += 1,
@@ -1782,6 +1792,11 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
         }
         println!();
         println!("  chain arena   : {} / {} bytes used", cache.arena_bytes_used(), cache.arena_capacity());
+        let fast_total = total_fast_path_hits + total_fast_path_bails;
+        let fast_hit_pct = if fast_total > 0 { total_fast_path_hits as f64 / fast_total as f64 * 100.0 } else { 0.0 };
+        println!(
+            "  fast mem path : {total_fast_path_hits} hits, {total_fast_path_bails} bails ({fast_hit_pct:.1}% hit rate)  [Phase 3, docs/jit-scalar-design.md]"
+        );
     }
     println!(
         "  guest speed   : {mips:.0} MIPS ({} insns/case avg)",
