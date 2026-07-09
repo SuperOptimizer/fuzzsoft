@@ -77,9 +77,16 @@ The plateau is structural (missing descriptions), not a mutator weakness — fs-
 
 ## T3 — Sanitizing (detect more bug classes on uninstrumented guests)
 - **T3.1 KMSAN Stage 1.5 — wire the register-taint as a LIVE ORACLE (HIGH value, turns shipped work
-  into a detector).** Add `--kmsan`: catch `Trap::KmsanTainted`, report + minimize + reproduce like
-  the crash oracle. Today Stage 1 propagates taint but nothing surfaces it. `[agent · fs-cli/fs-riscv
-  · positive (planted uninit-branch fires) + negative (clean = 0) controls · KMSAN Stage 1 (done)]`
+  into a detector). DONE, but the headline finding raises T3.2's priority.** `--kmsan` is wired
+  (`Cpu::kmsan_hit` stashed by `finish_exit`, drained + minimized + reproduced like the crash
+  oracle; synthetic positive/negative controls pass). The clean-kernel false-positive measurement
+  (4000 cases) found **0 hits — but for a structural reason, not a precision one**: Stage 1's only
+  taint entry point (`Load` gathering `PERM_RAW`) has no live producer reachable outside
+  `--sanitize`'s allocator hooks (which `--kmsan` is, by design, forbidden to combine with), so a
+  live `--kmsan` run currently has zero taint sources at all — confirmed dormant even with
+  `--sanitize`'s hooks active in a one-off diagnostic. See `docs/kmsan.md`'s "T3.1 outcome" section.
+  `[agent · fs-cli/fs-riscv · positive (planted uninit-branch fires) + negative (clean = 0) controls
+  · KMSAN Stage 1 (done)]`
 - **T3.2 KMSAN Stage 2 — memory shadow.** `PERM_VTAINT` spare perm bit; loads OR in RAW+VTAINT;
   store→reload→branch round-trip propagation. Makes it true *value* taint. `[agent(worktree) ·
   fs-mmu/fs-riscv · positive+negative + store-reload test · T3.1]`

@@ -758,6 +758,95 @@ fn handle_new_crash<B: GuestBus>(
     eprintln!("fuzz: wrote {txt} and {cfile}");
 }
 
+/// Delta-debug a KMSAN-tainted program down to a minimal call subset that still raises
+/// [`fs_riscv::Trap::KmsanTainted`] at the *same* faulting `target_pc` — the KMSAN analogue of
+/// [`minimize_program`], which instead matches on `kernel_crash_sig`'s console-text signature.
+/// KMSAN hits never touch the console (the case ends at `Cpu::finish_exit`'s `SysExit::Halt`
+/// before any guest oops could print), so the match target here is `Cpu::kmsan_hit` instead.
+#[allow(clippy::too_many_arguments)]
+fn minimize_program_kmsan<B: GuestBus>(
+    cpu: &mut fs_riscv::Cpu,
+    m: &mut B,
+    mut reset: impl FnMut(&mut fs_riscv::Cpu, &mut B),
+    prog: &fs_prog::Prog,
+    target_pc: u32,
+    scratch_va: u32,
+    prog_pas: &[u32],
+    scratch_pas: &[u32],
+    case_insns: u64,
+) -> fs_prog::Prog {
+    let mut run_map = fs_cov::CovBitmap::new();
+    let mut keep: Vec<usize> = (0..prog.calls.len()).collect();
+    let mut changed = true;
+    while changed && keep.len() > 1 {
+        changed = false;
+        for pos in 0..keep.len() {
+            let mut cand = keep.clone();
+            cand.remove(pos);
+            let sub = subset_prog(prog, &cand);
+            let lowered = fs_prog::lower(&sub, scratch_va);
+            reset(cpu, m);
+            write_words(m, prog_pas, &fs_prog::to_wire(&lowered));
+            write_scratch_bytes(m, scratch_pas, &lowered.scratch);
+            run_map.clear();
+            let deadline = cpu.insns_retired + case_insns;
+            let _ = run_case_bus(cpu, m, &mut run_map, deadline);
+            if let Some(report) = cpu.kmsan_hit.take()
+                && report.pc == target_pc
+            {
+                keep = cand;
+                changed = true;
+                break;
+            }
+        }
+    }
+    subset_prog(prog, &keep)
+}
+
+/// Minimize a fresh KMSAN live-oracle hit (`docs/kmsan.md` T3.1) and write two artifacts under
+/// `crashes/`: a human-readable trace (`kmsan_<pc>.txt`, syscall names + the tainted-operand
+/// registers/masks) and a compilable C reproducer (`kmsan_<pc>.c`) — mirrors [`handle_new_crash`]
+/// exactly, just keyed on the tainted-branch `pc` instead of a kernel-oops signature.
+#[allow(clippy::too_many_arguments)]
+fn handle_new_kmsan_hit<B: GuestBus>(
+    cpu: &mut fs_riscv::Cpu,
+    m: &mut B,
+    reset: impl FnMut(&mut fs_riscv::Cpu, &mut B),
+    prog: &fs_prog::Prog,
+    report: fs_riscv::KmsanReport,
+    scratch_va: u32,
+    prog_pas: &[u32],
+    scratch_pas: &[u32],
+    case_insns: u64,
+) {
+    let before = prog.calls.len();
+    let minimal = minimize_program_kmsan(
+        cpu, m, reset, prog, report.pc, scratch_va, prog_pas, scratch_pas, case_insns,
+    );
+    let names: Vec<&str> = minimal.calls.iter().map(|c| c.desc.name).collect();
+    eprintln!(
+        "fuzz: minimized KMSAN hit pc={:#010x} from {before} → {} calls: {names:?}",
+        report.pc,
+        minimal.calls.len()
+    );
+
+    if std::fs::create_dir_all("crashes").is_err() {
+        return;
+    }
+    let mut trace = format!(
+        "fuzzsoft KMSAN: branch on uninitialized value\n  pc (faulting branch): {:#010x}\n  x{}={:#010x} (byte-taint) x{}={:#010x} (byte-taint)\n  minimized to {} calls (from {before}):\n",
+        report.pc, report.rs1, report.taint_a, report.rs2, report.taint_b, minimal.calls.len()
+    );
+    for (i, c) in minimal.calls.iter().enumerate() {
+        trace.push_str(&format!("    {i}: {} (nr {})\n", c.desc.name, c.desc.nr));
+    }
+    let txt = format!("crashes/kmsan_{:08x}.txt", report.pc);
+    let cfile = format!("crashes/kmsan_{:08x}.c", report.pc);
+    let _ = std::fs::write(&txt, trace);
+    let _ = std::fs::write(&cfile, emit_c_reproducer(&minimal));
+    eprintln!("fuzz: wrote {txt} and {cfile}");
+}
+
 // ---- Corpus persistence (decision #34): make campaigns cumulative. ----
 //
 // A typed `fs_prog::Prog` is serialized to a compact, whitespace-tokenized text form using only
@@ -977,6 +1066,15 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     // each other. Mutually exclusive with `--jit` (checked below).
     let mut jit_chain = false;
     let mut ubsan = false;
+    // KMSAN live oracle (Stage 1.5, `docs/kmsan.md` T3.1): catch `Trap::KmsanTainted` (a
+    // conditional branch that compared an uninitialized-value operand) via `Cpu::kmsan_hit`,
+    // report + minimize + reproduce like the kernel-crash oracle. Off by default — zero cost
+    // unless requested (see `Cpu::set_kmsan`). Never combined with `--sanitize`: KASAN-style
+    // `PERM_RAW` is a fault-on-first-read regime and KMSAN *permits* the same read and reports
+    // only at consumption — running both at once would mean the RAW fault fires first and the
+    // KMSAN checkpoint never gets a chance to, silently hiding half of whichever campaign runs
+    // second (`docs/kmsan.md`'s "separate campaigns, never simultaneous" decision).
+    let mut kmsan = false;
     // Fault injection (docs/bug-finding.md): when set, arm a fraction PCT of generated programs
     // with the fail_nth preamble (`fs_prog::prepend_fail_inject`) so kmalloc/alloc_pages
     // legitimately fail and the kernel's error/cleanup branches actually execute. None = off.
@@ -1018,6 +1116,12 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
             // zero cost unless requested (see `Cpu::set_ubsan`).
             "--ubsan" => {
                 ubsan = true;
+                i += 1;
+                continue;
+            }
+            // KMSAN live oracle (docs/kmsan.md T3.1): see the doc comment on `kmsan` above.
+            "--kmsan" => {
+                kmsan = true;
                 i += 1;
                 continue;
             }
@@ -1197,6 +1301,15 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
             eprintln!("fuzz: --jobs > 1 is incompatible with --ubsan in this first cut (serial-only)");
             return ExitCode::FAILURE;
         }
+        // KMSAN state (`regs_taint`/`kmsan_hit`) lives entirely on the per-worker `Cpu` with no
+        // PC-hooks involved, so parallelizing this is plausibly trivial (unlike --sanitize/
+        // --cmplog/--jit, which really do need serial PC-hook state) — but that composition is
+        // unverified, so `--kmsan` stays serial-only for this first cut too (T3.1's deliverable is
+        // the serial oracle; `--jobs` support is a flagged follow-up, see docs/roadmap.md T3.1).
+        if kmsan {
+            eprintln!("fuzz: --jobs > 1 is incompatible with --kmsan in this first cut (serial-only; may be trivial to add later, see docs/roadmap.md T3.1)");
+            return ExitCode::FAILURE;
+        }
         if dump_edges.is_some() {
             eprintln!("fuzz: --jobs > 1 is incompatible with --dump-edges (serial one-shot replay)");
             return ExitCode::FAILURE;
@@ -1269,6 +1382,14 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
         eprintln!("fuzz: --jit and --jit-chain are mutually exclusive (pick one JIT path to benchmark)");
         return ExitCode::FAILURE;
     }
+    // KMSAN permits reading uninitialized memory and reports only at consumption (the tainted
+    // `Branch` checkpoint); `--sanitize`'s `PERM_RAW` is a strict fault-on-first-read. Running
+    // both would race for the same access — see `kmsan`'s doc comment above for why
+    // `docs/kmsan.md` calls these out as separate campaigns, never simultaneous.
+    if kmsan && sanitize {
+        eprintln!("fuzz: --kmsan is incompatible with --sanitize (RAW fault-on-first-read vs. KMSAN's permit-and-report-at-consumption are separate campaigns, docs/kmsan.md)");
+        return ExitCode::FAILURE;
+    }
 
     // UBSAN div-by-zero (docs/emulator-sanitizers.md): arm recording on `cpu` BEFORE
     // `Snapshot::capture` below, so the captured golden `cpu` clone carries `ubsan: Some(empty
@@ -1276,6 +1397,13 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     // separate per-case toggle needed (and no risk of the reset undoing a toggle set afterward).
     if ubsan {
         cpu.set_ubsan(true);
+    }
+    // KMSAN live oracle (docs/kmsan.md T3.1): same reasoning as `--ubsan` just above — arm
+    // `regs_taint` on `cpu` BEFORE `Snapshot::capture` so the captured golden `cpu` clone carries
+    // `regs_taint: Some(zeroed)` and `kmsan_hit: None`, and every `snap.reset()` restores that
+    // clean, armed state for free (no separate per-case toggle/clear needed).
+    if kmsan {
+        cpu.set_kmsan(true);
     }
 
     // --- serial path (also `--sanitize`'s only path — it needs `Machine.ram: Mmu` directly for
@@ -1372,6 +1500,12 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     if ubsan {
         let _ = cpu.ubsan_take();
     }
+    // Same reasoning as the `ubsan_take()` flush just above: seed replay runs cases via
+    // `run_case_bus`, and `Cpu::finish_exit`'s KMSAN checkpoint is exercised there too, so any hit
+    // during replay must not be misattributed to case 0 below.
+    if kmsan {
+        let _ = cpu.kmsan_hit.take();
+    }
 
     // Exact-edge corpus dump (docs/bug-finding.md#3): a one-shot replay of the loaded corpus that
     // records precise control-flow edges for offline `fs-covmap` symbol attribution, then exits —
@@ -1431,6 +1565,10 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
     // total div-by-zero hits observed, deduped by faulting pc (mirrors `crash_sigs`).
     let mut ubsan_hits = 0u32;
     let mut ubsan_pcs = std::collections::HashSet::new();
+    // KMSAN bookkeeping (decision: --kmsan, serial path only — see the `--jobs > 1` guard above):
+    // total live-oracle hits observed, deduped by the faulting tainted-branch pc.
+    let mut kmsan_hits = 0u32;
+    let mut kmsan_pcs = std::collections::HashSet::new();
     let t0 = std::time::Instant::now();
 
     for case in 0..cases {
@@ -1542,6 +1680,27 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
             }
         }
 
+        // KMSAN live oracle (decision: --kmsan, docs/kmsan.md T3.1): `Cpu::finish_exit` stashes a
+        // `KmsanReport` in `cpu.kmsan_hit` the instant a conditional `Branch` compares a tainted
+        // operand, ending the case right there (`SysExit::Halt`) — drain it here, deduped by the
+        // faulting pc, mirroring the kernel-crash oracle above (including minimize + reproduce).
+        if kmsan && let Some(report) = cpu.kmsan_hit.take() {
+            kmsan_hits += 1;
+            if kmsan_pcs.insert(report.pc) {
+                let names: Vec<&str> = prog.calls.iter().map(|c| c.desc.name).collect();
+                eprintln!(
+                    "fuzz: [KMSAN] branch on uninitialized value pc={:#010x} x{}={:#010x} x{}={:#010x} case {case} calls={names:?}",
+                    report.pc, report.rs1, report.taint_a, report.rs2, report.taint_b
+                );
+                // (No `SanCtx` dirtied-perm restore needed here, unlike the kernel-crash oracle
+                // above: `--kmsan` and `--sanitize` are mutually exclusive, checked at startup.)
+                handle_new_kmsan_hit(
+                    &mut cpu, &mut m, |cpu, m| snap.reset(cpu, m), &prog, report, scratch,
+                    &prog_pas, &scratch_pas, case_insns,
+                );
+            }
+        }
+
         // UBSAN oracle (decision: --ubsan): RISC-V DIV/0 and REM/0 don't trap, so `Cpu` records
         // the faulting pc itself (see `Cpu::set_ubsan`) — drain and dedupe it here, mirroring the
         // kernel-crash oracle above but keyed on the div instruction's pc rather than a trap epc.
@@ -1592,6 +1751,12 @@ fn cmd_fuzz(args: &[String]) -> ExitCode {
         println!(
             "  ubsan         : {ubsan_hits} div-by-zero hit(s) ({} unique pc)",
             ubsan_pcs.len()
+        );
+    }
+    if kmsan {
+        println!(
+            "  kmsan         : {kmsan_hits} branch-on-uninitialized-value hit(s) ({} unique pc)  [Stage 1.5 live oracle, docs/kmsan.md T3.1]",
+            kmsan_pcs.len()
         );
     }
     if let Some(cache) = &jit_cache {

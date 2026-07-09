@@ -665,6 +665,21 @@ pub enum Trap {
     KmsanTainted { pc: u32, rs1: u8, rs2: u8, taint_a: u32, taint_b: u32 },
 }
 
+/// KMSAN (Stage 1, `docs/kmsan.md`) live-oracle report: a plain-data copy of a
+/// [`Trap::KmsanTainted`] hit, stashed in [`Cpu::kmsan_hit`] by [`Cpu::finish_exit`] so a fuzz
+/// runner can recover the finding (pc + which registers + their taint masks) after the case ends,
+/// without `SysExit` growing a dedicated variant (mirrors [`Cpu::jit_pending_trap`]'s "stash a
+/// plain value in a `Cpu` field, drain it out-of-band" shape rather than rippling a new outcome
+/// through every full-system caller).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KmsanReport {
+    pub pc: u32,
+    pub rs1: u8,
+    pub rs2: u8,
+    pub taint_a: u32,
+    pub taint_b: u32,
+}
+
 impl std::fmt::Display for Trap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -847,6 +862,14 @@ pub struct Cpu {
     /// `Err(trap)` from `exec_one`. `None` at every other time (interpreter path, ALU-only chains,
     /// between dispatches) — never read except right after a `TrapPending` return.
     pub jit_pending_trap: Option<Trap>,
+    /// KMSAN (Stage 1.5, `docs/kmsan.md` T3.1) live-oracle hit: [`Cpu::finish_exit`] stashes a
+    /// [`KmsanReport`] copy of a [`Trap::KmsanTainted`] here (instead of growing `SysExit` a new
+    /// variant) just before returning; a fuzz runner `take()`s it once the case that hit it has
+    /// stopped. `None` the rest of the time, including every case's start (`Snapshot::reset`/
+    /// `CowMachine` reset both restore the whole `Cpu` from a golden clone captured before any case
+    /// ran, so this always comes back `None` for free — no separate per-case clear needed, exactly
+    /// like `ubsan`'s log).
+    pub kmsan_hit: Option<KmsanReport>,
 }
 
 impl Cpu {
@@ -865,6 +888,7 @@ impl Cpu {
             ubsan: None,
             regs_taint: None,
             jit_pending_trap: None,
+            kmsan_hit: None,
         }
     }
 
@@ -1705,16 +1729,21 @@ impl Cpu {
                 self.take_trap(cause, tval, false);
                 SysExit::Continue
             }
-            Err(Trap::KmsanTainted { pc, .. }) => {
+            Err(Trap::KmsanTainted { pc, rs1, rs2, taint_a, taint_b }) => {
                 // KMSAN (Stage 1, `docs/kmsan.md`) is a host-side bug oracle, not an architectural
                 // RISC-V exception — there is no guest-deliverable cause for "branch on
                 // uninitialized value", so (unlike Mem/Illegal/Exception above) this must NOT be
-                // vectored into the guest's trap handler via `take_trap`. `SysExit` has no
-                // dedicated outcome for it yet — adding one would ripple into every full-system
-                // caller (fs-platform/fs-vec/fs-jit/fs-diff), which is out of Stage 1's scope and
-                // none of them wire up `set_kmsan` yet anyway. Until a later stage adds a proper
-                // outcome, surface it as an immediate halt keyed on the faulting `pc` so a run at
-                // least stops instead of silently resuming past a real finding.
+                // vectored into the guest's trap handler via `take_trap`. `SysExit` still has no
+                // dedicated outcome for it (adding one would ripple into every full-system caller —
+                // fs-platform/fs-vec/fs-jit/fs-diff — none of which wire up `set_kmsan`): instead
+                // (Stage 1.5, T3.1) stash a plain-data [`KmsanReport`] in `self.kmsan_hit` — the
+                // same "stash in a `Cpu` field, drain out-of-band" shape as `jit_pending_trap` —
+                // so a caller that cares (the fuzz runner) can recover the finding after the case
+                // stops, while one that doesn't (nothing does yet) sees no behavior change at all.
+                // Still surface an immediate halt keyed on the faulting `pc` so a run stops instead
+                // of silently resuming past a real finding (matches the "report-and-stop" shape
+                // `docs/kmsan.md` specifies for this trap).
+                self.kmsan_hit = Some(KmsanReport { pc, rs1, rs2, taint_a, taint_b });
                 SysExit::Halt(pc)
             }
         }
@@ -2189,6 +2218,52 @@ mod tests {
                     return;
                 }
                 Err(other) => panic!("expected a KmsanTainted trap, got {other:?}"),
+            }
+        }
+        panic!("program did not terminate without trapping");
+    }
+
+    /// T3.1 (`docs/kmsan.md`'s Stage 1.5 live-oracle wiring, `docs/roadmap.md` T3.1): the
+    /// full-system entry point (`Cpu::step_system`, which calls `Cpu::finish_exit`) must stash the
+    /// SAME `Trap::KmsanTainted` fields into `Cpu::kmsan_hit` as a `KmsanReport` — the mechanism a
+    /// fuzz runner drains after a case ends — while still returning `SysExit::Halt(pc)` (`SysExit`
+    /// itself gains no new variant). Same program/setup as the positive control above, driven
+    /// through `step_system` instead of bare `step` this time.
+    #[test]
+    fn kmsan_live_oracle_stashes_report_in_finish_exit() {
+        let base = 0x8000_0000u32;
+        let scratch = 0x8000_1000u32;
+        let mut mmu = Mmu::new(base, 0x1_0000);
+        mmu.protect(base, 0x1_0000, PERM_READ | PERM_WRITE).unwrap();
+        mmu.protect(scratch, 4, PERM_READ | PERM_WRITE | PERM_RAW).unwrap();
+        let prog = kmsan_test_program();
+        let mut bytes = Vec::new();
+        for w in prog {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        mmu.map(base, &bytes, PERM_READ | PERM_WRITE | PERM_EXEC).unwrap();
+
+        let mut cpu = Cpu::new(base);
+        cpu.set_kmsan(true);
+        let branch_pc = base + 4 * 4;
+        assert!(cpu.kmsan_hit.is_none());
+        for _ in 0..1000 {
+            match cpu.step_system(&mut mmu) {
+                SysExit::Continue => {}
+                SysExit::Halt(pc) => {
+                    assert_eq!(pc, branch_pc, "halt should be keyed on the tainted branch's pc");
+                    let report = cpu.kmsan_hit.take().expect("finish_exit must stash a KmsanReport");
+                    assert_eq!(report.pc, branch_pc);
+                    assert_eq!(report.rs1, 30);
+                    assert_eq!(report.rs2, 28);
+                    assert_ne!(report.taint_a, 0);
+                    assert_eq!(report.taint_b, 0);
+                    // Drained: a second `take()` (mirroring the fuzz runner's per-case check) sees
+                    // nothing left over.
+                    assert!(cpu.kmsan_hit.is_none());
+                    return;
+                }
+                SysExit::Hypercall(c) => panic!("unexpected hypercall {c}"),
             }
         }
         panic!("program did not terminate without trapping");

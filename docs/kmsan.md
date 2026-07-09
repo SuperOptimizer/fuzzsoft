@@ -63,6 +63,40 @@ one access.
 
 Origin tracking (which alloc first introduced a taint) is out of scope (a 4th-plane stretch).
 
+## T3.1 outcome — live oracle wired, but Stage 1 is DORMANT on a real kernel (2026-07-08)
+
+`--kmsan` is wired end-to-end (`Cpu::kmsan_hit: Option<KmsanReport>` stashed by `finish_exit`
+alongside its `SysExit::Halt(pc)`, drained by the fuzz loop, minimized + reproduced via the same
+`crashes/` machinery as the kernel-crash oracle, mutually exclusive with `--sanitize`). The unit-level
+positive/negative controls (synthetic `PERM_RAW` injected directly via `Mmu::protect`, bypassing any
+allocator) all pass, proving the checkpoint → stash → report pipeline is correct when taint exists.
+
+**But the empirical false-positive measurement surfaced a bigger finding than expected: it isn't a
+false-positive storm, it's zero hits of *any kind* — and that's for a structural reason, not a
+precision one.** `Cpu::regs_taint` can only become nonzero via the `Load` arm's gather from
+`PERM_RAW` (Stage 1 has no memory shadow yet, no other entry point). `PERM_RAW` itself is set in
+exactly one place reachable in this codebase: `fs-san`'s allocator hooks (`fs-san/src/alloc.rs`),
+gated behind `--sanitize` — which `--kmsan` is (by this same design doc) forbidden to run
+alongside. `fs-cli`'s boot sequence `protect()`s the *entire* guest RAM `READ|WRITE|EXEC` (no RAW)
+before anything loads, and `fs-san/src/pages.rs` deliberately stamps page-granularity
+(re)allocations `READ|WRITE` with no RAW too (its own false-positive-avoidance for the OOB/UAF
+oracle). So a `--kmsan`-only run has **no live taint source at all**: 0 hits over 4000 clean-kernel
+cases, and — confirmed by a one-off diagnostic run with `--sanitize` also enabled (its slack-byte
+`PERM_RAW` stamping is the one real producer) — still 0 hits over 3000 more cases, because legitimate
+kernel code never reads that OOB slack padding. The observed zero rate is therefore **guaranteed by
+construction, not evidence Stage 1's v0 over-tainting rules are precise enough** — Stage 1 cannot
+currently produce a true positive OR a false positive on a live kernel; it is a correctly-wired but
+dormant detector.
+
+**Implication for Stage 2:** the priority isn't the Stage 3 precision refinements (carry-smear,
+known-byte clearing) this doc originally slated next — a live kernel never reaches them because no
+register ever gets tainted in the first place. **Stage 2's `PERM_VTAINT` memory shadow is the
+blocking increment**, not just for round-trip store/load taint fidelity, but because it needs its
+*own* independent seeding path (e.g. tag freshly-`kmalloc`'d/`alloc_pages`'d payload bytes VTAINT at
+allocation, independent of `--sanitize`'s RAW/OOB bookkeeping) to give `--kmsan` any live signal at
+all. Re-run this same false-positive measurement once Stage 2 lands — that is the first point at
+which "0 hits" or "hit storm" becomes a meaningful precision result rather than a tautology.
+
 ## Open questions (decide, don't assume)
 Byte-taint packing (bits 0-3 vs byte-aligned 0/8/16/24 — recommend byte-aligned for Stage-3 shift math);
 mode flag as runtime `Option` (start here, matches cmplog) vs const-generic (only if profiled);
