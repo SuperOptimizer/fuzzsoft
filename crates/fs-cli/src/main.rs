@@ -1197,6 +1197,16 @@ fn save_corpus(dir: &str, corpus: &[fs_prog::Prog]) -> usize {
 /// Replay loaded seed programs once each to rebuild coverage feedback, returning the accumulated
 /// virgin map and the coverage-minimized corpus (only programs that lit new buckets are kept — the
 /// same admission rule the main loop uses). Runs on one guest; each seed resets the snapshot.
+///
+/// FUZZSOFT MINIMAL TOUCH (docs/bug-finding.md item 2, real-CVE pipeline validation, T4.2): unlike
+/// the main fuzz loop (`cmd_fuzz`'s per-case body), this previously discarded `inject_and_run`'s
+/// crash result entirely — a seed program that crashes the kernel on replay was silently absorbed
+/// into coverage bookkeeping with no report, which would have made a hand-crafted `--corpus-dir`
+/// trigger program (e.g. `scripts/cve-epoll-loop-seed.prog`) invisible even when it fired the
+/// oracle. This adds the same `[KERNEL CRASH]` console report the main loop already prints
+/// (`kernel_crash_sig` dedup only within this call, by design — a seed crashing is always worth
+/// reporting even if the main loop later reports the identical signature again), and nothing else:
+/// admission into `corpus` is unchanged, dedup/minimize/reproduce machinery is untouched.
 #[allow(clippy::too_many_arguments)]
 fn replay_seeds<B: GuestBus>(
     cpu: &mut fs_riscv::Cpu,
@@ -1212,11 +1222,18 @@ fn replay_seeds<B: GuestBus>(
     let mut virgin = fs_cov::VirginMap::new();
     let mut run_map = fs_cov::CovBitmap::new();
     let mut corpus = Vec::new();
-    for p in seeds {
-        let (_, _, _) = inject_and_run(
+    for (seed_idx, p) in seeds.iter().enumerate() {
+        let (_, _, crash) = inject_and_run(
             cpu, m, &mut reset, p, scratch_va, prog_pas, scratch_pas, case_insns, base_uart,
             &mut run_map,
         );
+        if let Some((sig, out)) = crash {
+            let names: Vec<&str> = p.calls.iter().map(|c| c.desc.name).collect();
+            eprintln!(
+                "fuzz: [KERNEL CRASH] epc={sig:#010x} seed #{seed_idx} calls={names:?} (seed replay)"
+            );
+            eprintln!("{out}");
+        }
         if virgin.has_new_bits(&run_map) {
             corpus.push(p.clone());
         }
