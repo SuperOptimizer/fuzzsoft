@@ -159,13 +159,25 @@ pub(crate) fn generate_from_recipe(rng: &mut Rng, recipe: &[&str]) -> Option<Pro
 /// Generate a fresh `Prog` of 1..=MAX_CALLS calls, each a random `SyscallDesc` from the starter
 /// table with type-directed argument generation and resource threading against earlier calls.
 ///
-/// 20% of the time, build one of `RECIPES` verbatim instead — a deliberately deep, real,
-/// bug-prone-subsystem call chain (see `RECIPES`'s doc comment). The remaining 80% (or if the
-/// chosen recipe somehow doesn't resolve) falls back to per-call `pick_desc_biased`, which itself
-/// increasingly prefers descriptions that consume an already-live resource once the
+/// `RING_FORCE_PCT` of the time (checked first), force-build a complete, closed same-kind
+/// resource ring via `build_epoll_ring` — T2.4.5's directed cycle-forcing recipe (see that
+/// function's doc comment): unlike everything else in this function, this fixes actual argument
+/// *values*/resource wiring, not just call order, so the CVE's exact minimal trigger shape
+/// (a closed N-node epoll containment cycle) assembles deterministically rather than by chance.
+///
+/// Otherwise, 20% of the time, build one of `RECIPES` verbatim instead — a deliberately deep,
+/// real, bug-prone-subsystem call chain (see `RECIPES`'s doc comment). The remaining fraction (or
+/// if the chosen recipe/ring somehow doesn't resolve) falls back to per-call `pick_desc_biased`,
+/// which itself increasingly prefers descriptions that consume an already-live resource once the
 /// program-under-construction has produced one — see that function's doc comment for why this is
 /// what actually deepens organically-generated chains too.
 pub fn generate(rng: &mut Rng) -> Prog {
+    if rng.chance(RING_FORCE_PCT) {
+        let n = 3 + rng.below(MAX_CALLS / 2 - 2); // 3..=MAX_CALLS/2 (3 or 4 today)
+        if let Some(p) = build_epoll_ring(rng, n) {
+            return p;
+        }
+    }
     if rng.chance(20) {
         let recipe: &'static [&'static str] = RECIPES[rng.below(RECIPES.len())];
         if let Some(p) = generate_from_recipe(rng, recipe) {
@@ -497,6 +509,135 @@ pub(crate) fn pick_res(rng: &mut Rng, want: ResourceKind, pool: &[PoolEntry]) ->
     } else {
         ResRef::Seed(*rng.pick(seeds))
     }
+}
+
+/// Chance (out of 100) that `generate()` force-builds a complete, closed same-kind resource ring
+/// (see [`build_same_kind_ring`]/[`build_epoll_ring`]) instead of an ordinary RECIPES draw or
+/// uniform-random generation. T2.4.5 (`docs/roadmap.md`): T2.4 made an epoll->epoll link
+/// expressible and even let a closed cycle assemble *by chance* occasionally (~0.7% of
+/// programs, `t24_probe::probe_full_cycle_rate`), but the CVE's exact minimal trigger — a
+/// specific, fully-closed >=3-node ring where *every* producer and *every* link lands exactly on
+/// its ring neighbor — needs all of that wiring to line up simultaneously, which compounds down
+/// to ~0.004% under the probabilistic bias alone. This constant instead *forces* the whole ring's
+/// wiring outright (mirrors `prepend_fail_inject`'s style: fixed argument values/resource wiring,
+/// not just call order), while staying a modest bias so ordinary RECIPES/uniform-random diversity
+/// remains the common case.
+pub(crate) const RING_FORCE_PCT: u32 = 10;
+
+/// How a `linker` call's own `Res` args wire the directed edge between two ring nodes, plus any
+/// extra forced values, for [`build_same_kind_ring`]. Bundled into one struct (rather than
+/// several loose parameters) so the builder function stays under clippy's arg-count limit.
+pub(crate) struct RingLinkSpec<'a> {
+    /// Index of the linker's `Res` arg wired to the ring *predecessor* (node `i`).
+    pub(crate) anchor_arg_idx: usize,
+    /// Index of the linker's `Res` arg wired to the ring *successor* (node `(i+1) mod n`).
+    pub(crate) target_arg_idx: usize,
+    /// Additional `(arg_idx, ArgValue)` overrides applied to *every* linker call after the ring
+    /// wiring (e.g. forcing epoll_ctl's `op` arg to `EPOLL_CTL_ADD` rather than leaving it to
+    /// land on DEL/MOD by chance) — the "fixing argument values, not just call order" recipe
+    /// style `prepend_fail_inject` established.
+    pub(crate) fixed_args: &'a [(usize, ArgValue)],
+    /// If given, guarantees the linker's arg at that index (which must be an `ArgType::Ptr`) is
+    /// never the nullable-NULL case — needed for epoll_ctl's `event` arg, since `EPOLL_CTL_ADD`
+    /// with a NULL event fails `copy_from_user` before ever reaching the vulnerable insert path,
+    /// which would silently break the ring 20% of the time (`ArgType::Ptr`'s own nullable roll)
+    /// if left to chance.
+    pub(crate) force_nonnull_ptr_idx: Option<usize>,
+}
+
+/// Build a `Prog` that force-closes a complete, directed N-node ring over some same-kind
+/// resource: `n` calls to `producer` (each of which must `Produces::Ret(kind)` exactly one
+/// resource per call, at slot 0), followed by `n` calls to `linker`, with the `i`-th linker
+/// call's `link.anchor_arg_idx` argument wired to producer call `i`'s output and its
+/// `link.target_arg_idx` argument wired to producer call `(i+1) mod n`'s output — i.e.
+/// `linker(P_i, ..., P_{(i+1) mod n}, ...)` for every `i`, closing the ring
+/// `P0 -> P1 -> ... -> P(n-1) -> P0`. General over *any* same-kind resource graph (not
+/// epoll-specific): the caller supplies the producer/linker description names and which of the
+/// linker's own `Res` arg slots are the "from"/"to" ends of the edge (plus any forced values, via
+/// `link` — see [`RingLinkSpec`]). Every other argument (both producer and linker) is left to
+/// ordinary `generate_args`/`pick_res_biased`, so only the ring's own shape is forced, not the
+/// whole program.
+///
+/// Returns `None` if `producer`/`linker` don't name a live `SyscallDesc`, if either arg index is
+/// out of range for `linker`, or if `n < 2` or `2*n > MAX_CALLS` (the caller should clamp `n`
+/// first; this is just a defensive backstop matching `generate_from_recipe`'s style).
+pub(crate) fn build_same_kind_ring(
+    rng: &mut Rng,
+    producer_name: &str,
+    linker_name: &str,
+    link: &RingLinkSpec,
+    n: usize,
+) -> Option<Prog> {
+    if n < 2 || 2 * n > MAX_CALLS {
+        return None;
+    }
+    let producer_desc = find_desc(producer_name)?;
+    let linker_desc = find_desc(linker_name)?;
+    if link.anchor_arg_idx >= linker_desc.args.len() || link.target_arg_idx >= linker_desc.args.len()
+    {
+        return None;
+    }
+
+    let mut calls: Vec<TypedCall> = Vec::with_capacity(2 * n);
+    for _ in 0..n {
+        let args = generate_args(rng, producer_desc, &calls);
+        calls.push(TypedCall {
+            desc: producer_desc,
+            args,
+        });
+    }
+    for i in 0..n {
+        let mut args = generate_args(rng, linker_desc, &calls);
+        args[link.anchor_arg_idx] = ArgValue::Res(ResRef::Produced {
+            call_idx: i as u16,
+            slot: 0,
+        });
+        args[link.target_arg_idx] = ArgValue::Res(ResRef::Produced {
+            call_idx: ((i + 1) % n) as u16,
+            slot: 0,
+        });
+        for (idx, val) in link.fixed_args {
+            args[*idx] = val.clone();
+        }
+        if let Some(idx) = link.force_nonnull_ptr_idx
+            && let ArgType::Ptr { inner, .. } = &linker_desc.args[idx]
+        {
+            args[idx] = ArgValue::Ptr(Box::new(gen_arg_value(rng, inner, &build_pool(&calls))));
+        }
+        calls.push(TypedCall {
+            desc: linker_desc,
+            args,
+        });
+    }
+    Some(Prog { calls })
+}
+
+/// The concrete T2.4.5 deliverable: force-build a closed N-node `epoll_create1` ring —
+/// `epoll_create1`x`n` -> E0..E(n-1), then `epoll_ctl(E_i, EPOLL_CTL_ADD, E_{(i+1) mod n}, event)`
+/// for every `i` — the exact minimal shape that overflows `ep_loop_check_proc`'s nesting-depth
+/// counter (`docs/bug-finding.md`'s epoll loop-check CVE / `scripts/cve-epoll-loop-bug.patch`).
+/// `epoll_ctl`'s args are `[Res(EPOLL) epfd, Flags op, Res(FD) fd, Ptr event]` (see
+/// `syscalls.rs`), so `anchor_arg_idx=0` wires `epfd` to the ring predecessor and
+/// `target_arg_idx=2` wires the target `fd` to the ring successor; `fixed_args` forces `op`
+/// (index 1) to `EPOLL_CTL_ADD=1` so every link actually attempts an insert (an
+/// organically-rolled DEL/MOD wouldn't reach `ep_loop_check_proc` at all), and
+/// `force_nonnull_ptr_idx=Some(3)` guarantees `event` (index 3) is never NULL, since ADD requires
+/// a real event struct to pass `copy_from_user` before reaching the loop check.
+///
+/// `n` is clamped to `[3, MAX_CALLS/2]`: 3 is the CVE's documented minimal cycle length (see
+/// `scripts/cve-epoll-loop-seed.prog`'s 3-epoll_create1/3-epoll_ctl shape), and `MAX_CALLS/2`
+/// (4, since `MAX_CALLS=8`) is the largest ring `2*n` calls can fit in one program — `n=5` (10
+/// calls) would overflow `MAX_CALLS`, so it's capped down to 4 rather than failing outright.
+pub(crate) fn build_epoll_ring(rng: &mut Rng, n: usize) -> Option<Prog> {
+    let n = n.clamp(3, MAX_CALLS / 2);
+    const EPOLL_CTL_ADD: u64 = 1;
+    let link = RingLinkSpec {
+        anchor_arg_idx: 0,
+        target_arg_idx: 2,
+        fixed_args: &[(1, ArgValue::Imm(EPOLL_CTL_ADD))],
+        force_nonnull_ptr_idx: Some(3),
+    };
+    build_same_kind_ring(rng, "epoll_create1", "epoll_ctl", &link, n)
 }
 
 /// Prepend the fail_nth arming preamble — `openat$fail_nth` -> `write$fail_nth`, with the
@@ -994,6 +1135,178 @@ mod tests {
                 pick_res(&mut rng_b, FD, &pool)
             );
         }
+    }
+
+    // ---- T2.4.5: ring-forcing recipe (build_same_kind_ring / build_epoll_ring) ----
+
+    /// Returns `Some(order)` iff `p` is *exactly* the shape `build_epoll_ring(n)` produces: the
+    /// first `n` calls are all `epoll_create1`, the remaining calls are all `epoll_ctl` with
+    /// op == EPOLL_CTL_ADD (1), a non-NULL event, and epfd/target-fd wiring that forms a single
+    /// closed directed ring over the `n` epoll_create1 calls (every node has out-degree and
+    /// in-degree exactly 1) — `order` is the ring's node order starting from call 0. Used both to
+    /// check `build_epoll_ring`'s own output and to detect when `generate()`'s ring-force path
+    /// fired (as opposed to RECIPES/uniform-random happening to look similar).
+    fn exact_closed_epoll_ring(p: &Prog, n: usize) -> bool {
+        if p.calls.len() != 2 * n {
+            return false;
+        }
+        for c in &p.calls[..n] {
+            if c.desc.name != "epoll_create1" {
+                return false;
+            }
+        }
+        let mut next: Vec<Option<usize>> = vec![None; n];
+        for (j, c) in p.calls[n..].iter().enumerate() {
+            if c.desc.name != "epoll_ctl" {
+                return false;
+            }
+            let ArgValue::Res(ResRef::Produced { call_idx: epfd_idx, .. }) = c.args[0] else {
+                return false;
+            };
+            let ArgValue::Imm(op) = c.args[1] else {
+                return false;
+            };
+            if op != 1 {
+                return false; // must be EPOLL_CTL_ADD
+            }
+            let ArgValue::Res(ResRef::Produced { call_idx: fd_idx, .. }) = c.args[2] else {
+                return false;
+            };
+            if matches!(c.args[3], ArgValue::Imm(0)) {
+                return false; // event must be non-NULL
+            }
+            let epfd_idx = epfd_idx as usize;
+            let fd_idx = fd_idx as usize;
+            if epfd_idx >= n || fd_idx >= n {
+                return false;
+            }
+            // The linker call at position j (0-indexed among the n linker calls) is expected to
+            // wire epoll_create1 call `j` -> `(j+1) mod n`, but only the *shape* (a single closed
+            // ring covering all n nodes) is asserted here, not the exact call order, since that's
+            // exactly what this function independently re-derives via `next`.
+            let _ = j;
+            if next[epfd_idx].is_some() {
+                return false; // out-degree > 1: not a simple ring
+            }
+            next[epfd_idx] = Some(fd_idx);
+        }
+        // Walk the ring starting at node 0 and confirm it visits every node exactly once before
+        // returning to 0.
+        let mut visited = vec![false; n];
+        let mut cur = 0usize;
+        for _ in 0..n {
+            if visited[cur] {
+                return false;
+            }
+            visited[cur] = true;
+            let Some(nxt) = next[cur] else {
+                return false;
+            };
+            cur = nxt;
+        }
+        cur == 0 && visited.iter().all(|&v| v)
+    }
+
+    /// `build_epoll_ring` must, for every supported ring size (3 and 4 — the range `[3, MAX_CALLS
+    /// / 2]`), produce a program that is well-formed, lowers cleanly to the fixed wire size, and
+    /// is *exactly* a closed N-node epoll containment ring per `exact_closed_epoll_ring` — not
+    /// just "contains an epoll link somewhere", the full CVE-minimal shape every time.
+    #[test]
+    fn build_epoll_ring_closes_an_exact_n_node_cycle_and_lowers_cleanly() {
+        for n in [3usize, 4] {
+            for seed in [1u32, 2, 3, 42, 12345, 999999] {
+                let mut rng = Rng::new(seed.wrapping_add(n as u32 * 7919));
+                let p = build_epoll_ring(&mut rng, n)
+                    .unwrap_or_else(|| panic!("build_epoll_ring({n}) returned None (seed {seed})"));
+                assert_eq!(p.calls.len(), 2 * n);
+                assert!(p.is_well_formed(), "n={n} seed={seed}: ring program ill-formed");
+                assert!(
+                    exact_closed_epoll_ring(&p, n),
+                    "n={n} seed={seed}: build_epoll_ring did not close an exact {n}-node ring: {:?}",
+                    p.calls.iter().map(|c| c.desc.name).collect::<Vec<_>>()
+                );
+                let lowered = crate::lower::lower(&p, 0xA000_0000);
+                let wire = crate::lower::to_wire(&lowered);
+                assert_eq!(wire.len(), crate::lower::WIRE_WORDS);
+            }
+        }
+    }
+
+    /// `build_epoll_ring` must ask for at least the CVE's documented minimal cycle length (n=3):
+    /// n=2 is a valid ring shape-wise but not the target trigger, so the clamp floor matters.
+    /// Also checks the clamp ceiling (`n=5`, which would need 10 calls, gets capped to 4).
+    #[test]
+    fn build_epoll_ring_clamps_n_into_the_max_calls_budget() {
+        let mut rng = Rng::new(1);
+        let p_small = build_epoll_ring(&mut rng, 1).expect("clamped to 3");
+        assert_eq!(p_small.calls.len(), 6, "n=1 should clamp up to 3 (6 calls)");
+        let p_big = build_epoll_ring(&mut rng, 5).expect("clamped to 4");
+        assert_eq!(p_big.calls.len(), 8, "n=5 should clamp down to 4 (8 calls, MAX_CALLS)");
+        assert!(p_big.calls.len() <= MAX_CALLS);
+    }
+
+    /// `build_same_kind_ring`'s defensive backstops: an unknown producer/linker name, an
+    /// out-of-range arg index, or an `n` that can't fit `2*n` calls in `MAX_CALLS` must all
+    /// return `None` rather than panicking.
+    #[test]
+    fn build_same_kind_ring_rejects_bad_input_defensively() {
+        let mut rng = Rng::new(1);
+        let link = RingLinkSpec {
+            anchor_arg_idx: 0,
+            target_arg_idx: 2,
+            fixed_args: &[],
+            force_nonnull_ptr_idx: None,
+        };
+        assert!(build_same_kind_ring(&mut rng, "no_such_syscall", "epoll_ctl", &link, 3).is_none());
+        assert!(
+            build_same_kind_ring(&mut rng, "epoll_create1", "no_such_syscall", &link, 3).is_none()
+        );
+        let bad_anchor = RingLinkSpec {
+            anchor_arg_idx: 99,
+            target_arg_idx: 2,
+            fixed_args: &[],
+            force_nonnull_ptr_idx: None,
+        };
+        assert!(
+            build_same_kind_ring(&mut rng, "epoll_create1", "epoll_ctl", &bad_anchor, 3).is_none(),
+            "out-of-range anchor_arg_idx must fail"
+        );
+        assert!(
+            build_same_kind_ring(&mut rng, "epoll_create1", "epoll_ctl", &link, 5).is_none(),
+            "n=5 needs 10 calls > MAX_CALLS and must fail (unclamped API)"
+        );
+    }
+
+    /// T2.4.5's core engagement claim: across many seeds, `generate()`'s `RING_FORCE_PCT` path
+    /// must actually fire at a measurable, roughly-proportional rate — i.e. this isn't dead code,
+    /// and it isn't so rare that it wouldn't matter in a real campaign. Checked against a wide
+    /// tolerance band (not tightly pinned to `RING_FORCE_PCT`) since RECIPES/uniform-random could
+    /// coincidentally also produce this exact shape a small extra fraction of the time.
+    #[test]
+    fn generate_engages_the_ring_force_bias_at_a_measurable_rate() {
+        const N: u32 = 20_000;
+        let mut hits = 0u32;
+        for seed in 1..=N {
+            let mut rng = Rng::new(seed.wrapping_mul(2_654_435_761).wrapping_add(11));
+            let p = generate(&mut rng);
+            let n = p.calls.len() / 2;
+            if (3..=4).contains(&n) && exact_closed_epoll_ring(&p, n) {
+                hits += 1;
+            }
+        }
+        let rate = f64::from(hits) / f64::from(N);
+        eprintln!(
+            "T2.4.5: {hits}/{N} ({:.2}%) generate() calls produced an exact closed epoll ring \
+             (RING_FORCE_PCT={RING_FORCE_PCT})",
+            rate * 100.0
+        );
+        // RING_FORCE_PCT=10 means ~10% * (fraction that resolves, always here since epoll_ctl/
+        // epoll_create1 always exist) should hit; assert a generous lower bound well below that
+        // to avoid RNG-offset flakiness while still proving the path is very much alive.
+        assert!(
+            rate > 0.03,
+            "expected a robustly measurable ring-force engagement rate, got {rate:.4} ({hits}/{N})"
+        );
     }
 }
 
