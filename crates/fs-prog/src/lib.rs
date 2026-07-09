@@ -34,7 +34,7 @@ pub use lower::{
 };
 pub use mutate::mutate;
 pub use prog::{ArgValue, MAX_CALLS, Prog, ResRef, TypedCall};
-pub use resource::{FD, RESOURCES, ResourceDef, ResourceKind, SOCK, VMA, kind_compat, seeds_for};
+pub use resource::{FD, KEY, RESOURCES, ResourceDef, ResourceKind, SOCK, VMA, kind_compat, seeds_for};
 pub use rng::Rng;
 pub use syscalls::SYSCALLS;
 pub use types::{ArgType, Dir, Field, LenSpec, Produces, SyscallDesc};

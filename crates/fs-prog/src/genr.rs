@@ -94,6 +94,16 @@ pub static RECIPES: &[&[&str]] = &[
     &["pidfd_open", "pidfd_getfd", "close"],
     // memfd + mmap + vectored IO against the same backing fd.
     &["memfd_create", "mmap2", "readv", "writev", "munmap"],
+    // T2.1 wave 12: pipe-based data movement — two pipes so tee/splice see two distinct fds
+    // instead of degenerating to a single pipe's own two ends every time.
+    &["pipe2", "pipe2", "vmsplice", "tee", "splice", "close", "close"],
+    // T2.1 wave 13: acquire a namespace fd, join it, then also try the flags-only unshare path.
+    &["openat$ns", "setns", "unshare"],
+    // T2.1 wave 14: add a key, then run it through the read-only keyctl ops before revoking it —
+    // the classic add/describe/read/revoke key lifecycle.
+    &["add_key", "keyctl$describe", "keyctl$read", "keyctl$revoke"],
+    // T2.1 wave 15: cross-process memory access, both directions back to back.
+    &["process_vm_writev", "process_vm_readv"],
 ];
 
 fn find_desc(name: &str) -> Option<&'static SyscallDesc> {

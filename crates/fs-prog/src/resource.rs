@@ -11,6 +11,10 @@ pub struct ResourceKind(pub &'static str);
 pub const FD: ResourceKind = ResourceKind("fd");
 pub const SOCK: ResourceKind = ResourceKind("sock"); // subtype of fd
 pub const VMA: ResourceKind = ResourceKind("vma");
+/// A `key_serial_t` (security/keys): produced by `add_key`/`request_key`/
+/// `keyctl$get_keyring_id`, consumed by `keyctl$*`'s key/keyring args. Unrelated to `fd` (a key
+/// serial number, not a file descriptor) — same "new unrelated resource kind" shape as `VMA`.
+pub const KEY: ResourceKind = ResourceKind("key");
 
 #[derive(Debug)]
 pub struct ResourceDef {
@@ -36,6 +40,13 @@ pub static RESOURCES: &[ResourceDef] = &[
         subtype_of: None,
         seeds: &[0, -1],
     }, // 0 = let kernel pick, -1 = bad
+    ResourceDef {
+        kind: KEY,
+        subtype_of: None,
+        // uapi/linux/keyctl.h KEY_SPEC_* special keyring ids: usable as a keyring/key arg even
+        // with no live add_key/request_key producer in the program.
+        seeds: &[-1 /* THREAD_KEYRING */, -3 /* SESSION_KEYRING */, -4 /* USER_KEYRING */],
+    },
 ];
 
 /// Whether a value produced as `have` may satisfy a consumer that wants `want`.
@@ -78,10 +89,20 @@ mod tests {
     }
 
     #[test]
+    fn key_is_unrelated_to_fd_and_vma() {
+        assert!(!kind_compat(FD, KEY));
+        assert!(!kind_compat(KEY, FD));
+        assert!(!kind_compat(VMA, KEY));
+        assert!(!kind_compat(KEY, VMA));
+        assert!(kind_compat(KEY, KEY));
+    }
+
+    #[test]
     fn seeds_present_for_all_kinds() {
         assert!(!seeds_for(FD).is_empty());
         assert!(!seeds_for(SOCK).is_empty());
         assert!(!seeds_for(VMA).is_empty());
+        assert!(!seeds_for(KEY).is_empty());
         assert!(seeds_for(ResourceKind("nonexistent")).is_empty());
     }
 }

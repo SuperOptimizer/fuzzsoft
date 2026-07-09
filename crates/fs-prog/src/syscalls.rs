@@ -11,7 +11,7 @@
 //! before `name_hi` — see `include/asm-generic/compat.h`), confirmed against each syscall's
 //! `COMPAT_SYSCALL_DEFINE*` in `fs/read_write.c` / `fs/open.c` / `fs/sync.c`.
 
-use crate::resource::{FD, SOCK, VMA};
+use crate::resource::{FD, KEY, SOCK, VMA};
 use crate::types::ArgType;
 use crate::types::ArgType::*;
 use crate::types::Dir::*;
@@ -259,6 +259,124 @@ pub const NLM_F_FLAGS: &[u32] = &[
     0x200, /* NLM_F_MATCH */
     0x300, /* NLM_F_DUMP (ROOT|MATCH) */
 ];
+
+// ---- wave 12: splice/vmsplice/tee (fs/splice.c) ----
+// `SPLICE_F_*` bits (include/linux/splice.h; there's no uapi header for these — they're
+// exposed only via this literal value set, same citation discipline as the wave-8/10 ioctls).
+pub const SPLICE_FLAGS: &[u32] = &[
+    0,
+    0x01, /* SPLICE_F_MOVE */
+    0x02, /* SPLICE_F_NONBLOCK */
+    0x04, /* SPLICE_F_MORE */
+    0x08, /* SPLICE_F_GIFT */
+];
+
+// ---- wave 13: unshare/setns namespaces (kernel/fork.c, kernel/nsproxy.c) ----
+// CLONE_NEW*/CLONE_{FS,FILES,THREAD,SYSVSEM} bits (uapi/linux/sched.h) valid for
+// unshare(2)'s `unshare_flags`.
+pub const UNSHARE_FLAGS: &[u32] = &[
+    0x00000200, /* CLONE_FS */
+    0x00000400, /* CLONE_FILES */
+    0x00000080, /* CLONE_NEWTIME */
+    0x00010000, /* CLONE_THREAD */
+    0x00020000, /* CLONE_NEWNS */
+    0x00040000, /* CLONE_SYSVSEM */
+    0x02000000, /* CLONE_NEWCGROUP */
+    0x04000000, /* CLONE_NEWUTS */
+    0x08000000, /* CLONE_NEWIPC */
+    0x10000000, /* CLONE_NEWUSER */
+    0x20000000, /* CLONE_NEWPID */
+    0x40000000, /* CLONE_NEWNET */
+];
+// setns(2)'s `nstype` (0 = don't check / infer from fd; else one real CLONE_NEW* bit).
+pub const NSTYPE_FLAGS: &[u32] = &[
+    0,
+    0x00000080, /* CLONE_NEWTIME */
+    0x00020000, /* CLONE_NEWNS */
+    0x02000000, /* CLONE_NEWCGROUP */
+    0x04000000, /* CLONE_NEWUTS */
+    0x08000000, /* CLONE_NEWIPC */
+    0x10000000, /* CLONE_NEWUSER */
+    0x20000000, /* CLONE_NEWPID */
+    0x40000000, /* CLONE_NEWNET */
+];
+// `/proc/self/ns/*` magic-symlink fds (proc_ns_dir_operations) — the standard zero-scaffolding
+// way to obtain an fd `setns(2)` will accept, one entry per namespace type actually enabled in
+// this kernel's `.config` (CONFIG_{UTS,IPC,USER,PID,NET,TIME}_NS=y — verified against
+// `build/linux-slubdebug/.config`; CONFIG_CGROUP_NS wasn't checked so "cgroup" is left out
+// rather than risking an always-ENOENT path).
+pub const NS_PATHS: &[&str] = &[
+    "/proc/self/ns/mnt",
+    "/proc/self/ns/uts",
+    "/proc/self/ns/ipc",
+    "/proc/self/ns/user",
+    "/proc/self/ns/pid",
+    "/proc/self/ns/net",
+    "/proc/self/ns/time",
+];
+
+// ---- wave 14: keyctl/add_key/request_key (security/keys/keyctl.c) ----
+// Real key type names `key_get_type_from_user` accepts against `.config`'s built-in
+// `CONFIG_KEYS=y` type table (security/keys/{user_defined,keyring,request_key_auth}.c register
+// "user"/"keyring"/"logon"; "big_key" needs CONFIG_BIG_KEYS, left out since it's not confirmed
+// enabled).
+pub const KEY_TYPES: &[&str] = &["user", "keyring", "logon"];
+pub const KEY_DESCRIPTIONS: &[&str] = &["fuzzkey", "a", ""];
+pub const KEY_CALLOUT_INFO: &[&str] = &["-", "fuzz"];
+// KEY_SPEC_* special keyring ids (uapi/linux/keyctl.h) usable as an `add_key`/`request_key`
+// `ringid`/`destringid` or a `keyctl$unlink` destination keyring — encoded as their real
+// (negative) `key_serial_t` bit pattern in a u32 (this crate's `Flags` vals are always u32; the
+// guest reads them back as the same signed `int` bits either way).
+pub const KEYRING_SPECIAL: &[u32] = &[
+    0xffffffff, /* -1 KEY_SPEC_THREAD_KEYRING */
+    0xfffffffe, /* -2 KEY_SPEC_PROCESS_KEYRING */
+    0xfffffffd, /* -3 KEY_SPEC_SESSION_KEYRING */
+    0xfffffffc, /* -4 KEY_SPEC_USER_KEYRING */
+    0xfffffffb, /* -5 KEY_SPEC_USER_SESSION_KEYRING */
+];
+// keyctl(2) `option` values this wave models (uapi/linux/keyctl.h `KEYCTL_*`).
+pub const KEYCTL_GET_KEYRING_ID: u32 = 0;
+pub const KEYCTL_REVOKE: u32 = 3;
+pub const KEYCTL_UNLINK: u32 = 9;
+pub const KEYCTL_READ: u32 = 11;
+pub const KEYCTL_DESCRIBE: u32 = 6;
+
+// ---- wave 15: process_vm_readv/writev (mm/process_vm_access.c) ----
+// struct iovec describing a slice of the *remote* target's address space: unlike this crate's
+// `IOVEC` (whose `iov_base` is a real `Ptr` into our own scratch, correct for `lvec` — the local
+// side), a remote-side `iov_base` is an address in some *other* task's mm, which this generator
+// has no model of — so it's a free `Int` (an arbitrary/biased guess, mostly landing on unmapped
+// remote addresses and exercising `access_remote_vm`'s fault/short-copy paths, which is exactly
+// the useful fuzz signal here) rather than a `Ptr`.
+static REMOTE_IOVEC_FIELDS: &[Field] = &[
+    Field {
+        name: "iov_base",
+        ty: &Int {
+            bits: 32,
+            signed: false,
+        },
+    },
+    Field {
+        name: "iov_len",
+        ty: &Int {
+            bits: 32,
+            signed: false,
+        },
+    },
+];
+static REMOTE_IOVEC: ArgType = Struct(REMOTE_IOVEC_FIELDS);
+// Two-entry remote iovec array, same manual-unroll shape as `IOVEC2` (see its doc comment).
+static REMOTE_IOVEC2_FIELDS: &[Field] = &[
+    Field {
+        name: "iov0",
+        ty: &REMOTE_IOVEC,
+    },
+    Field {
+        name: "iov1",
+        ty: &REMOTE_IOVEC,
+    },
+];
+static REMOTE_IOVEC2: ArgType = Struct(REMOTE_IOVEC2_FIELDS);
 
 // struct sockaddr (generic, 16 bytes: u16 family + 14 bytes data — enough for AF_UNIX/AF_INET)
 static SOCKADDR_FIELDS: &[Field] = &[
@@ -2604,6 +2722,361 @@ pub static SYSCALLS: &[SyscallDesc] = &[
         ],
         produces: Produces::None,
     },
+
+    // ============ wave 12: splice/vmsplice/tee (T2.1 cheap subsystem, was 0 descriptions) ============
+    // fs/splice.c. All three thread `pipe2`(59)'s FD OutArray producer — a pipe end is required
+    // on at least one side of every one of these (vmsplice always; splice/tee whenever the other
+    // fd isn't itself pipe-capable) — so `pipe2` is this wave's real resource-producer anchor,
+    // same role `openat`/`socket` play for the read/write/ioctl waves above.
+
+    // 93. vmsplice(75): fd:fd (ideally a pipe2 end), iov(in,array[iovec,2]), nr_segs=2,
+    //     flags -> ssize (fs/splice.c SYSCALL_DEFINE4(vmsplice,...)).
+    SyscallDesc {
+        name: "vmsplice",
+        nr: 75,
+        args: &[
+            Res(FD),
+            Ptr {
+                dir: In,
+                inner: &IOVEC2,
+                nullable: false,
+            },
+            Const(2),
+            Flags {
+                vals: SPLICE_FLAGS,
+                bitmask: true,
+            },
+        ],
+        produces: Produces::None,
+    },
+    // 94. splice(76): EXACTLY 6 args (fs/splice.c SYSCALL_DEFINE6(splice,...)). fd_in, off_in
+    //     (nullable — must be NULL when fd_in is a pipe, real splice(2) constraint; an
+    //     occasionally-non-NULL offset against a pipe fd is a real -ESPIPE fuzz signal, same
+    //     "mismatch is a signal, not a modeling gap" rationale IOVEC's doc documents), fd_out,
+    //     off_out (nullable, same constraint on the write side), len, flags -> ssize.
+    SyscallDesc {
+        name: "splice",
+        nr: 76,
+        args: &[
+            Res(FD),
+            Ptr {
+                dir: InOut,
+                inner: &Int {
+                    bits: 64,
+                    signed: true,
+                },
+                nullable: true,
+            },
+            Res(FD),
+            Ptr {
+                dir: InOut,
+                inner: &Int {
+                    bits: 64,
+                    signed: true,
+                },
+                nullable: true,
+            },
+            Int {
+                bits: 32,
+                signed: false,
+            },
+            Flags {
+                vals: SPLICE_FLAGS,
+                bitmask: true,
+            },
+        ],
+        produces: Produces::None,
+    },
+    // 95. tee(77): fdin:fd, fdout:fd (real tee(2) requires BOTH to be pipes — genr's resource
+    //     pool doesn't distinguish "pipe fd" from "any fd" within the flat `fd` kind, so this
+    //     frequently draws a non-pipe fd on one side; that's the same accepted imprecision as
+    //     `splice`'s offset nullability above, not a correctness bug in the description), len,
+    //     flags -> ssize.
+    SyscallDesc {
+        name: "tee",
+        nr: 77,
+        args: &[
+            Res(FD),
+            Res(FD),
+            Int {
+                bits: 32,
+                signed: false,
+            },
+            Flags {
+                vals: SPLICE_FLAGS,
+                bitmask: true,
+            },
+        ],
+        produces: Produces::None,
+    },
+
+    // ============ wave 13: unshare/setns namespaces (T2.1 cheap subsystem, was 0 descriptions) ============
+    // kernel/fork.c / kernel/nsproxy.c. `CONFIG_{USER,UTS,IPC,PID,NET,TIME}_NS=y` (verified
+    // against `build/linux-slubdebug/.config`); zero guest-side scaffolding needed — `unshare` is
+    // single-scalar, and `setns`'s fd comes from the always-present `/proc/self/ns/*` magic
+    // symlinks (`openat$ns` below), not from any T2.2-class mount/initramfs setup.
+
+    // 96. unshare(97): unshare_flags -> int32. Zero-fd, zero-dependency (CLONE_NEWUSER succeeds
+    //     unprivileged; the rest need CAP_SYS_ADMIN, which this guest's init/agent has as root).
+    SyscallDesc {
+        name: "unshare",
+        nr: 97,
+        args: &[Flags {
+            vals: UNSHARE_FLAGS,
+            bitmask: true,
+        }],
+        produces: Produces::None,
+    },
+    // 97. openat$ns(56): dirfd (ignored — path is absolute), path=one of `/proc/self/ns/*`,
+    //     flags=O_RDONLY, mode=0 -> fd. The FD producer `setns` below threads from.
+    SyscallDesc {
+        name: "openat$ns",
+        nr: 56,
+        args: &[
+            Res(FD),
+            Ptr {
+                dir: In,
+                inner: &StringConst(NS_PATHS),
+                nullable: false,
+            },
+            Const(0 /* O_RDONLY */),
+            Const(0),
+        ],
+        produces: Produces::Ret(FD),
+    },
+    // 98. setns(268): fd:fd (ideally openat$ns's), nstype -> int32 (kernel/nsproxy.c
+    //     SYSCALL_DEFINE2(setns,...)).
+    SyscallDesc {
+        name: "setns",
+        nr: 268,
+        args: &[
+            Res(FD),
+            Flags {
+                vals: NSTYPE_FLAGS,
+                bitmask: false,
+            },
+        ],
+        produces: Produces::None,
+    },
+
+    // ============ wave 14: keyctl/add_key/request_key (T2.1 cheap subsystem, was 0 descriptions) ============
+    // security/keys/keyctl.c. `CONFIG_KEYS=y` (verified against `build/linux-slubdebug/.config`).
+    // `add_key`/`request_key`/`keyctl$get_keyring_id` are the `Res(KEY)` producers; the rest are
+    // consumers threaded against them (or a `KEYRING_SPECIAL` seed literal when no live key
+    // exists yet) — same producer/consumer shape as the `fd`/`sock`/`vma` waves above, just a new
+    // unrelated resource kind (see `resource::KEY`'s doc comment).
+
+    // 99. add_key(217): type(in,string), description(in,string), payload(in,bytes),
+    //     plen=len(payload), ringid -> key_serial_t (security/keys/keyctl.c
+    //     SYSCALL_DEFINE5(add_key,...)).
+    SyscallDesc {
+        name: "add_key",
+        nr: 217,
+        args: &[
+            Ptr {
+                dir: In,
+                inner: &StringConst(KEY_TYPES),
+                nullable: false,
+            },
+            Ptr {
+                dir: In,
+                inner: &StringConst(KEY_DESCRIPTIONS),
+                nullable: false,
+            },
+            Ptr {
+                dir: In,
+                inner: &Buffer {
+                    len: LenSpec::Range(0, 64),
+                },
+                nullable: true,
+            },
+            Len { of: 2 },
+            Flags {
+                vals: KEYRING_SPECIAL,
+                bitmask: false,
+            },
+        ],
+        produces: Produces::Ret(KEY),
+    },
+    // 100. request_key(218): type(in,string), description(in,string),
+    //      callout_info(in,string,nullable), destringid -> key_serial_t (security/keys/keyctl.c
+    //      SYSCALL_DEFINE4(request_key,...)).
+    SyscallDesc {
+        name: "request_key",
+        nr: 218,
+        args: &[
+            Ptr {
+                dir: In,
+                inner: &StringConst(KEY_TYPES),
+                nullable: false,
+            },
+            Ptr {
+                dir: In,
+                inner: &StringConst(KEY_DESCRIPTIONS),
+                nullable: false,
+            },
+            Ptr {
+                dir: In,
+                inner: &StringConst(KEY_CALLOUT_INFO),
+                nullable: true,
+            },
+            Flags {
+                vals: KEYRING_SPECIAL,
+                bitmask: false,
+            },
+        ],
+        produces: Produces::Ret(KEY),
+    },
+    // 101. keyctl$get_keyring_id(219): option=KEYCTL_GET_KEYRING_ID(0), id (a KEYRING_SPECIAL
+    //      special id, since we have no independent "keyring id" pool yet), create:bool(0/1)
+    //      -> key_serial_t. Another `Res(KEY)` producer besides add_key/request_key
+    //      (security/keys/keyctl.c keyctl_get_keyring_ID).
+    SyscallDesc {
+        name: "keyctl$get_keyring_id",
+        nr: 219,
+        args: &[
+            Const(KEYCTL_GET_KEYRING_ID),
+            Flags {
+                vals: KEYRING_SPECIAL,
+                bitmask: false,
+            },
+            Int {
+                bits: 32,
+                signed: false,
+            },
+        ],
+        produces: Produces::Ret(KEY),
+    },
+    // 102. keyctl$describe(219): option=KEYCTL_DESCRIBE(6), key:Res(KEY), buffer(out),
+    //      buflen=len(buffer) -> int32 (security/keys/keyctl.c keyctl_describe_key).
+    SyscallDesc {
+        name: "keyctl$describe",
+        nr: 219,
+        args: &[
+            Const(KEYCTL_DESCRIBE),
+            Res(KEY),
+            Ptr {
+                dir: Out,
+                inner: &Buffer {
+                    len: LenSpec::Range(0, 256),
+                },
+                nullable: false,
+            },
+            Len { of: 2 },
+        ],
+        produces: Produces::None,
+    },
+    // 103. keyctl$read(219): option=KEYCTL_READ(11), key:Res(KEY), buffer(out),
+    //      buflen=len(buffer) -> int32 (security/keys/keyctl.c keyctl_read_key).
+    SyscallDesc {
+        name: "keyctl$read",
+        nr: 219,
+        args: &[
+            Const(KEYCTL_READ),
+            Res(KEY),
+            Ptr {
+                dir: Out,
+                inner: &Buffer {
+                    len: LenSpec::Range(0, 256),
+                },
+                nullable: false,
+            },
+            Len { of: 2 },
+        ],
+        produces: Produces::None,
+    },
+    // 104. keyctl$revoke(219): option=KEYCTL_REVOKE(3), key:Res(KEY) -> int32
+    //      (security/keys/keyctl.c keyctl_revoke_key).
+    SyscallDesc {
+        name: "keyctl$revoke",
+        nr: 219,
+        args: &[Const(KEYCTL_REVOKE), Res(KEY)],
+        produces: Produces::None,
+    },
+    // 105. keyctl$unlink(219): option=KEYCTL_UNLINK(9), key:Res(KEY), keyring (a KEYRING_SPECIAL
+    //      destination) -> int32 (security/keys/keyctl.c keyctl_unlink).
+    SyscallDesc {
+        name: "keyctl$unlink",
+        nr: 219,
+        args: &[
+            Const(KEYCTL_UNLINK),
+            Res(KEY),
+            Flags {
+                vals: KEYRING_SPECIAL,
+                bitmask: false,
+            },
+        ],
+        produces: Produces::None,
+    },
+
+    // ============ wave 15: process_vm_readv/writev (T2.1 cheap subsystem) ============
+    // mm/process_vm_access.c. Zero-fd, zero-dependency: a `pid` is a plain biased `Int` (small
+    // values organically cover pid 1/2, i.e. real tasks, per this wave's brief — "self-pid is
+    // fine for reachability"), reaching `find_get_task_by_vpid`/`mm_access`/
+    // `process_vm_rw_single_vec` regardless of whether the remote-side addresses are valid (see
+    // `REMOTE_IOVEC`'s doc comment for why the remote iovec is modeled with free `Int`s rather
+    // than `Ptr`s).
+
+    // 106. process_vm_readv(270): EXACTLY 6 args (mm/process_vm_access.c
+    //      SYSCALL_DEFINE6(process_vm_readv,...)). pid, lvec(out,array[iovec,2], local/our
+    //      scratch), liovcnt=2, rvec(in,array[remote_iovec,2], remote addresses), riovcnt=2,
+    //      flags(currently unused by the kernel; still fuzzed) -> ssize.
+    SyscallDesc {
+        name: "process_vm_readv",
+        nr: 270,
+        args: &[
+            Int {
+                bits: 32,
+                signed: true,
+            },
+            Ptr {
+                dir: Out,
+                inner: &IOVEC2,
+                nullable: false,
+            },
+            Const(2),
+            Ptr {
+                dir: In,
+                inner: &REMOTE_IOVEC2,
+                nullable: false,
+            },
+            Const(2),
+            Int {
+                bits: 32,
+                signed: false,
+            },
+        ],
+        produces: Produces::None,
+    },
+    // 107. process_vm_writev(271): same EXACTLY-6-args shape as process_vm_readv, opposite
+    //      direction (lvec is our real data source, rvec is the remote destination).
+    SyscallDesc {
+        name: "process_vm_writev",
+        nr: 271,
+        args: &[
+            Int {
+                bits: 32,
+                signed: true,
+            },
+            Ptr {
+                dir: In,
+                inner: &IOVEC2,
+                nullable: false,
+            },
+            Const(2),
+            Ptr {
+                dir: In,
+                inner: &REMOTE_IOVEC2,
+                nullable: false,
+            },
+            Const(2),
+            Int {
+                bits: 32,
+                signed: false,
+            },
+        ],
+        produces: Produces::None,
+    },
 ];
 
 #[cfg(test)]
@@ -2830,5 +3303,185 @@ mod tests {
             .count();
         assert!(producers >= 1, "producers={producers}");
         assert!(consumers >= 2, "consumers={consumers}");
+    }
+
+    #[test]
+    fn table_grew_past_the_wave_12_to_15_cheap_subsystem_expansion() {
+        // Locks in T2.1's expansion (90 -> 105+: splice/vmsplice/tee, unshare/setns,
+        // keyctl/add_key/request_key, process_vm_readv/writev); a regression here means someone
+        // accidentally deleted descriptions rather than adding to them.
+        assert!(
+            SYSCALLS.len() >= 105,
+            "expected >=105 descriptions, got {}",
+            SYSCALLS.len()
+        );
+    }
+
+    #[test]
+    fn wave_12_to_15_cheap_subsystem_descriptions_are_represented() {
+        let names: Vec<&str> = SYSCALLS.iter().map(|d| d.name).collect();
+        for want in [
+            "vmsplice",
+            "splice",
+            "tee",
+            "unshare",
+            "openat$ns",
+            "setns",
+            "add_key",
+            "request_key",
+            "keyctl$get_keyring_id",
+            "keyctl$describe",
+            "keyctl$read",
+            "keyctl$revoke",
+            "keyctl$unlink",
+            "process_vm_readv",
+            "process_vm_writev",
+        ] {
+            assert!(names.contains(&want), "missing expected desc {want}");
+        }
+    }
+
+    /// `key` is a brand-new resource kind (wave 14): confirm it has the same
+    /// producer(s)-and-consumers shape `vma_has_a_producer_and_consumers` already checks for
+    /// `vma`, so a chain like `add_key -> keyctl$describe` can actually thread organically.
+    #[test]
+    fn key_has_producers_and_consumers() {
+        use crate::types::Produces;
+        let producers = SYSCALLS
+            .iter()
+            .filter(|d| matches!(d.produces, Produces::Ret(k) if k == KEY))
+            .count();
+        let consumers = SYSCALLS
+            .iter()
+            .filter(|d| d.args.iter().any(|a| matches!(a, Res(k) if *k == KEY)))
+            .count();
+        assert!(producers >= 3, "producers={producers}");
+        assert!(consumers >= 4, "consumers={consumers}");
+    }
+
+    /// `splice`/`tee`/`vmsplice` all consume `fd`, and `pipe2` (already in the table) is their
+    /// natural producer anchor — confirm the resource-threading precondition holds so genr's
+    /// consumer-preference bias (`pick_desc_biased`) can actually deepen these chains.
+    #[test]
+    fn splice_family_consumes_fd_and_pipe2_produces_it() {
+        let pipe2_produces_fd = SYSCALLS
+            .iter()
+            .find(|d| d.name == "pipe2")
+            .map(|d| matches!(d.produces, Produces::OutArray { kind, .. } if kind == FD))
+            .unwrap_or(false);
+        assert!(pipe2_produces_fd, "pipe2 must still produce FD");
+        for name in ["vmsplice", "splice", "tee"] {
+            let d = SYSCALLS.iter().find(|d| d.name == name).unwrap();
+            assert!(
+                d.args.iter().any(|a| matches!(a, Res(k) if *k == FD)),
+                "{name} should consume Res(FD)"
+            );
+        }
+    }
+
+    /// `setns` needs a namespace fd; `openat$ns` is this wave's zero-scaffolding producer for
+    /// one (`/proc/self/ns/*`). Confirm the pairing lowers cleanly end to end (not just
+    /// individually), including the FD threading fixup, mirroring
+    /// `prepend_fail_inject_builds_a_well_formed_armed_preamble_that_lowers_cleanly`'s style of
+    /// check for a hand-threaded two-call chain.
+    #[test]
+    fn openat_ns_threads_into_setns_and_lowers_cleanly() {
+        use crate::lower::lower;
+        use crate::prog::{ArgValue, Prog, ResRef, TypedCall};
+        use crate::rng::Rng;
+
+        let openat_ns = SYSCALLS.iter().find(|d| d.name == "openat$ns").unwrap();
+        let setns = SYSCALLS.iter().find(|d| d.name == "setns").unwrap();
+
+        let mut rng = Rng::new(7);
+        let mut p = Prog::new();
+        p.calls.push(TypedCall {
+            desc: openat_ns,
+            args: crate::genr::generate_args(&mut rng, openat_ns, &[]),
+        });
+        let mut args = crate::genr::generate_args(&mut rng, setns, &p.calls);
+        args[0] = ArgValue::Res(ResRef::Produced {
+            call_idx: 0,
+            slot: 0,
+        });
+        p.calls.push(TypedCall { desc: setns, args });
+        assert!(p.is_well_formed());
+
+        let lowered = lower(&p, 0x9400_0000);
+        assert_eq!(lowered.calls[0].nr, 56); // openat
+        assert_eq!(lowered.calls[1].nr, 268); // setns
+        let has_fd_fixup = lowered.fixups.iter().any(|f| {
+            f.dst_call == 1 && f.dst_arg == 0 && matches!(f.src, crate::lower::FixupSrc::Reg(0))
+        });
+        assert!(has_fd_fixup, "setns's fd arg must thread from openat$ns's return");
+
+        let wire = crate::lower::to_wire(&lowered);
+        assert_eq!(wire.len(), crate::lower::WIRE_WORDS);
+    }
+
+    /// A hand-built `add_key -> keyctl$describe` chain (the classic key-management pairing)
+    /// must be well-formed and lower cleanly, with the key serial threaded via a `Reg(0)` fixup
+    /// exactly like `openat_ns_threads_into_setns_and_lowers_cleanly` above.
+    #[test]
+    fn add_key_threads_into_keyctl_describe_and_lowers_cleanly() {
+        use crate::lower::lower;
+        use crate::prog::{ArgValue, Prog, ResRef, TypedCall};
+        use crate::rng::Rng;
+
+        let add_key = SYSCALLS.iter().find(|d| d.name == "add_key").unwrap();
+        let describe = SYSCALLS.iter().find(|d| d.name == "keyctl$describe").unwrap();
+
+        let mut rng = Rng::new(13);
+        let mut p = Prog::new();
+        p.calls.push(TypedCall {
+            desc: add_key,
+            args: crate::genr::generate_args(&mut rng, add_key, &[]),
+        });
+        let mut args = crate::genr::generate_args(&mut rng, describe, &p.calls);
+        args[1] = ArgValue::Res(ResRef::Produced {
+            call_idx: 0,
+            slot: 0,
+        });
+        p.calls.push(TypedCall {
+            desc: describe,
+            args,
+        });
+        assert!(p.is_well_formed());
+
+        let lowered = lower(&p, 0x9500_0000);
+        assert_eq!(lowered.calls[0].nr, 217); // add_key
+        assert_eq!(lowered.calls[1].nr, 219); // keyctl
+        let has_key_fixup = lowered.fixups.iter().any(|f| {
+            f.dst_call == 1 && f.dst_arg == 1 && matches!(f.src, crate::lower::FixupSrc::Reg(0))
+        });
+        assert!(has_key_fixup, "keyctl$describe's key arg must thread from add_key's return");
+
+        let wire = crate::lower::to_wire(&lowered);
+        assert_eq!(wire.len(), crate::lower::WIRE_WORDS);
+    }
+
+    /// `process_vm_readv`/`process_vm_writev` are zero-fd/zero-resource (just a `pid` + two
+    /// iovec arrays) — confirm they generate and lower cleanly across a seed sweep on their own,
+    /// same discipline as the recipe-resolution test above but for a plain generated call.
+    #[test]
+    fn process_vm_readv_writev_generate_and_lower_cleanly() {
+        use crate::lower::lower;
+        use crate::prog::{Prog, TypedCall};
+        use crate::rng::Rng;
+
+        for name in ["process_vm_readv", "process_vm_writev"] {
+            let desc = SYSCALLS.iter().find(|d| d.name == name).unwrap();
+            for seed in [1u32, 2, 3, 42, 12345] {
+                let mut rng = Rng::new(seed);
+                let args = crate::genr::generate_args(&mut rng, desc, &[]);
+                let mut p = Prog::new();
+                p.calls.push(TypedCall { desc, args });
+                assert!(p.is_well_formed(), "{name} seed {seed} ill-formed");
+                let lowered = lower(&p, 0x9600_0000);
+                assert_eq!(lowered.calls[0].nr, desc.nr);
+                let wire = crate::lower::to_wire(&lowered);
+                assert_eq!(wire.len(), crate::lower::WIRE_WORDS);
+            }
+        }
     }
 }
